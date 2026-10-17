@@ -32,13 +32,18 @@ fn c_smoke_compiles_and_runs() {
         ("profiles", cfg!(feature = "profiles")),
         ("cow", cfg!(feature = "cow")),
     ] {
-        if enabled { build.args(["--features", name]); }
+        if enabled {
+            build.args(["--features", name]);
+        }
     }
     if profile == "release" {
         build.arg("--release");
     }
     let build_status = build.status().expect("invoke cargo build for cdylib");
-    assert!(build_status.success(), "failed to build sandlock-ffi cdylib");
+    assert!(
+        build_status.success(),
+        "failed to build sandlock-ffi cdylib"
+    );
 
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -70,16 +75,17 @@ fn c_smoke_compiles_and_runs() {
         }
     }
 
-    let library_path = CString::new(
-        cdylib_dir.join("libsandlock_ffi.so").as_os_str().as_bytes(),
-    ).expect("library path has no NUL bytes");
+    let library_path = CString::new(cdylib_dir.join("libsandlock_ffi.so").as_os_str().as_bytes())
+        .expect("library path has no NUL bytes");
     let handle = unsafe { libc::dlopen(library_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
         let error = unsafe { libc::dlerror() };
         let message = if error.is_null() {
             "unknown loader error".into()
         } else {
-            unsafe { CStr::from_ptr(error) }.to_string_lossy().into_owned()
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned()
         };
         panic!("failed to load FFI library: {message}");
     }
@@ -92,13 +98,28 @@ fn c_smoke_compiles_and_runs() {
         ("sandlock_checkpoint_load", cfg!(feature = "checkpoint")),
         ("sandlock_checkpoint_set_name", cfg!(feature = "checkpoint")),
         ("sandlock_checkpoint_name", cfg!(feature = "checkpoint")),
-        ("sandlock_checkpoint_set_app_state", cfg!(feature = "checkpoint")),
-        ("sandlock_checkpoint_app_state", cfg!(feature = "checkpoint")),
+        (
+            "sandlock_checkpoint_set_app_state",
+            cfg!(feature = "checkpoint"),
+        ),
+        (
+            "sandlock_checkpoint_app_state",
+            cfg!(feature = "checkpoint"),
+        ),
         ("sandlock_checkpoint_free", cfg!(feature = "checkpoint")),
         ("sandlock_restore_interactive", cfg!(feature = "checkpoint")),
-        ("sandlock_handle_restore_skipped_len", cfg!(feature = "checkpoint")),
-        ("sandlock_handle_restore_skipped_fd", cfg!(feature = "checkpoint")),
-        ("sandlock_handle_restore_skipped_path", cfg!(feature = "checkpoint")),
+        (
+            "sandlock_handle_restore_skipped_len",
+            cfg!(feature = "checkpoint"),
+        ),
+        (
+            "sandlock_handle_restore_skipped_fd",
+            cfg!(feature = "checkpoint"),
+        ),
+        (
+            "sandlock_handle_restore_skipped_path",
+            cfg!(feature = "checkpoint"),
+        ),
     ] {
         let name = CString::new(symbol).unwrap();
         let exported = !unsafe { libc::dlsym(library.0, name.as_ptr()) }.is_null();

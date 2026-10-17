@@ -21,7 +21,9 @@ fn build_err(setter: Setter, value: &str) -> String {
     let policy = unsafe { sandlock_sandbox_build(b, &mut err, &mut msg) };
     assert!(policy.is_null(), "{value:?} built");
     assert_eq!(err, -1);
-    let text = unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned();
+    let text = unsafe { CStr::from_ptr(msg) }
+        .to_string_lossy()
+        .into_owned();
     unsafe { sandlock_string_free(msg) };
     text
 }
@@ -50,7 +52,11 @@ fn refused_values_report_the_core_reason() {
         (sandlock_sandbox_builder_max_memory, "1.5G", "max_memory"),
         (sandlock_sandbox_builder_max_memory, "1T", "max_memory"),
         (sandlock_sandbox_builder_max_disk, "lots", "max_disk"),
-        (sandlock_sandbox_builder_time_start, "1767225600", "time_start"),
+        (
+            sandlock_sandbox_builder_time_start,
+            "1767225600",
+            "time_start",
+        ),
     ];
     for (setter, value, knob) in cases {
         let msg = build_err(setter, value);

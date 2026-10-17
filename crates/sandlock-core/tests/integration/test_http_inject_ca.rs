@@ -9,10 +9,7 @@ use sandlock_core::Sandbox;
 
 #[tokio::test]
 async fn inject_ca_appends_to_declared_bundle() {
-    let dir = std::env::temp_dir().join(format!(
-        "sandlock-test-inject-ca-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("sandlock-test-inject-ca-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let bundle = dir.join("bundle.pem");
     std::fs::write(&bundle, b"ORIGINAL-BUNDLE\n").unwrap();
@@ -32,13 +29,12 @@ async fn inject_ca_appends_to_declared_bundle() {
         .build()
         .unwrap();
 
-    let result = policy
-        .clone()
-        
-        .run(&["cat", &bundle_str])
-        .await
-        .unwrap();
-    assert!(result.success(), "cat should succeed, exit={:?}", result.code());
+    let result = policy.clone().run(&["cat", &bundle_str]).await.unwrap();
+    assert!(
+        result.success(),
+        "cat should succeed, exit={:?}",
+        result.code()
+    );
 
     let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert!(

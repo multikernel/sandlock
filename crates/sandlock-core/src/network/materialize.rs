@@ -82,9 +82,7 @@ pub(crate) fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
     }
     let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as u32;
     match family {
-        f if f == AF_INET || f == AF_INET6 => {
-            Some(u16::from_be_bytes([bytes[2], bytes[3]]))
-        }
+        f if f == AF_INET || f == AF_INET6 => Some(u16::from_be_bytes([bytes[2], bytes[3]])),
         _ => None,
     }
 }
@@ -186,8 +184,14 @@ fn materialize_control(
     if msg_controllen as usize > MAX_CONTROL_BUF {
         return Err(libc::EMSGSIZE);
     }
-    let raw = read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, msg_controllen as usize)
-        .map_err(|_| libc::EIO)?;
+    let raw = read_child_mem(
+        notif_fd,
+        notif.id,
+        notif.pid,
+        msg_control_ptr,
+        msg_controllen as usize,
+    )
+    .map_err(|_| libc::EIO)?;
     if is_unix {
         let (buf, fds) = translate_scm_rights(notif.pid, &raw)?;
         Ok((Some(buf), fds))
@@ -214,7 +218,10 @@ pub(crate) fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::Pat
     if sun_path[0] == 0 {
         return None; // abstract namespace (Landlock scope handles it)
     }
-    let end = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
+    let end = sun_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(sun_path.len());
     let raw = &sun_path[..end];
     if raw.is_empty() {
         return None;
@@ -460,7 +467,14 @@ mod tests {
         b[40..48].copy_from_slice(&64u64.to_ne_bytes());
         let h = ChildMsghdr::parse(&b).unwrap();
         assert_eq!(
-            (h.name_ptr, h.namelen, h.iov_ptr, h.iovlen, h.control_ptr, h.controllen),
+            (
+                h.name_ptr,
+                h.namelen,
+                h.iov_ptr,
+                h.iovlen,
+                h.control_ptr,
+                h.controllen
+            ),
             (0x1111, 7, 0x2222, 3, 0x3333, 64)
         );
         assert!(!h.connected());
@@ -519,7 +533,10 @@ mod tests {
     #[test]
     fn parse_ip_keeps_plain_ipv6_untouched() {
         let bytes = v6_sockaddr_bytes(Ipv6Addr::LOCALHOST, 80);
-        assert_eq!(parse_ip_from_sockaddr(&bytes), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(
+            parse_ip_from_sockaddr(&bytes),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
         assert!(sockaddr_is_ipv6(&bytes));
     }
 

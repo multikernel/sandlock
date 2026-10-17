@@ -29,13 +29,21 @@ fn base() -> Sandbox {
 async fn test_popen_pipe_roundtrip() {
     let mut sb = base().with_name("popen-cat");
     let mut child = sb
-        .popen(&["cat"], StdioMode::Piped, StdioMode::Piped, StdioMode::Inherit)
+        .popen(
+            &["cat"],
+            StdioMode::Piped,
+            StdioMode::Piped,
+            StdioMode::Inherit,
+        )
         .await
         .unwrap();
 
     let mut stdin = File::from(child.take_stdin().expect("stdin pipe"));
     let mut stdout = File::from(child.take_stdout().expect("stdout pipe"));
-    assert!(child.take_stderr().is_none(), "stderr was Inherit, not piped");
+    assert!(
+        child.take_stderr().is_none(),
+        "stderr was Inherit, not piped"
+    );
 
     stdin.write_all(b"hello\n").unwrap();
     drop(stdin); // EOF → cat exits and closes stdout
@@ -44,7 +52,12 @@ async fn test_popen_pipe_roundtrip() {
     stdout.read_to_string(&mut out).unwrap();
     assert_eq!(out, "hello\n");
 
-    let res = async { child.wait().await?; child.shutdown().await }.await.unwrap();
+    let res = async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap();
     assert!(res.success());
 }
 
@@ -54,7 +67,12 @@ async fn test_popen_pipe_roundtrip() {
 async fn test_popen_stdout_only() {
     let mut sb = base().with_name("popen-echo");
     let mut child = sb
-        .popen(&["echo", "hi"], StdioMode::Inherit, StdioMode::Piped, StdioMode::Inherit)
+        .popen(
+            &["echo", "hi"],
+            StdioMode::Inherit,
+            StdioMode::Piped,
+            StdioMode::Inherit,
+        )
         .await
         .unwrap();
     assert!(child.take_stdin().is_none(), "stdin was Inherit");
@@ -62,7 +80,13 @@ async fn test_popen_stdout_only() {
     let mut out = String::new();
     stdout.read_to_string(&mut out).unwrap();
     assert_eq!(out, "hi\n");
-    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
+    assert!(async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap()
+    .success());
 }
 
 /// Null stdout is actually wired to `/dev/null`, not left inherited. The child
@@ -75,15 +99,28 @@ async fn test_popen_null_stdout_is_dev_null() {
         .popen(
             // Stat the *shell's* fd 1 via $$ — `$(...)` would rebind fd 1 for the
             // inner stat itself, so /proc/self/fd/1 there is the substitution pipe.
-            &["sh", "-c", r#"[ "$(stat -L -c %t:%T /proc/$$/fd/1)" = 1:3 ]"#],
+            &[
+                "sh",
+                "-c",
+                r#"[ "$(stat -L -c %t:%T /proc/$$/fd/1)" = 1:3 ]"#,
+            ],
             StdioMode::Inherit,
             StdioMode::Null,
             StdioMode::Inherit,
         )
         .await
         .unwrap();
-    let res = async { child.wait().await?; child.shutdown().await }.await.unwrap();
-    assert!(res.success(), "fd 1 was not /dev/null (1:3): exit={:?}", res.exit_status);
+    let res = async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap();
+    assert!(
+        res.success(),
+        "fd 1 was not /dev/null (1:3): exit={:?}",
+        res.exit_status
+    );
 }
 
 /// stderr piped independently of stdout: the stderr match arm must dup the
@@ -92,7 +129,12 @@ async fn test_popen_null_stdout_is_dev_null() {
 async fn test_popen_stderr_piped() {
     let mut sb = base().with_name("popen-stderr");
     let mut child = sb
-        .popen(&["sh", "-c", "echo oops 1>&2"], StdioMode::Inherit, StdioMode::Inherit, StdioMode::Piped)
+        .popen(
+            &["sh", "-c", "echo oops 1>&2"],
+            StdioMode::Inherit,
+            StdioMode::Inherit,
+            StdioMode::Piped,
+        )
         .await
         .unwrap();
     assert!(child.take_stdout().is_none(), "stdout was Inherit");
@@ -100,7 +142,13 @@ async fn test_popen_stderr_piped() {
     let mut out = String::new();
     stderr.read_to_string(&mut out).unwrap();
     assert_eq!(out, "oops\n");
-    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
+    assert!(async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap()
+    .success());
 }
 
 /// A piped stdin the caller never takes must still reach EOF at `wait`, or a
@@ -110,12 +158,25 @@ async fn test_popen_stderr_piped() {
 async fn test_popen_untaken_stdin_reaches_eof() {
     let mut sb = base().with_name("popen-stdin-eof");
     let mut child = sb
-        .popen(&["cat"], StdioMode::Piped, StdioMode::Null, StdioMode::Inherit)
+        .popen(
+            &["cat"],
+            StdioMode::Piped,
+            StdioMode::Null,
+            StdioMode::Inherit,
+        )
         .await
         .unwrap();
     // Deliberately do not take stdin. cat reads to EOF; wait must deliver it.
-    let res = async { child.wait().await?; child.shutdown().await }.await.unwrap();
-    assert!(res.success(), "cat did not exit — untaken stdin never EOF'd");
+    let res = async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap();
+    assert!(
+        res.success(),
+        "cat did not exit — untaken stdin never EOF'd"
+    );
 }
 
 /// Dropping the owning Sandbox kills the whole process group and reaps it,
@@ -139,7 +200,10 @@ async fn test_popen_group_killed_on_drop() {
         let mut line = String::new();
         BufReader::new(stdout).read_line(&mut line).unwrap();
         gc_pid = line.trim().parse().expect("grandchild pid");
-        assert!(unsafe { libc::kill(gc_pid, 0) } == 0, "grandchild should be alive");
+        assert!(
+            unsafe { libc::kill(gc_pid, 0) } == 0,
+            "grandchild should be alive"
+        );
         // sb (and child borrow) dropped here → Sandbox::drop kills the group.
     }
     // Poll for ESRCH rather than a fixed sleep: after the group SIGKILL the
@@ -153,7 +217,10 @@ async fn test_popen_group_killed_on_drop() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(reaped, "grandchild {gc_pid} should be dead+reaped after group kill");
+    assert!(
+        reaped,
+        "grandchild {gc_pid} should be dead+reaped after group kill"
+    );
 }
 
 /// A descendant still running when the main process exits dies with it. Left
@@ -176,9 +243,17 @@ async fn test_wait_kills_descendants_the_main_process_left_behind() {
     let mut line = String::new();
     BufReader::new(stdout).read_line(&mut line).unwrap();
     let bg_pid: i32 = line.trim().parse().expect("background pid");
-    assert!(unsafe { libc::kill(bg_pid, 0) } == 0, "background job should be alive");
+    assert!(
+        unsafe { libc::kill(bg_pid, 0) } == 0,
+        "background job should be alive"
+    );
 
-    let res = async { child.wait().await?; child.shutdown().await }.await.unwrap();
+    let res = async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap();
     assert!(res.success());
 
     // A killed orphan stays a zombie until init/subreaper reaps it.
@@ -190,14 +265,21 @@ async fn test_wait_kills_descendants_the_main_process_left_behind() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(gone, "background job {bg_pid} outlived the sandbox's main process");
+    assert!(
+        gone,
+        "background job {bg_pid} outlived the sandbox's main process"
+    );
 }
 
 /// Regression: capture-mode `run` still buffers stdout into the RunResult
 /// after the do_create stdio refactor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_run_still_captures_stdout() {
-    let res = base().with_name("run-capture").run(&["echo", "captured"]).await.unwrap();
+    let res = base()
+        .with_name("run-capture")
+        .run(&["echo", "captured"])
+        .await
+        .unwrap();
     assert!(res.success());
     assert_eq!(res.stdout_str(), Some("captured"));
 }
@@ -209,7 +291,12 @@ async fn test_popen_all_three_piped() {
     let mut sb = base().with_name("popen-3pipe");
     // cat echoes stdin→stdout; then a marker is written to stderr.
     let mut child = sb
-        .popen(&["sh", "-c", "cat; echo err 1>&2"], StdioMode::Piped, StdioMode::Piped, StdioMode::Piped)
+        .popen(
+            &["sh", "-c", "cat; echo err 1>&2"],
+            StdioMode::Piped,
+            StdioMode::Piped,
+            StdioMode::Piped,
+        )
         .await
         .unwrap();
     let mut stdin = File::from(child.take_stdin().expect("stdin"));
@@ -225,7 +312,13 @@ async fn test_popen_all_three_piped() {
     stderr.read_to_string(&mut err).unwrap();
     assert_eq!(out, "data\n");
     assert_eq!(err, "err\n");
-    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
+    assert!(async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap()
+    .success());
 }
 
 /// Null stdin delivers immediate EOF: `cat` reading /dev/null exits 0 at once.
@@ -233,10 +326,21 @@ async fn test_popen_all_three_piped() {
 async fn test_popen_null_stdin_is_eof() {
     let mut sb = base().with_name("popen-null-stdin");
     let mut child = sb
-        .popen(&["cat"], StdioMode::Null, StdioMode::Null, StdioMode::Inherit)
+        .popen(
+            &["cat"],
+            StdioMode::Null,
+            StdioMode::Null,
+            StdioMode::Inherit,
+        )
         .await
         .unwrap();
-    assert!(async { child.wait().await?; child.shutdown().await }.await.unwrap().success());
+    assert!(async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap()
+    .success());
 }
 
 /// Explicit Process::kill terminates the child; wait still collects a
@@ -245,11 +349,21 @@ async fn test_popen_null_stdin_is_eof() {
 async fn test_popen_explicit_kill_then_wait() {
     let mut sb = base().with_name("popen-kill");
     let mut child = sb
-        .popen(&["sleep", "100"], StdioMode::Inherit, StdioMode::Inherit, StdioMode::Inherit)
+        .popen(
+            &["sleep", "100"],
+            StdioMode::Inherit,
+            StdioMode::Inherit,
+            StdioMode::Inherit,
+        )
         .await
         .unwrap();
     child.kill().expect("kill");
-    let res = async { child.wait().await?; child.shutdown().await }.await.unwrap();
+    let res = async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap();
     assert!(!res.success(), "a killed process must not report success");
 }
 
@@ -259,15 +373,33 @@ async fn test_popen_explicit_kill_then_wait() {
 async fn test_popen_rejects_second_spawn() {
     let mut sb = base().with_name("popen-twice");
     let mut first = sb
-        .popen(&["echo", "first"], StdioMode::Inherit, StdioMode::Inherit, StdioMode::Inherit)
+        .popen(
+            &["echo", "first"],
+            StdioMode::Inherit,
+            StdioMode::Inherit,
+            StdioMode::Inherit,
+        )
         .await
         .unwrap();
-    async { first.wait().await?; first.shutdown().await }.await.unwrap(); // consume the Process → releases the &mut borrow
+    async {
+        first.wait().await?;
+        first.shutdown().await
+    }
+    .await
+    .unwrap(); // consume the Process → releases the &mut borrow
 
     let second = sb
-        .popen(&["echo", "second"], StdioMode::Inherit, StdioMode::Inherit, StdioMode::Inherit)
+        .popen(
+            &["echo", "second"],
+            StdioMode::Inherit,
+            StdioMode::Inherit,
+            StdioMode::Inherit,
+        )
         .await;
-    assert!(second.is_err(), "second popen on a used Sandbox must error, not reuse state");
+    assert!(
+        second.is_err(),
+        "second popen on a used Sandbox must error, not reuse state"
+    );
 }
 
 /// A stream the caller took stays the caller's: `wait()` must not drain it (or
@@ -287,15 +419,30 @@ async fn test_popen_taken_stdout_is_not_drained_by_wait() {
         .await
         .unwrap();
 
-    let mut stdout = File::from(child.take_stdout().expect("taking stdout must yield the stream"));
+    let mut stdout = File::from(
+        child
+            .take_stdout()
+            .expect("taking stdout must yield the stream"),
+    );
 
     let mut out = String::new();
     stdout.read_to_string(&mut out).unwrap();
-    assert_eq!(out, "out", "the taken stream must still carry the child's output");
+    assert_eq!(
+        out, "out",
+        "the taken stream must still carry the child's output"
+    );
 
-    let res = async { child.wait().await?; child.shutdown().await }.await.unwrap();
+    let res = async {
+        child.wait().await?;
+        child.shutdown().await
+    }
+    .await
+    .unwrap();
     assert!(res.success());
-    assert!(res.stdout.is_none(), "a taken stdout must be None in the RunResult");
+    assert!(
+        res.stdout.is_none(),
+        "a taken stdout must be None in the RunResult"
+    );
     assert_eq!(
         res.stderr.as_deref(),
         Some(&b"err"[..]),

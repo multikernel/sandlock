@@ -53,9 +53,7 @@ async fn responder_loop(fd: OwnedFd, reply_pid: u32) -> std::io::Result<()> {
         let mut guard = async_fd.readable().await?;
         let raw = guard.get_inner().as_raw_fd();
         let n = match guard.try_io(|_| {
-            let ret = unsafe {
-                libc::recv(raw, buf.as_mut_ptr() as *mut _, buf.len(), 0)
-            };
+            let ret = unsafe { libc::recv(raw, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
             if ret < 0 {
                 Err(std::io::Error::last_os_error())
             } else {

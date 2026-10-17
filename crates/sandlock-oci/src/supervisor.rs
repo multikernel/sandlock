@@ -52,10 +52,7 @@ struct InitLink {
 
 impl InitLink {
     /// Build the link and spawn the background reader that routes replies.
-    fn new(
-        writer: std::os::unix::net::UnixStream,
-        reader: tokio::net::UnixStream,
-    ) -> Arc<Self> {
+    fn new(writer: std::os::unix::net::UnixStream, reader: tokio::net::UnixStream) -> Arc<Self> {
         let link = Arc::new(InitLink {
             writer: tokio::sync::Mutex::new(writer),
             state: StdMutex::new(LinkState {
@@ -85,7 +82,10 @@ impl InitLink {
         // Hold the writer lock until the reply lands so a concurrent request
         // cannot overwrite `pending` before this one is answered.
         let resp = rx.await.map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sandlock-init closed control channel")
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sandlock-init closed control channel",
+            )
         })?;
         drop(writer);
         Ok(resp)
@@ -154,9 +154,7 @@ async fn reader_task(link: Arc<InitLink>, reader: tokio::net::UnixStream) {
 /// Map an init `Resp::Exited` (if any) to the on-disk `ExitInfo`.
 fn exit_info_from_resp(resp: Option<Resp>) -> Option<crate::state::ExitInfo> {
     match resp {
-        Some(Resp::Exited { code, signal, .. }) => {
-            Some(crate::state::ExitInfo { code, signal })
-        }
+        Some(Resp::Exited { code, signal, .. }) => Some(crate::state::ExitInfo { code, signal }),
         _ => None,
     }
 }
@@ -196,10 +194,17 @@ pub enum SupervisorCmd {
 #[serde(tag = "result", rename_all = "lowercase")]
 pub enum SupervisorReply {
     Ok,
-    Pid { pid: i32 },
-    Err { msg: String },
+    Pid {
+        pid: i32,
+    },
+    Err {
+        msg: String,
+    },
     /// Final status of an exec'd process (attached exec only).
-    Exit { code: Option<i32>, signal: Option<i32> },
+    Exit {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
 }
 
 /// Deterministic 64-bit FNV-1a hash of `id` as 16 lowercase hex chars.
@@ -276,7 +281,9 @@ pub fn run_supervisor(
 
     // Build the Sandbox from the OCI policy — this carries chroot, env, fs
     // rules, resource limits, and network policy into sandlock-core.
-    let mut sandbox = policy.to_sandbox().context("build Sandbox from OCI policy")?;
+    let mut sandbox = policy
+        .to_sandbox()
+        .context("build Sandbox from OCI policy")?;
     sandbox.set_name(id);
 
     let sock_path = socket_path(id);
@@ -409,7 +416,10 @@ async fn supervisor_main(
     // Report two pids: the supervisor daemon's own pid (this process, which is
     // the containerd shim's child and what the shim reaps to detect exit) and
     // sandlock-init's pid (the OCI container init, recorded as state.pid).
-    pipe_write(pid_write_fd, &format!("OK {} {}", std::process::id(), init_pid));
+    pipe_write(
+        pid_write_fd,
+        &format!("OK {} {}", std::process::id(), init_pid),
+    );
 
     {
         let mut state = SandboxState::load(id)
@@ -482,16 +492,16 @@ async fn supervisor_main(
                         return Ok(exit_info);
                     }
                     Ok(Resp::Err { msg }) => {
-                        let reply = serde_json::to_vec(&SupervisorReply::Err { msg })
-                            .unwrap_or_default();
+                        let reply =
+                            serde_json::to_vec(&SupervisorReply::Err { msg }).unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
                         return Ok(None);
                     }
                     other => {
                         let msg = format!("unexpected init reply to RunMain: {:?}", other);
-                        let reply = serde_json::to_vec(&SupervisorReply::Err { msg })
-                            .unwrap_or_default();
+                        let reply =
+                            serde_json::to_vec(&SupervisorReply::Err { msg }).unwrap_or_default();
                         let _ = stream.write_all(&reply).await;
                         let _ = stream.write_all(b"\n").await;
                         return Ok(None);
@@ -514,10 +524,14 @@ async fn supervisor_main(
                         cp.name = id.to_string();
                         match cp.save(std::path::Path::new(&dir)) {
                             Ok(()) => serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default(),
-                            Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() }).unwrap_or_default(),
+                            Err(e) => {
+                                serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                                    .unwrap_or_default()
+                            }
                         }
                     }
-                    Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() }).unwrap_or_default(),
+                    Err(e) => serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                        .unwrap_or_default(),
                 };
                 let _ = stream.write_all(&reply).await;
                 let _ = stream.write_all(b"\n").await;
@@ -630,7 +644,12 @@ async fn serve_one_running_init(
             let _ = stream.write_all(b"\n").await;
             RunningCmd::Continue
         }
-        SupervisorCmd::Exec { args, env, cwd, detach } => {
+        SupervisorCmd::Exec {
+            args,
+            env,
+            cwd,
+            detach,
+        } => {
             handle_exec(stream, link.clone(), args, env, cwd, detach, fds).await;
             RunningCmd::Continue
         }
@@ -700,15 +719,22 @@ async fn handle_exec(
         return;
     }
     if args.is_empty() {
-        let reply = serde_json::to_vec(&SupervisorReply::Err { msg: "exec: empty command".into() })
-            .unwrap_or_default();
+        let reply = serde_json::to_vec(&SupervisorReply::Err {
+            msg: "exec: empty command".into(),
+        })
+        .unwrap_or_default();
         let _ = stream.write_all(&reply).await;
         let _ = stream.write_all(b"\n").await;
         return;
     }
 
     let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
-    let req = Req::RunExec { argv: args, env, cwd, detach };
+    let req = Req::RunExec {
+        argv: args,
+        env,
+        cwd,
+        detach,
+    };
     let started = link.request(&req, &raw).await;
     // init has now dup'd the fds (SCM_RIGHTS); drop the daemon's copies.
     drop(fds);
@@ -755,10 +781,22 @@ fn exit_info_from(
     use sandlock_core::ExitStatus;
     match res {
         Ok(r) => match r.exit_status {
-            ExitStatus::Code(code) => Some(ExitInfo { code: Some(code), signal: None }),
-            ExitStatus::Signal(sig) => Some(ExitInfo { code: None, signal: Some(sig) }),
-            ExitStatus::Killed => Some(ExitInfo { code: None, signal: Some(libc::SIGKILL) }),
-            ExitStatus::Timeout => Some(ExitInfo { code: Some(124), signal: None }),
+            ExitStatus::Code(code) => Some(ExitInfo {
+                code: Some(code),
+                signal: None,
+            }),
+            ExitStatus::Signal(sig) => Some(ExitInfo {
+                code: None,
+                signal: Some(sig),
+            }),
+            ExitStatus::Killed => Some(ExitInfo {
+                code: None,
+                signal: Some(libc::SIGKILL),
+            }),
+            ExitStatus::Timeout => Some(ExitInfo {
+                code: Some(124),
+                signal: None,
+            }),
         },
         Err(_) => None,
     }
@@ -925,9 +963,7 @@ async fn serve_running(
 /// and exec'd siblings sharing the group). Send SIGKILL to every group so
 /// nothing outlives the container with a now-dead supervisor. The `Shutdown`
 /// path does not call this because `sandbox.kill()` already does the same.
-async fn reap_and_collapse(
-    sandbox: &mut sandlock_core::Sandbox,
-) -> Option<crate::state::ExitInfo> {
+async fn reap_and_collapse(sandbox: &mut sandlock_core::Sandbox) -> Option<crate::state::ExitInfo> {
     let info = exit_info_from(sandbox.shutdown().await);
     let _ = sandbox.signal(libc::SIGKILL);
     info
@@ -947,7 +983,11 @@ pub fn run_supervisor_restore(id: &str, image_dir: &str, pid_write_fd: i32) -> R
         Ok(c) => c,
         Err(e) => {
             pipe_write(pid_write_fd, &format!("ERR load checkpoint: {}", e));
-            return Err(anyhow::anyhow!("load checkpoint from {:?}: {}", image_dir, e));
+            return Err(anyhow::anyhow!(
+                "load checkpoint from {:?}: {}",
+                image_dir,
+                e
+            ));
         }
     };
 
@@ -967,7 +1007,13 @@ pub fn run_supervisor_restore(id: &str, image_dir: &str, pid_write_fd: i32) -> R
         .build()
         .context("build tokio runtime")?;
 
-    rt.block_on(supervisor_restore_main(id, sandbox, cp, sock_path, pid_write_fd))
+    rt.block_on(supervisor_restore_main(
+        id,
+        sandbox,
+        cp,
+        sock_path,
+        pid_write_fd,
+    ))
 }
 
 /// Async body of [`run_supervisor_restore`].
@@ -1006,7 +1052,10 @@ async fn supervisor_restore_main(
         return Err(anyhow::anyhow!("sandbox restore_interactive: {}", e));
     }
     for f in sandbox.restore_skipped() {
-        eprintln!("sandlock: fd {} not transparently restored: {}", f.fd, f.path);
+        eprintln!(
+            "sandlock: fd {} not transparently restored: {}",
+            f.fd, f.path
+        );
     }
 
     let child_pid = sandbox.pid().unwrap_or(0);
@@ -1061,7 +1110,11 @@ mod tests {
         let cri_root = "/run/containerd/runc/k8s.io";
         let id = "a".repeat(64);
         let full = format!("{}/{}.sock", cri_root, fnv1a_hex(&id));
-        assert!(full.len() < 108, "socket path too long: {} bytes", full.len());
+        assert!(
+            full.len() < 108,
+            "socket path too long: {} bytes",
+            full.len()
+        );
     }
 
     #[test]
@@ -1109,7 +1162,9 @@ mod tests {
 
     #[test]
     fn supervisor_reply_err_serde() {
-        let reply = SupervisorReply::Err { msg: "test error".into() };
+        let reply = SupervisorReply::Err {
+            msg: "test error".into(),
+        };
         let json = serde_json::to_string(&reply).unwrap();
         assert!(json.contains("err"));
         assert!(json.contains("test error"));
@@ -1118,7 +1173,9 @@ mod tests {
     #[test]
     #[cfg(feature = "checkpoint")]
     fn supervisor_cmd_checkpoint_serde() {
-        let cmd = SupervisorCmd::Checkpoint { dir: "/tmp/img".into() };
+        let cmd = SupervisorCmd::Checkpoint {
+            dir: "/tmp/img".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("checkpoint"));
         assert!(json.contains("/tmp/img"));
@@ -1128,7 +1185,9 @@ mod tests {
 
     #[test]
     fn supervisor_cmd_signal_serde() {
-        let cmd = SupervisorCmd::Signal { signum: libc::SIGKILL };
+        let cmd = SupervisorCmd::Signal {
+            signum: libc::SIGKILL,
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("signal"));
         let back: SupervisorCmd = serde_json::from_str(&json).unwrap();

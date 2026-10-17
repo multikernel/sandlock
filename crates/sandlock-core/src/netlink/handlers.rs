@@ -54,12 +54,7 @@ fn tgid_of(tid: i32) -> i32 {
 /// Read a POD struct `T` from child memory via `process_vm_readv`, with the
 /// shared `notif::read_child_mem` helper that ID-validates the notification
 /// before and after the read.
-fn read_struct<T: Copy>(
-    notif_fd: RawFd,
-    id: u64,
-    pid: u32,
-    addr: usize,
-) -> Option<T> {
+fn read_struct<T: Copy>(notif_fd: RawFd, id: u64, pid: u32, addr: usize) -> Option<T> {
     let bytes = read_child_mem(notif_fd, id, pid, addr as u64, std::mem::size_of::<T>()).ok()?;
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
 }
@@ -83,7 +78,11 @@ fn bind_kernel_like_address(fd: RawFd) -> std::io::Result<()> {
             *dst = src as libc::c_char;
         }
         let rc = unsafe {
-            libc::bind(fd, &addr as *const _ as *const libc::sockaddr, SOCKADDR_NL_LEN)
+            libc::bind(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                SOCKADDR_NL_LEN,
+            )
         };
         if rc == 0 {
             return Ok(());
@@ -100,11 +99,8 @@ fn bind_kernel_like_address(fd: RawFd) -> std::io::Result<()> {
 /// supervisor-side end and speaks synthesized NETLINK_ROUTE replies.
 /// Allowed domains pass through; AF_NETLINK is virtualized; everything
 /// else (and non-NETLINK_ROUTE netlink protocols) returns EAFNOSUPPORT.
-pub async fn handle_socket(
-    notif: &SeccompNotif,
-    state: &Arc<NetlinkState>,
-) -> NotifAction {
-    let domain   = notif.data.args[0];
+pub async fn handle_socket(notif: &SeccompNotif, state: &Arc<NetlinkState>) -> NotifAction {
+    let domain = notif.data.args[0];
     let protocol = notif.data.args[2];
 
     if !family_allowed(domain) {
@@ -214,10 +210,7 @@ pub async fn handle_netlink_recvmsg(
     NotifAction::Continue
 }
 
-pub async fn handle_bind(
-    notif: &SeccompNotif,
-    state: &Arc<NetlinkState>,
-) -> NotifAction {
+pub async fn handle_bind(notif: &SeccompNotif, state: &Arc<NetlinkState>) -> NotifAction {
     let fd = notif.data.args[0] as i32;
     if state.port_id(notif.pid, fd).is_some() {
         return NotifAction::ReturnValue(0);

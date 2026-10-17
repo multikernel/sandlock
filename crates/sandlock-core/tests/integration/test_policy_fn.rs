@@ -1,13 +1,17 @@
-use sandlock_core::{Sandbox};
-use sandlock_core::policy_fn::{PolicyFn, Verdict, SyscallCategory};
+use sandlock_core::policy_fn::{PolicyFn, SyscallCategory, Verdict};
 use sandlock_core::sandbox::ByteSize;
+use sandlock_core::Sandbox;
 use std::net::{IpAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn temp_file(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("sandlock-test-policyfn-{}-{}", name, std::process::id()))
+    std::env::temp_dir().join(format!(
+        "sandlock-test-policyfn-{}-{}",
+        name,
+        std::process::id()
+    ))
 }
 
 /// A live TCP listener on `host:ephemeral`. Connecting to it *succeeds* when
@@ -21,8 +25,13 @@ fn loopback_listener(host: &str) -> (TcpListener, u16) {
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
 }
 
@@ -40,18 +49,27 @@ async fn test_policy_fn_receives_events_with_metadata() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&["python3", "-c", "print('hello')"],
-    ).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", "print('hello')"])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let captured = events.lock().unwrap();
     assert!(!captured.is_empty(), "should receive events");
 
     // Should have at least one openat (file syscall) and one execve.
-    assert!(captured.iter().any(|n| n == "openat"),
-        "should include openat, got: {:?}", &captured[..captured.len().min(5)]);
-    assert!(captured.iter().any(|n| n == "execve"),
-        "should include execve, got: {:?}", &captured[..captured.len().min(5)]);
+    assert!(
+        captured.iter().any(|n| n == "openat"),
+        "should include openat, got: {:?}",
+        &captured[..captured.len().min(5)]
+    );
+    assert!(
+        captured.iter().any(|n| n == "execve"),
+        "should include execve, got: {:?}",
+        &captured[..captured.len().min(5)]
+    );
 }
 
 /// Verdict::Deny blocks a connect syscall (with EPERM), attributable to the
@@ -75,24 +93,35 @@ async fn test_policy_fn_deny_connect() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(3)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', {port}))\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "except OSError as e:\n",
-        "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
-    ), port = port, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
+        ),
+        port = port,
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     // EPERM (1) from the policy_fn deny — not a dead-port ECONNREFUSED.
-    assert_eq!(content, "BLOCKED:1", "connect should be denied by policy_fn (EPERM)");
+    assert_eq!(
+        content, "BLOCKED:1",
+        "connect should be denied by policy_fn (EPERM)"
+    );
 }
 
 #[tokio::test]
@@ -112,22 +141,26 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(2)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', {port}))\n",
-        "  connect_result = 'CONNECTED'\n",
-        "except OSError as e:\n",
-        "  connect_result = 'DENIED:%d' % e.errno\n",
-        "try:\n",
-        "  s.sendall(b'escaped')\n",
-        "  send_result = 'SENT'\n",
-        "except OSError as e:\n",
-        "  send_result = 'BLOCKED:%d' % e.errno\n",
-        "open('{out}', 'w').write(connect_result + ';' + send_result)\n",
-    ), port = port, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(2)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  connect_result = 'CONNECTED'\n",
+            "except OSError as e:\n",
+            "  connect_result = 'DENIED:%d' % e.errno\n",
+            "try:\n",
+            "  s.sendall(b'escaped')\n",
+            "  send_result = 'SENT'\n",
+            "except OSError as e:\n",
+            "  send_result = 'BLOCKED:%d' % e.errno\n",
+            "open('{out}', 'w').write(connect_result + ';' + send_result)\n",
+        ),
+        port = port,
+        out = out.display()
+    );
 
     let result = policy
         .run_interactive(&["python3", "-c", &script])
@@ -145,7 +178,10 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
         !content.ends_with(";SENT"),
         "denied socket still sent data: {content:?}"
     );
-    assert!(listener.accept().is_err(), "denied connect reached the listener");
+    assert!(
+        listener.accept().is_err(),
+        "denied connect reached the listener"
+    );
 }
 
 /// restrict_network narrows outbound to the listed IPs and is enforced. The
@@ -184,13 +220,25 @@ async fn test_policy_fn_restrict_network_takes_effect() {
         "open('{out}', 'w').write('allowed=' + probe('127.0.0.1', {p1}) + ' denied=' + probe('127.0.0.2', {p2}))\n",
     ), out = out.display(), p1 = p1, p2 = p2);
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(content.contains("allowed=OK"), "listed IP should still connect, got: {}", content);
-    assert!(content.contains("denied=ERR111"), "non-listed IP should be refused, got: {}", content);
+    assert!(
+        content.contains("allowed=OK"),
+        "listed IP should still connect, got: {}",
+        content
+    );
+    assert!(
+        content.contains("denied=ERR111"),
+        "non-listed IP should be refused, got: {}",
+        content
+    );
 }
 
 /// Test deny_path blocks filesystem access dynamically.
@@ -208,19 +256,30 @@ async fn test_policy_fn_deny_path() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "try:\n",
-        "  with open('/etc/hostname') as f:\n",
-        "    open('{out}', 'w').write('READ:' + f.read().strip())\n",
-        "except (PermissionError, OSError) as e:\n",
-        "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "try:\n",
+            "  with open('/etc/hostname') as f:\n",
+            "    open('{out}', 'w').write('READ:' + f.read().strip())\n",
+            "except (PermissionError, OSError) as e:\n",
+            "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("BLOCKED"), "path should be denied, got: {}", content);
+    assert!(
+        content.starts_with("BLOCKED"),
+        "path should be denied, got: {}",
+        content
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -239,12 +298,19 @@ async fn test_policy_fn_passthrough() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&["python3", "-c", "print('hello')"],
-    ).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", "print('hello')"])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let count = *call_count.lock().unwrap();
-    assert!(count > 0, "callback should have been called at least once, got {}", count);
+    assert!(
+        count > 0,
+        "callback should have been called at least once, got {}",
+        count
+    );
 }
 
 /// Test execve events include argv (TOCTOU-safe via sibling freeze).
@@ -265,14 +331,23 @@ async fn test_policy_fn_execve_argv() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&["python3", "-c", "print('argv test')"],
-    ).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", "print('argv test')"])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let captured = argvs.lock().unwrap();
     assert!(!captured.is_empty(), "should have captured execve argv");
-    let has_python = captured.iter().any(|args| args.iter().any(|a| a.contains("python3")));
-    assert!(has_python, "argv should contain python3, got: {:?}", *captured);
+    let has_python = captured
+        .iter()
+        .any(|args| args.iter().any(|a| a.contains("python3")));
+    assert!(
+        has_python,
+        "argv should contain python3, got: {:?}",
+        *captured
+    );
 }
 
 /// Test argv_contains-based denial. The supervisor freezes sibling
@@ -290,9 +365,15 @@ async fn test_policy_fn_deny_by_argv() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&["echo", "malicious"],
-    ).await.unwrap();
-    assert!(!result.success(), "execve with 'malicious' in argv should be denied");
+    let result = policy
+        .clone()
+        .run_interactive(&["echo", "malicious"])
+        .await
+        .unwrap();
+    assert!(
+        !result.success(),
+        "execve with 'malicious' in argv should be denied"
+    );
 }
 
 /// Test event has host/port metadata for connect.
@@ -313,11 +394,16 @@ async fn test_policy_fn_connect_metadata() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&[
-        "python3", "-c",
-        "import socket; s=socket.socket(); s.settimeout(0.1); \
+    let result = policy
+        .clone()
+        .run_interactive(&[
+            "python3",
+            "-c",
+            "import socket; s=socket.socket(); s.settimeout(0.1); \
          s.connect_ex(('127.0.0.1', 9999)); s.close()",
-    ]).await.unwrap();
+        ])
+        .await
+        .unwrap();
     let _ = result;
 
     let captured = events.lock().unwrap();
@@ -341,23 +427,37 @@ async fn test_policy_fn_event_categories() {
     let policy = base_policy()
         .net_allow("127.0.0.1:443")
         .policy_fn(PolicyFn::new(move |event, _ctx| {
-            cats_clone.lock().unwrap().push((event.syscall.clone(), event.category));
+            cats_clone
+                .lock()
+                .unwrap()
+                .push((event.syscall.clone(), event.category));
             Verdict::Allow
         }))
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&["python3", "-c", "print('categories')"],
-    ).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", "print('categories')"])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let captured = categories.lock().unwrap();
     // openat should be File
     let has_file = captured.iter().any(|(_, c)| *c == SyscallCategory::File);
-    assert!(has_file, "should have File category events, got: {:?}", *captured);
+    assert!(
+        has_file,
+        "should have File category events, got: {:?}",
+        *captured
+    );
     // execve should be Process
     let has_process = captured.iter().any(|(_, c)| *c == SyscallCategory::Process);
-    assert!(has_process, "should have Process category events, got: {:?}", *captured);
+    assert!(
+        has_process,
+        "should have Process category events, got: {:?}",
+        *captured
+    );
 }
 
 // ============================================================
@@ -380,15 +480,22 @@ async fn test_policy_fn_parent_pid() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&["python3", "-c", "print('ppid')"],
-    ).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", "print('ppid')"])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let captured = ppids.lock().unwrap();
     assert!(!captured.is_empty(), "should have execve events");
     // At least one event should have a non-zero parent_pid
     let has_ppid = captured.iter().any(|p| p.map_or(false, |v| v > 0));
-    assert!(has_ppid, "execve should have parent_pid > 0, got: {:?}", *captured);
+    assert!(
+        has_ppid,
+        "execve should have parent_pid > 0, got: {:?}",
+        *captured
+    );
 }
 
 // ============================================================
@@ -411,25 +518,36 @@ async fn test_policy_fn_deny_with_eacces() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket, errno\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(1)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', 1))\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "except OSError as e:\n",
-        "  open('{out}', 'w').write(f'ERR:{{e.errno}}')\n",
-        "finally:\n",
-        "  s.close()\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, errno\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(1)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', 1))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write(f'ERR:{{e.errno}}')\n",
+            "finally:\n",
+            "  s.close()\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     // EACCES = 13
-    assert!(content.contains("ERR:13"), "should get EACCES (13), got: {}", content);
+    assert!(
+        content.contains("ERR:13"),
+        "should get EACCES (13), got: {}",
+        content
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -455,8 +573,11 @@ async fn test_policy_fn_audit() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run_interactive(&["cat", "/etc/hostname"],
-    ).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["cat", "/etc/hostname"])
+        .await
+        .unwrap();
     // Audit should allow the syscall — cat should succeed
     assert!(result.success(), "Audit should allow, not deny");
 
@@ -487,17 +608,25 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', {port}))\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "except OSError as e:\n",
-        "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
-    ), port = port, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
+        ),
+        port = port,
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -505,7 +634,10 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
     // The listener is live, so a successful connect would read "CONNECTED";
     // ERR111 (ECONNREFUSED from the on-behalf deny) can only come from the
     // per-pid restriction.
-    assert_eq!(content, "ERR111", "restrict_pid_network([]) must deny the connect");
+    assert_eq!(
+        content, "ERR111",
+        "restrict_pid_network([]) must deny the connect"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -522,7 +654,7 @@ async fn test_policy_fn_restrict_max_memory_enforced() {
         "import sys\n",
         "print('STARTED', flush=True)\n",
         "b = bytearray(128 * 1024 * 1024)\n",
-        "b[::4096] = b'\\x01' * (len(b) // 4096)\n",   // commit the pages
+        "b[::4096] = b'\\x01' * (len(b) // 4096)\n", // commit the pages
         "print('ALLOC_OK')\n",
     );
 
@@ -536,26 +668,35 @@ async fn test_policy_fn_restrict_max_memory_enforced() {
         }))
         .build()
         .unwrap()
-        
         .run(&["python3", "-c", alloc_128])
         .await
         .unwrap();
     let out = String::from_utf8_lossy(restricted.stdout.as_deref().unwrap_or(b""));
     assert!(out.contains("STARTED"), "should start, got: {}", out);
-    assert!(!out.contains("ALLOC_OK"), "128 MiB must exceed the 64 MiB dynamic limit, got: {}", out);
-    assert!(!restricted.success(), "process should be killed by the memory limit");
+    assert!(
+        !out.contains("ALLOC_OK"),
+        "128 MiB must exceed the 64 MiB dynamic limit, got: {}",
+        out
+    );
+    assert!(
+        !restricted.success(),
+        "process should be killed by the memory limit"
+    );
 
     let baseline = base_policy()
         .max_memory(ByteSize::mib(256))
         .policy_fn(PolicyFn::new(|_e, _c| Verdict::Allow))
         .build()
         .unwrap()
-        
         .run(&["python3", "-c", alloc_128])
         .await
         .unwrap();
     let out = String::from_utf8_lossy(baseline.stdout.as_deref().unwrap_or(b""));
-    assert!(out.contains("ALLOC_OK"), "128 MiB under the 256 MiB ceiling should succeed, got: {}", out);
+    assert!(
+        out.contains("ALLOC_OK"),
+        "128 MiB under the 256 MiB ceiling should succeed, got: {}",
+        out
+    );
     assert!(baseline.success());
 }
 
@@ -583,25 +724,35 @@ async fn test_policy_fn_restrict_max_processes_enforced() {
         }))
         .build()
         .unwrap()
-        
         .run(&["python3", "-c", fork_once])
         .await
         .unwrap();
     let out = String::from_utf8_lossy(restricted.stdout.as_deref().unwrap_or(b""));
     assert!(out.contains("STARTED"), "should start, got: {}", out);
-    assert!(!out.contains("FORK_OK"), "fork must be denied under the limit, got: {}", out);
-    assert!(out.contains("FORK_DENIED 11"), "fork should be denied with EAGAIN, got: {}", out);
+    assert!(
+        !out.contains("FORK_OK"),
+        "fork must be denied under the limit, got: {}",
+        out
+    );
+    assert!(
+        out.contains("FORK_DENIED 11"),
+        "fork should be denied with EAGAIN, got: {}",
+        out
+    );
 
     let baseline = base_policy()
         .policy_fn(PolicyFn::new(|_e, _c| Verdict::Allow))
         .build()
         .unwrap()
-        
         .run(&["python3", "-c", fork_once])
         .await
         .unwrap();
     let out = String::from_utf8_lossy(baseline.stdout.as_deref().unwrap_or(b""));
-    assert!(out.contains("FORK_OK"), "unrestricted fork should succeed, got: {}", out);
+    assert!(
+        out.contains("FORK_OK"),
+        "unrestricted fork should succeed, got: {}",
+        out
+    );
 }
 
 /// Regression: a workload that forks under an active policy_fn must not
@@ -624,8 +775,7 @@ async fn test_policy_fn_fork_does_not_deadlock() {
         // count events so the fork path is exercised under an active callback
         .policy_fn(PolicyFn::new(|_e, _c| Verdict::Allow))
         .build()
-        .unwrap()
-        ;
+        .unwrap();
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
@@ -637,7 +787,11 @@ async fn test_policy_fn_fork_does_not_deadlock() {
 
     assert!(result.success(), "run should complete");
     let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or(b""));
-    assert!(out.contains("FORKS_OK 30"), "all 30 forks should complete, got: {}", out);
+    assert!(
+        out.contains("FORKS_OK 30"),
+        "all 30 forks should complete, got: {}",
+        out
+    );
 }
 
 /// A policy_fn-only sandbox (no COW, no network supervision) must receive
@@ -650,7 +804,10 @@ async fn test_policy_fn_fs_mutation_events() {
 
     let policy = base_policy()
         .policy_fn(PolicyFn::new(move |event, _ctx| {
-            events_clone.lock().unwrap().push((event.syscall.clone(), event.path.clone()));
+            events_clone
+                .lock()
+                .unwrap()
+                .push((event.syscall.clone(), event.path.clone()));
             Verdict::Allow
         }))
         .build()
@@ -701,7 +858,8 @@ async fn test_policy_fn_deny_openat2() {
         .unwrap();
 
     // SYS_openat2 = 437 on all supported arches; struct open_how { flags, mode, resolve }.
-    let script = format!(concat!(
+    let script = format!(
+        concat!(
         "import ctypes, os\n",
         "libc = ctypes.CDLL(None, use_errno=True)\n",
         "class How(ctypes.Structure):\n",
@@ -712,15 +870,25 @@ async fn test_policy_fn_deny_openat2() {
         "  open('{out}', 'w').write('BLOCKED:%d' % ctypes.get_errno())\n",
         "else:\n",
         "  open('{out}', 'w').write(os.read(fd, 32).decode())\n",
-    ), secret = secret.display(), out = out.display());
+    ),
+        secret = secret.display(),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&secret);
-    assert_eq!(content, "BLOCKED:1", "openat2 must be denied by the policy_fn openat deny (EPERM)");
+    assert_eq!(
+        content, "BLOCKED:1",
+        "openat2 must be denied by the policy_fn openat deny (EPERM)"
+    );
 }
 
 /// Verdict::Deny for a "sendmsg" event must block the send: sendto is held,
@@ -743,24 +911,38 @@ async fn test_policy_fn_deny_sendmsg() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "try:\n",
-        "  s.sendmsg([b'hi'], [], 0, ('127.0.0.1', {port}))\n",
-        "  open('{out}', 'w').write('SENT')\n",
-        "except OSError as e:\n",
-        "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
-    ), port = port, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "try:\n",
+            "  s.sendmsg([b'hi'], [], 0, ('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('SENT')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
+        ),
+        port = port,
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert_eq!(content, "BLOCKED:1", "sendmsg should be denied by policy_fn (EPERM)");
+    assert_eq!(
+        content, "BLOCKED:1",
+        "sendmsg should be denied by policy_fn (EPERM)"
+    );
     let mut buf = [0; 16];
-    assert!(receiver.recv_from(&mut buf).is_err(), "denied sendmsg reached the receiver");
+    assert!(
+        receiver.recv_from(&mut buf).is_err(),
+        "denied sendmsg reached the receiver"
+    );
 }
 
 #[tokio::test]
@@ -772,9 +954,14 @@ async fn test_policy_fn_deny_sendmmsg_has_no_side_effect() {
     let mut policy = base_policy()
         .net_allow(format!("udp://127.0.0.1:{port}"))
         .policy_fn(PolicyFn::new(|event, _ctx| {
-            if event.syscall == "sendmmsg" { Verdict::Deny } else { Verdict::Allow }
+            if event.syscall == "sendmmsg" {
+                Verdict::Deny
+            } else {
+                Verdict::Allow
+            }
         }))
-        .build().unwrap();
+        .build()
+        .unwrap();
     let script = format!(concat!(
         "import ctypes, socket, struct\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
@@ -831,13 +1018,19 @@ async fn test_policy_fn_deny_sendmmsg_has_no_side_effect() {
         "s.close()\n",
     ), out = out.display(), port = port);
 
-    let result = policy.run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out).unwrap();
     let _ = std::fs::remove_file(out);
     assert_eq!(content, "ret=-1 errno=1 msg0_len=0");
     let mut buf = [0; 1];
-    assert_eq!(receiver.recv_from(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        receiver.recv_from(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[tokio::test]
@@ -881,7 +1074,12 @@ async fn unlimited_approval_survives_old_five_second_limit() {
         .unwrap();
     let mut sandbox = policy.clone();
     sandbox.spawn(&["/bin/sleep", "0.1"]).await.unwrap();
-    let result = async { sandbox.wait().await?; sandbox.shutdown().await }.await.unwrap();
+    let result = async {
+        sandbox.wait().await?;
+        sandbox.shutdown().await
+    }
+    .await
+    .unwrap();
     assert!(
         result.success(),
         "unlimited approval must accept a late verdict"

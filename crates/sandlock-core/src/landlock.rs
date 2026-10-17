@@ -5,15 +5,15 @@ use crate::error::{ConfinementError, SandlockError};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
 use crate::sandbox::Sandbox;
 use crate::sys::structs::{
-    LandlockNetPortAttr, LandlockPathBeneathAttr, LandlockRulesetAttr,
-    LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_MAKE_BLOCK,
-    LANDLOCK_ACCESS_FS_MAKE_CHAR, LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO,
-    LANDLOCK_ACCESS_FS_MAKE_REG, LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM,
-    LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER,
-    LANDLOCK_ACCESS_FS_REMOVE_DIR, LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE,
-    LANDLOCK_ACCESS_FS_WRITE_FILE, LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP,
-    LANDLOCK_CREATE_RULESET_VERSION, LANDLOCK_RULE_NET_PORT, LANDLOCK_RULE_PATH_BENEATH,
-    LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET, LANDLOCK_SCOPE_SIGNAL, SYS_LANDLOCK_CREATE_RULESET,
+    LandlockNetPortAttr, LandlockPathBeneathAttr, LandlockRulesetAttr, LANDLOCK_ACCESS_FS_EXECUTE,
+    LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_MAKE_BLOCK, LANDLOCK_ACCESS_FS_MAKE_CHAR,
+    LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO, LANDLOCK_ACCESS_FS_MAKE_REG,
+    LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM, LANDLOCK_ACCESS_FS_READ_DIR,
+    LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REMOVE_DIR,
+    LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_WRITE_FILE,
+    LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP, LANDLOCK_CREATE_RULESET_VERSION,
+    LANDLOCK_RULE_NET_PORT, LANDLOCK_RULE_PATH_BENEATH, LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+    LANDLOCK_SCOPE_SIGNAL, SYS_LANDLOCK_CREATE_RULESET,
 };
 use crate::sys::syscall;
 
@@ -102,7 +102,13 @@ fn present_gpu_indices() -> Vec<u32> {
     // nvidia-uvm, nvidia-caps, nvidia-modeset, etc.
     let mut out: Vec<u32> = entries
         .flatten()
-        .filter_map(|ent| ent.file_name().to_str()?.strip_prefix("nvidia")?.parse().ok())
+        .filter_map(|ent| {
+            ent.file_name()
+                .to_str()?
+                .strip_prefix("nvidia")?
+                .parse()
+                .ok()
+        })
         .collect();
     out.sort_unstable();
     out
@@ -159,7 +165,10 @@ fn shadowed_files() -> impl Iterator<Item = &'static Path> {
 /// tree, so this is the only way to grant the rest. A file created directly
 /// in `dir` after this is not covered; the grants this applies to are
 /// read-only host trees such as /etc.
-fn add_read_rules_around_shadowed(ruleset_fd: &OwnedFd, dir: &Path) -> Result<(), ConfinementError> {
+fn add_read_rules_around_shadowed(
+    ruleset_fd: &OwnedFd,
+    dir: &Path,
+) -> Result<(), ConfinementError> {
     add_path_rule(ruleset_fd, dir, LANDLOCK_ACCESS_FS_READ_DIR)?;
     let entries = std::fs::read_dir(dir)
         .map_err(|e| ConfinementError::Landlock(format!("read dir {:?}: {}", dir, e)))?;
@@ -196,7 +205,10 @@ fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), C
     let raw = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if raw < 0 {
         let e = std::io::Error::last_os_error();
-        return Err(ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e)));
+        return Err(ConfinementError::Landlock(format!(
+            "open path {:?} failed: {}",
+            path, e
+        )));
     }
     let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
 
@@ -423,11 +435,14 @@ pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
     confine_inner(policy, false, false)
 }
 
-fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result<(), SandlockError> {
+fn confine_inner(
+    policy: &Sandbox,
+    handle_net: bool,
+    supervised: bool,
+) -> Result<(), SandlockError> {
     // Step 1 — detect host ABI version.
-    let abi = abi_version().map_err(|e| {
-        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-    })?;
+    let abi = abi_version()
+        .map_err(|e| SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e)))?;
 
     // Step 2 — per-protection availability resolution. Any protection
     // in `ProtectionState::Strict` that the host kernel cannot provide
@@ -490,12 +505,13 @@ fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result
         scoped,
     };
 
-    let ruleset_fd = syscall::landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0)
-        .map_err(|e| {
-            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
-                ConfinementError::Landlock(format!("create ruleset: {}", e)),
-            ))
-        })?;
+    let ruleset_fd =
+        syscall::landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0)
+            .map_err(|e| {
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
+                    ConfinementError::Landlock(format!("create ruleset: {}", e)),
+                ))
+            })?;
 
     // Step 4 — add filesystem path rules.
     // When chroot is active, translate virtual paths (inside chroot) to host
@@ -521,7 +537,9 @@ fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result
         let host;
         let rule_path = if let Some(root) = chroot_root {
             host = root.join(path.strip_prefix("/").unwrap_or(path));
-            if !host.exists() { continue; }
+            if !host.exists() {
+                continue;
+            }
             host.as_path()
         } else {
             path.as_path()
@@ -535,14 +553,20 @@ fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result
         let host;
         let rule_path = if let Some(root) = chroot_root {
             host = root.join(path.strip_prefix("/").unwrap_or(path));
-            if !host.exists() { continue; }
+            if !host.exists() {
+                continue;
+            }
             host.as_path()
         } else {
             // The supervisor serves procfs reads: a rule would let any link
             // reach what the handlers hide by name. Without a supervisor the
             // rule is all there is, so it stays.
-            if supervised && crate::procfs::is_supervised_proc_grant(path) { continue; }
-            if supervised && shadowed_files().any(|f| f == path) { continue; }
+            if supervised && crate::procfs::is_supervised_proc_grant(path) {
+                continue;
+            }
+            if supervised && shadowed_files().any(|f| f == path) {
+                continue;
+            }
             if supervised && shadowed_files().any(|f| f.starts_with(path)) {
                 add_read_rules_around_shadowed(&ruleset_fd, path).map_err(|e| {
                     SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
@@ -609,10 +633,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool, supervised: bool) -> Result
     // handled set, so every bind is already allowed. A listed port `0` is
     // installed verbatim: Landlock permits only a `bind(0)` request with it
     // (the kernel then chooses an ephemeral port), not explicit nonzero binds.
-    if handle_net
-        && net_tcp_active
-        && handled_access_net & LANDLOCK_ACCESS_NET_BIND_TCP != 0
-    {
+    if handle_net && net_tcp_active && handled_access_net & LANDLOCK_ACCESS_NET_BIND_TCP != 0 {
         if let crate::sandbox::BindPorts::Ports(ports) = &policy.net_allow_bind {
             for &port in ports {
                 add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
@@ -712,7 +733,10 @@ mod mask_contract_tests {
     #[test]
     fn scope_mask_disable_abstract_unix_clears_only_abstract_bit() {
         let mut pol = ProtectionPolicy::strict_all();
-        pol.set(Protection::AbstractUnixSocketScope, ProtectionState::Disabled);
+        pol.set(
+            Protection::AbstractUnixSocketScope,
+            ProtectionState::Disabled,
+        );
         let mask = compute_scope_mask(6, &pol);
         assert_eq!(
             mask & LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
@@ -730,7 +754,10 @@ mod mask_contract_tests {
     fn scope_mask_disable_both_returns_zero() {
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::SignalScope, ProtectionState::Disabled);
-        pol.set(Protection::AbstractUnixSocketScope, ProtectionState::Disabled);
+        pol.set(
+            Protection::AbstractUnixSocketScope,
+            ProtectionState::Disabled,
+        );
         assert_eq!(
             compute_scope_mask(6, &pol),
             0,
@@ -744,7 +771,10 @@ mod mask_contract_tests {
         // silently — observable as both bits absent.
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::SignalScope, ProtectionState::Degradable);
-        pol.set(Protection::AbstractUnixSocketScope, ProtectionState::Degradable);
+        pol.set(
+            Protection::AbstractUnixSocketScope,
+            ProtectionState::Degradable,
+        );
         assert_eq!(
             compute_scope_mask(5, &pol),
             0,
@@ -778,8 +808,14 @@ mod mask_contract_tests {
         pol.set(Protection::FsRefer, ProtectionState::Disabled);
         let mask = compute_fs_mask(6, &pol);
         assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, 0);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_TRUNCATE);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_IOCTL_DEV);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_FS_TRUNCATE,
+            LANDLOCK_ACCESS_FS_TRUNCATE
+        );
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
+            LANDLOCK_ACCESS_FS_IOCTL_DEV
+        );
     }
 
     #[test]
@@ -789,7 +825,10 @@ mod mask_contract_tests {
         let mask = compute_fs_mask(6, &pol);
         assert_eq!(mask & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
         assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REFER);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_IOCTL_DEV);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
+            LANDLOCK_ACCESS_FS_IOCTL_DEV
+        );
     }
 
     #[test]
@@ -799,7 +838,10 @@ mod mask_contract_tests {
         let mask = compute_fs_mask(6, &pol);
         assert_eq!(mask & LANDLOCK_ACCESS_FS_IOCTL_DEV, 0);
         assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REFER);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_TRUNCATE);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_FS_TRUNCATE,
+            LANDLOCK_ACCESS_FS_TRUNCATE
+        );
     }
 
     #[test]
@@ -886,8 +928,7 @@ mod mask_contract_tests {
         assert!(!sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
         assert_eq!(
-            mask,
-            LANDLOCK_ACCESS_NET_BIND_TCP,
+            mask, LANDLOCK_ACCESS_NET_BIND_TCP,
             "deny-only must drop CONNECT_TCP so all TCP connects reach the on-behalf path",
         );
         assert!(wildcard, "deny-only must set the wildcard flag");
@@ -905,7 +946,10 @@ mod mask_contract_tests {
             .expect("combined sandbox builds");
         assert!(sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
-        assert!(!wildcard, "combined finite must not force the connect wildcard");
+        assert!(
+            !wildcard,
+            "combined finite must not force the connect wildcard"
+        );
         assert_eq!(
             mask,
             LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
@@ -945,7 +989,10 @@ mod mask_contract_tests {
         assert!(sb.net_allow.is_empty());
         assert!(sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
-        assert!(!wildcard, "http-only finite must not force the connect wildcard");
+        assert!(
+            !wildcard,
+            "http-only finite must not force the connect wildcard"
+        );
         assert_eq!(
             mask,
             LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
@@ -969,8 +1016,7 @@ mod mask_contract_tests {
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
         assert!(wildcard, "deny-only+http must set the wildcard flag");
         assert_eq!(
-            mask,
-            LANDLOCK_ACCESS_NET_BIND_TCP,
+            mask, LANDLOCK_ACCESS_NET_BIND_TCP,
             "deny-only+http must drop CONNECT_TCP",
         );
     }
@@ -987,7 +1033,10 @@ mod mask_contract_tests {
             .expect("combined+http sandbox builds");
         assert!(sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
-        assert!(!wildcard, "combined+http finite must not force the connect wildcard");
+        assert!(
+            !wildcard,
+            "combined+http finite must not force the connect wildcard"
+        );
         assert_eq!(
             mask,
             LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
@@ -1075,8 +1124,7 @@ mod mask_contract_tests {
             .expect("wildcard allow-bind sandbox builds");
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
         assert_eq!(
-            mask,
-            LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            mask, LANDLOCK_ACCESS_NET_CONNECT_TCP,
             "bind-all must drop BIND_TCP from the handled set and keep CONNECT_TCP",
         );
         assert!(!wildcard, "bind-all must not force the connect wildcard");

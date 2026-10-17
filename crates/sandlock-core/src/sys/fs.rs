@@ -158,7 +158,14 @@ pub(crate) fn statx_in_root(
     // baked into how the fd was opened, so drop AT_SYMLINK_NOFOLLOW here.
     let stx_flags = (flags & !libc::AT_SYMLINK_NOFOLLOW) | libc::AT_EMPTY_PATH;
     let rc = unsafe {
-        libc::syscall(libc::SYS_statx, fd, EMPTY, stx_flags, mask, buf.as_mut_ptr())
+        libc::syscall(
+            libc::SYS_statx,
+            fd,
+            EMPTY,
+            stx_flags,
+            mask,
+            buf.as_mut_ptr(),
+        )
     };
     let err = last_errno(libc::EIO);
     unsafe { libc::close(fd) };
@@ -205,9 +212,8 @@ pub(crate) fn readlink_in_root(root: &Path, path: &str) -> Result<Vec<u8>, i32> 
     // then reads its target. The parent walk is confined to root.
     let fd = opath_in_root(root, path, false)?;
     let mut buf = vec![0u8; 4096];
-    let n = unsafe {
-        libc::readlinkat(fd, EMPTY, buf.as_mut_ptr() as *mut libc::c_char, buf.len())
-    };
+    let n =
+        unsafe { libc::readlinkat(fd, EMPTY, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     let err = last_errno(libc::EIO);
     unsafe { libc::close(fd) };
     if n < 0 {
@@ -245,7 +251,12 @@ fn parent_dir_in_root(root: &Path, rel: &str) -> Result<(RawFd, String), i32> {
         return Err(libc::EINVAL);
     }
     let parent = if parent.is_empty() { "." } else { parent };
-    let fd = openat2_in_root(root, parent, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC, 0)?;
+    let fd = openat2_in_root(
+        root,
+        parent,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
     Ok((fd, base.to_string()))
 }
 
@@ -295,10 +306,21 @@ pub(crate) fn mknod_in_root(root: &Path, rel: &str, mode: u32, dev: u64) -> Resu
         unsafe { libc::close(pfd) };
         libc::EINVAL
     })?;
-    let rc = unsafe { libc::mknodat(pfd, cbase.as_ptr(), mode as libc::mode_t, dev as libc::dev_t) };
+    let rc = unsafe {
+        libc::mknodat(
+            pfd,
+            cbase.as_ptr(),
+            mode as libc::mode_t,
+            dev as libc::dev_t,
+        )
+    };
     let err = last_errno(libc::EIO);
     unsafe { libc::close(pfd) };
-    if rc < 0 { Err(err) } else { Ok(()) }
+    if rc < 0 {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 /// Create a symlink `rel -> target` confined within `root` (parent must exist).
@@ -569,7 +591,11 @@ pub(crate) fn file_handle(
     }
 }
 
-fn encode_fh(dirfd: RawFd, path: &std::ffi::CStr, flags: libc::c_int) -> Result<(i32, Vec<u8>), i32> {
+fn encode_fh(
+    dirfd: RawFd,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> Result<(i32, Vec<u8>), i32> {
     // `struct file_handle` is variable length; keep the header and a
     // MAX_HANDLE_SZ payload contiguous and 4-byte aligned (c_uint first).
     #[repr(C)]
@@ -617,8 +643,7 @@ mod tests {
 
         match openat2_in_root(root, "/evil", libc::O_PATH, 0) {
             Ok(fd) => {
-                let resolved =
-                    std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap();
+                let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap();
                 unsafe { libc::close(fd) };
                 assert!(resolved.starts_with(root), "escaped root: {:?}", resolved);
             }
@@ -635,8 +660,7 @@ mod tests {
             Err(libc::ENOENT) => {} // clamped to <root>/etc/group, absent
             Err(libc::ENOSYS) => {}
             Ok(fd) => {
-                let resolved =
-                    std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap();
+                let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap();
                 unsafe { libc::close(fd) };
                 assert!(resolved.starts_with(root), "escaped root: {:?}", resolved);
             }
@@ -663,7 +687,11 @@ mod tests {
         // lstat: stat the link itself, confined; must report a symlink, never
         // the host /etc/group it points at.
         let st = skip_if_nosys!(statat_in_root(root, "evil", false)).unwrap();
-        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFLNK, "expected a symlink");
+        assert_eq!(
+            st.st_mode & libc::S_IFMT,
+            libc::S_IFLNK,
+            "expected a symlink"
+        );
 
         // stat (follow): the absolute target is clamped to <root>/etc/group,
         // which does not exist, so the host file is never reached.
@@ -705,8 +733,14 @@ mod tests {
         symlink("/etc", root.join("dirlink")).unwrap();
 
         let times = [
-            libc::timespec { tv_sec: 1_000_000, tv_nsec: 0 },
-            libc::timespec { tv_sec: 1_000_000, tv_nsec: 0 },
+            libc::timespec {
+                tv_sec: 1_000_000,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 1_000_000,
+                tv_nsec: 0,
+            },
         ];
         // In-tree file: stamp succeeds and takes effect.
         skip_if_nosys!(utimensat_in_root(root, "f", times.as_ptr(), true)).unwrap();
@@ -820,7 +854,11 @@ mod tests {
             return;
         }
         assert_eq!(
-            std::fs::metadata(root.join("f")).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(root.join("f"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         symlink("/etc", root.join("evil")).unwrap();

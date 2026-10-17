@@ -28,9 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sandlock_core::seccomp::notif::NotifAction;
-use sandlock_core::{
-    Handler, HandlerCtx, HandlerError, Sandbox, SandlockError, SyscallError,
-};
+use sandlock_core::{Handler, HandlerCtx, HandlerError, Sandbox, SandlockError, SyscallError};
 
 /// Read a NUL-terminated path from the sandboxed child's address space.
 ///
@@ -109,11 +107,11 @@ async fn handler_intercepts_syscall_outside_builtin_set() {
         }
     };
 
-    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_getcwd, handler)],
-    )
-    .await
-    .expect("sandbox spawn failed");
+    let result = policy
+        .clone()
+        .run_with_handlers(&["sh", "-c", &cmd], [(libc::SYS_getcwd, handler)])
+        .await
+        .expect("sandbox spawn failed");
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -149,11 +147,11 @@ async fn handler_continue_lets_syscall_proceed() {
         }
     };
 
-    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_getcwd, handler)],
-    )
-    .await
-    .expect("sandbox spawn failed");
+    let result = policy
+        .clone()
+        .run_with_handlers(&["sh", "-c", &cmd], [(libc::SYS_getcwd, handler)])
+        .await
+        .expect("sandbox spawn failed");
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -179,7 +177,9 @@ async fn empty_extras_preserves_default_behaviour() {
 
     let baseline = policy.clone().run(&["/bin/pwd"]).await.unwrap();
     let no_handlers: [(i64, fn(&HandlerCtx) -> std::future::Ready<NotifAction>); 0] = [];
-    let with_extras = policy.clone().run_with_handlers(&["/bin/pwd"], no_handlers)
+    let with_extras = policy
+        .clone()
+        .run_with_handlers(&["/bin/pwd"], no_handlers)
         .await
         .unwrap();
 
@@ -215,11 +215,11 @@ async fn handler_runs_after_builtin_returns_continue() {
         }
     };
 
-    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_openat, handler)],
-    )
-    .await
-    .expect("sandbox spawn failed");
+    let result = policy
+        .clone()
+        .run_with_handlers(&["sh", "-c", &cmd], [(libc::SYS_openat, handler)])
+        .await
+        .expect("sandbox spawn failed");
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -271,11 +271,11 @@ async fn builtin_non_continue_blocks_extra() {
         }
     };
 
-    let _ = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_openat, handler)],
-    )
-    .await
-    .expect("sandbox spawn failed");
+    let _ = policy
+        .clone()
+        .run_with_handlers(&["sh", "-c", &cmd], [(libc::SYS_openat, handler)])
+        .await
+        .expect("sandbox spawn failed");
 
     let _ = std::fs::remove_file(&out);
     let paths = observed.lock().unwrap();
@@ -347,11 +347,14 @@ async fn chain_of_extras_runs_in_insertion_order() {
         action: NotifAction::Errno(libc::EACCES),
     };
 
-    let result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
-    )
-    .await
-    .expect("sandbox spawn failed");
+    let result = policy
+        .clone()
+        .run_with_handlers(
+            &["sh", "-c", &cmd],
+            [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
+        )
+        .await
+        .expect("sandbox spawn failed");
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -385,10 +388,10 @@ async fn handler_on_default_blocklist_syscall_is_rejected() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result = policy.clone().run_with_handlers(&["true"],
-        [(libc::SYS_mount, handler)],
-    )
-    .await;
+    let result = policy
+        .clone()
+        .run_with_handlers(&["true"], [(libc::SYS_mount, handler)])
+        .await;
 
     assert!(
         result.is_err(),
@@ -422,10 +425,10 @@ async fn handler_on_user_specified_blocklist_is_rejected() {
         .unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result = policy.clone().run_with_handlers(&["true"],
-        [(libc::SYS_mremap, handler)],
-    )
-    .await;
+    let result = policy
+        .clone()
+        .run_with_handlers(&["true"], [(libc::SYS_mremap, handler)])
+        .await;
 
     assert!(
         result.is_err(),
@@ -469,11 +472,11 @@ async fn handler_via_blanket_impl_dispatches_in_sandbox() {
         }
     };
 
-    let _result = policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_getcwd, handler)],
-    )
-    .await
-    .expect("run_with_handlers");
+    let _result = policy
+        .clone()
+        .run_with_handlers(&["sh", "-c", &cmd], [(libc::SYS_getcwd, handler)])
+        .await
+        .expect("run_with_handlers");
 
     assert!(
         calls.load(Ordering::SeqCst) > 0,
@@ -532,11 +535,11 @@ async fn struct_handler_state_persists_across_sandbox_calls() {
     let out = temp_out("struct-handler-counter");
     let cmd = format!("/bin/pwd; /bin/pwd; echo done > {}", out.display());
 
-    policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_getcwd, handler)],
-    )
-    .await
-    .expect("run_with_handlers");
+    policy
+        .clone()
+        .run_with_handlers(&["sh", "-c", &cmd], [(libc::SYS_getcwd, handler)])
+        .await
+        .expect("run_with_handlers");
     let _ = std::fs::remove_file(&out);
 
     assert!(
@@ -555,8 +558,10 @@ async fn run_with_handlers_rejects_negative_syscall() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result =
-        policy.clone().run_with_handlers(&["true"], [(-5i64, handler)]).await;
+    let result = policy
+        .clone()
+        .run_with_handlers(&["true"], [(-5i64, handler)])
+        .await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::InvalidSyscall(SyscallError::Negative(-5)))) => {}
@@ -573,8 +578,10 @@ async fn run_with_handlers_rejects_arch_unknown_syscall() {
     let policy = base_policy().build().unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
-    let result =
-        policy.clone().run_with_handlers(&["true"], [(99_999i64, handler)]).await;
+    let result = policy
+        .clone()
+        .run_with_handlers(&["true"], [(99_999i64, handler)])
+        .await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::InvalidSyscall(
@@ -634,14 +641,21 @@ async fn run_with_handlers_preserves_insertion_order_in_sandbox_chain() {
         action: NotifAction::Errno(libc::EACCES),
     };
 
-    policy.clone().run_with_handlers(&["sh", "-c", &cmd],
-        [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
-    )
-    .await
-    .expect("run_with_handlers");
+    policy
+        .clone()
+        .run_with_handlers(
+            &["sh", "-c", &cmd],
+            [(libc::SYS_getcwd, h1), (libc::SYS_getcwd, h2)],
+        )
+        .await
+        .expect("run_with_handlers");
 
     let order = order.lock().unwrap();
-    assert!(order.len() >= 2, "expected at least 2 dispatches, got {:?}", *order);
+    assert!(
+        order.len() >= 2,
+        "expected at least 2 dispatches, got {:?}",
+        *order
+    );
     assert_eq!(order[0], 1, "h1 must run before h2; order: {:?}", *order);
     assert_eq!(order[1], 2, "h2 must run after h1; order: {:?}", *order);
 
@@ -657,8 +671,10 @@ async fn run_with_handlers_rejects_handler_on_default_blocklist_syscall() {
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };
 
     // SYS_mount is in DEFAULT_BLOCKLIST_SYSCALLS.
-    let result =
-        policy.clone().run_with_handlers(&["true"], [(libc::SYS_mount, handler)]).await;
+    let result = policy
+        .clone()
+        .run_with_handlers(&["true"], [(libc::SYS_mount, handler)])
+        .await;
 
     match result {
         Err(SandlockError::Handler(HandlerError::OnDenySyscall { syscall_nr })) => {
@@ -693,7 +709,11 @@ async fn inject_bytes_delivers_synthetic_content_to_guest() {
         // sentinel injects; every other openat (libc, the output file, ...)
         // falls through.
         let path = sandlock_core::seccomp::notif::read_child_cstr(
-            cx.notif_fd, cx.notif.id, cx.notif.pid, cx.notif.data.args[1], 4096,
+            cx.notif_fd,
+            cx.notif.id,
+            cx.notif.pid,
+            cx.notif.data.args[1],
+            4096,
         );
         async move {
             match path {

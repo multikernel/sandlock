@@ -27,7 +27,12 @@ fn run_in_pty_session(f: fn() -> i32) -> i32 {
             std::ptr::null_mut(),
         )
     };
-    assert_eq!(ret, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        ret,
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
 
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
@@ -60,8 +65,16 @@ fn run_in_pty_session(f: fn() -> i32) -> i32 {
     // Close the master only after the child exits, so the slave side stays
     // a live terminal for the whole run.
     unsafe { libc::close(master) };
-    assert_eq!(ret, pid, "waitpid failed: {}", std::io::Error::last_os_error());
-    assert!(libc::WIFEXITED(status), "helper child did not exit normally: status {status}");
+    assert_eq!(
+        ret,
+        pid,
+        "waitpid failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        libc::WIFEXITED(status),
+        "helper child did not exit normally: status {status}"
+    );
     libc::WEXITSTATUS(status)
 }
 
@@ -189,7 +202,11 @@ fn shutdown_returns_tty_foreground_taken_by_a_job() {
                               time.sleep(0.3)\n    \
                               os.tcsetpgrp(0, os.getpgrp())\n    \
                               time.sleep(60)\n";
-            if policy.spawn_interactive(&["python3", "-c", script]).await.is_err() {
+            if policy
+                .spawn_interactive(&["python3", "-c", script])
+                .await
+                .is_err()
+            {
                 return EXIT_RUN_FAILED;
             }
             if policy.wait().await.is_err() {

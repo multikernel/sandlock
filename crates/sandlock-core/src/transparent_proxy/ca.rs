@@ -19,7 +19,9 @@ fn dummy_ca() -> std::io::Result<(KeyPair, rcgen::Certificate)> {
     // A distinct subject DN is required: leaf certs minted under this CA must
     // have a subject that differs from their issuer, otherwise an empty-DN leaf
     // looks self-signed (subject == issuer) and clients reject it.
-    params.distinguished_name.push(DnType::CommonName, "sandlock MITM CA");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "sandlock MITM CA");
     let cert = params.self_signed(&kp).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("self-sign failed: {e}"))
     })?;
@@ -46,10 +48,16 @@ pub(crate) fn resolve_ca(
 ) -> std::io::Result<Option<CaMaterial>> {
     if let (Some(cert_path), Some(key_path)) = (ca_cert, ca_key) {
         let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to read --http-ca {:?}: {e}", cert_path))
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read --http-ca {:?}: {e}", cert_path),
+            )
         })?;
         let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("failed to read --http-key {:?}: {e}", key_path))
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read --http-key {:?}: {e}", key_path),
+            )
         })?;
         return Ok(Some(CaMaterial { cert_pem, key_pem }));
     }
@@ -69,7 +77,9 @@ mod tests {
 
     #[test]
     fn resolve_ca_generate_produces_parseable_ca() {
-        let m = resolve_ca(None, None, true).unwrap().expect("should generate");
+        let m = resolve_ca(None, None, true)
+            .unwrap()
+            .expect("should generate");
         let kp = KeyPair::from_pem(&m.key_pem).expect("key parses");
         let _ = CertificateParams::from_ca_cert_pem(&m.cert_pem)
             .expect("cert parses")

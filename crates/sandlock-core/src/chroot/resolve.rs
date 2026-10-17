@@ -136,13 +136,11 @@ pub fn resolve_in_root_nofollow(
 ///
 /// Use this for read-only lookups (stat, access, readlink) where the file
 /// must already exist.
-pub fn resolve_existing_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
-    match openat2_in_root(
-        chroot_root,
-        child_path,
-        libc::O_PATH | libc::O_CLOEXEC,
-        0,
-    ) {
+pub fn resolve_existing_in_root(
+    chroot_root: &Path,
+    child_path: &str,
+) -> Option<(PathBuf, PathBuf)> {
+    match openat2_in_root(chroot_root, child_path, libc::O_PATH | libc::O_CLOEXEC, 0) {
         Ok(fd) => {
             let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
             unsafe { libc::close(fd) };
@@ -346,11 +344,7 @@ mod tests {
                 // If it succeeds, the resolved path must be under root.
                 let resolved = std::fs::read_link(format!("/proc/self/fd/{}", fd)).unwrap();
                 unsafe { libc::close(fd) };
-                assert!(
-                    resolved.starts_with(root),
-                    "escaped chroot: {:?}",
-                    resolved
-                );
+                assert!(resolved.starts_with(root), "escaped chroot: {:?}", resolved);
             }
             Err(e) => panic!("unexpected error: {}", e),
         }
@@ -477,8 +471,11 @@ mod tests {
         match result {
             Some((host, virt)) => {
                 assert!(host.starts_with(root));
-                assert!(host.ends_with("python3.12"),
-                    "host path should be resolved through symlink: {:?}", host);
+                assert!(
+                    host.ends_with("python3.12"),
+                    "host path should be resolved through symlink: {:?}",
+                    host
+                );
                 assert_eq!(virt, PathBuf::from("/usr/local/bin/python3.12"));
             }
             None => {
@@ -500,8 +497,11 @@ mod tests {
         let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
         match result {
             Some((host, virt)) => {
-                assert!(host.starts_with(root),
-                    "absolute symlink must not escape chroot: {:?}", host);
+                assert!(
+                    host.starts_with(root),
+                    "absolute symlink must not escape chroot: {:?}",
+                    host
+                );
                 assert!(host.ends_with("usr/bin/python3.12"));
                 assert_eq!(virt, PathBuf::from("/usr/bin/python3.12"));
             }

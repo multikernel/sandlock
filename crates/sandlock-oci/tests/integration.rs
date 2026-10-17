@@ -138,7 +138,10 @@ fn oci_check_exits_zero() {
 #[test]
 fn oci_state_unknown_sandbox_errors() {
     let out = run_oci(&["state", "this-does-not-exist-xyz-12345"]);
-    assert!(!out.status.success(), "expected failure for unknown sandbox");
+    assert!(
+        !out.status.success(),
+        "expected failure for unknown sandbox"
+    );
 }
 
 #[test]
@@ -277,11 +280,16 @@ async fn oci_restore_resumes_vdso_free_program() {
 
     // ── Test setup: produce a checkpoint image with sandlock-core ───────────
     let policy = sandlock_core::Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_read(&tmp)
         .fs_write(&tmp)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let bin_s = bin.to_str().unwrap().to_string();
     // Capturing spawn so the source's stdio are pipes (not inherited regular
@@ -293,10 +301,15 @@ async fn oci_restore_resumes_vdso_free_program() {
 
     let cp = sb.checkpoint().await.unwrap();
     let read_counter = |path: &str| -> Option<u64> {
-        fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
     };
     let baseline = read_counter(&counter_s).expect("counter file should exist with a value");
-    assert!(baseline > 2, "counter should have advanced before checkpoint, got {baseline}");
+    assert!(
+        baseline > 2,
+        "counter should have advanced before checkpoint, got {baseline}"
+    );
     cp.save(&image).unwrap();
 
     // Kill the source so only a restored process can advance the file.
@@ -317,10 +330,22 @@ async fn oci_restore_resumes_vdso_free_program() {
     // with `.status()`.
     let restore_log = tmp.join("restore.log");
     let status = Command::new(oci_bin())
-        .args(["--root", &root_s, "restore", id, "--image-path", image.to_str().unwrap()])
-        .stdout(std::process::Stdio::from(fs::File::create(&restore_log).unwrap()))
+        .args([
+            "--root",
+            &root_s,
+            "restore",
+            id,
+            "--image-path",
+            image.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::from(
+            fs::File::create(&restore_log).unwrap(),
+        ))
         .stderr(std::process::Stdio::from(
-            fs::OpenOptions::new().append(true).open(&restore_log).unwrap(),
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&restore_log)
+                .unwrap(),
         ))
         .status()
         .expect("failed to run sandlock-oci restore");
@@ -466,10 +491,22 @@ async fn oci_checkpoint_of_running_container() {
     // ── create (daemonizes a supervisor that inherits stdio; redirect + status) ─
     let create_log = tmp.join("create.log");
     let create_status = Command::new(oci_bin())
-        .args(["--root", &root_s, "create", id, "-b", bundle.to_str().unwrap()])
-        .stdout(std::process::Stdio::from(fs::File::create(&create_log).unwrap()))
+        .args([
+            "--root",
+            &root_s,
+            "create",
+            id,
+            "-b",
+            bundle.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::from(
+            fs::File::create(&create_log).unwrap(),
+        ))
         .stderr(std::process::Stdio::from(
-            fs::OpenOptions::new().append(true).open(&create_log).unwrap(),
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&create_log)
+                .unwrap(),
         ))
         .status()
         .expect("failed to run sandlock-oci create");
@@ -516,14 +553,24 @@ async fn oci_checkpoint_of_running_container() {
     let ckpt_out = if running {
         Some(
             Command::new(oci_bin())
-                .args(["--root", &root_s, "checkpoint", id, "--image-path", image.to_str().unwrap()])
+                .args([
+                    "--root",
+                    &root_s,
+                    "checkpoint",
+                    id,
+                    "--image-path",
+                    image.to_str().unwrap(),
+                ])
                 .output()
                 .expect("failed to run sandlock-oci checkpoint"),
         )
     } else {
         None
     };
-    let ckpt_ok = ckpt_out.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    let ckpt_ok = ckpt_out
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     let meta_exists = image.join("meta.json").exists();
 
     // ── bonus: restore the checkpoint into a second container ───────────────────
@@ -540,10 +587,22 @@ async fn oci_checkpoint_of_running_container() {
 
         let restore_log = tmp.join("restore.log");
         let restore_status = Command::new(oci_bin())
-            .args(["--root", &root_s, "restore", id2, "--image-path", image.to_str().unwrap()])
-            .stdout(std::process::Stdio::from(fs::File::create(&restore_log).unwrap()))
+            .args([
+                "--root",
+                &root_s,
+                "restore",
+                id2,
+                "--image-path",
+                image.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::from(
+                fs::File::create(&restore_log).unwrap(),
+            ))
             .stderr(std::process::Stdio::from(
-                fs::OpenOptions::new().append(true).open(&restore_log).unwrap(),
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&restore_log)
+                    .unwrap(),
             ))
             .status()
             .expect("failed to run sandlock-oci restore");
@@ -667,7 +726,11 @@ async fn oci_exec_same_sandbox() {
     fs::copy(&helper, rootfs.join("rootfs-helper")).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(rootfs.join("rootfs-helper"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            rootfs.join("rootfs-helper"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
     }
     create_bundle(&bundle, &["/rootfs-helper", "spawn-loop", "/keepalive.cnt"]);
 
@@ -677,14 +740,30 @@ async fn oci_exec_same_sandbox() {
 
     let create_log = tmp.join("create.log");
     let cs = Command::new(oci_bin())
-        .args(["--root", &root_s, "create", id, "-b", bundle.to_str().unwrap()])
-        .stdout(std::process::Stdio::from(fs::File::create(&create_log).unwrap()))
+        .args([
+            "--root",
+            &root_s,
+            "create",
+            id,
+            "-b",
+            bundle.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::from(
+            fs::File::create(&create_log).unwrap(),
+        ))
         .stderr(std::process::Stdio::from(
-            fs::OpenOptions::new().append(true).open(&create_log).unwrap(),
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&create_log)
+                .unwrap(),
         ))
         .status()
         .expect("create");
-    assert!(cs.success(), "create: {}", fs::read_to_string(&create_log).unwrap_or_default());
+    assert!(
+        cs.success(),
+        "create: {}",
+        fs::read_to_string(&create_log).unwrap_or_default()
+    );
     assert!(Command::new(oci_bin())
         .args(["--root", &root_s, "start", id])
         .output()
@@ -695,7 +774,9 @@ async fn oci_exec_same_sandbox() {
     // container running once keepalive advances
     let host_keepalive = rootfs.join("keepalive.cnt");
     let read = |p: &std::path::Path| {
-        fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<u64>().ok())
+        fs::read_to_string(p)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
     };
     let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut running = false;
@@ -706,23 +787,44 @@ async fn oci_exec_same_sandbox() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(running, "container never started: {}", fs::read_to_string(&create_log).unwrap_or_default());
+    assert!(
+        running,
+        "container never started: {}",
+        fs::read_to_string(&create_log).unwrap_or_default()
+    );
 
     // exec writes a sentinel inside the container rootfs and exits 0
     let exec_out = Command::new(oci_bin())
-        .args(["--root", &root_s, "exec", id, "/rootfs-helper", "write", "/exec.ok", "done"])
+        .args([
+            "--root",
+            &root_s,
+            "exec",
+            id,
+            "/rootfs-helper",
+            "write",
+            "/exec.ok",
+            "done",
+        ])
         .output()
         .expect("exec");
     let sentinel = rootfs.join("exec.ok");
-    let ok = sentinel.exists() && fs::read_to_string(&sentinel).unwrap_or_default().trim() == "done";
+    let ok =
+        sentinel.exists() && fs::read_to_string(&sentinel).unwrap_or_default().trim() == "done";
 
     let _ = Command::new(oci_bin())
         .args(["--root", &root_s, "delete", id, "--force"])
         .output();
     let _ = fs::remove_dir_all(&tmp);
 
-    assert!(exec_out.status.success(), "exec must exit 0: {}", String::from_utf8_lossy(&exec_out.stderr));
-    assert!(ok, "exec'd process must run inside the container rootfs and write /exec.ok=done");
+    assert!(
+        exec_out.status.success(),
+        "exec must exit 0: {}",
+        String::from_utf8_lossy(&exec_out.stderr)
+    );
+    assert!(
+        ok,
+        "exec'd process must run inside the container rootfs and write /exec.ok=done"
+    );
 }
 
 /// Regression test for process-group collapse on container stop. sandlock has
@@ -758,14 +860,20 @@ async fn oci_stop_collapses_process_group() {
     fs::copy(&helper, rootfs.join("rootfs-helper")).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(rootfs.join("rootfs-helper"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            rootfs.join("rootfs-helper"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
     }
     create_bundle(&bundle, &["/rootfs-helper", "spawn-loop", "/child.cnt"]);
 
     let host_child = rootfs.join("child.cnt");
     let host_child_s = host_child.to_str().unwrap().to_string();
     let read_counter = |path: &str| -> Option<u64> {
-        fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
     };
 
     let root = tempdir().unwrap();
@@ -775,20 +883,40 @@ async fn oci_stop_collapses_process_group() {
     // create (daemonizes a supervisor that inherits stdio; redirect + .status()).
     let create_log = tmp.join("create.log");
     let create_status = Command::new(oci_bin())
-        .args(["--root", &root_s, "create", id, "-b", bundle.to_str().unwrap()])
-        .stdout(std::process::Stdio::from(fs::File::create(&create_log).unwrap()))
+        .args([
+            "--root",
+            &root_s,
+            "create",
+            id,
+            "-b",
+            bundle.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::from(
+            fs::File::create(&create_log).unwrap(),
+        ))
         .stderr(std::process::Stdio::from(
-            fs::OpenOptions::new().append(true).open(&create_log).unwrap(),
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&create_log)
+                .unwrap(),
         ))
         .status()
         .expect("run create");
-    assert!(create_status.success(), "create failed: {}", fs::read_to_string(&create_log).unwrap_or_default());
+    assert!(
+        create_status.success(),
+        "create failed: {}",
+        fs::read_to_string(&create_log).unwrap_or_default()
+    );
 
     let start_out = Command::new(oci_bin())
         .args(["--root", &root_s, "start", id])
         .output()
         .expect("run start");
-    assert!(start_out.status.success(), "start failed: {}", String::from_utf8_lossy(&start_out.stderr));
+    assert!(
+        start_out.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start_out.stderr)
+    );
 
     // Wait until the forked worker is genuinely running.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -821,8 +949,16 @@ async fn oci_stop_collapses_process_group() {
         .output();
     let _ = fs::remove_dir_all(&tmp);
 
-    assert!(worker_running, "forked worker never started; create_log: {}", fs::read_to_string(&create_log).unwrap_or_default());
-    assert!(kill_ok, "kill failed: {}", String::from_utf8_lossy(&kill_out.stderr));
+    assert!(
+        worker_running,
+        "forked worker never started; create_log: {}",
+        fs::read_to_string(&create_log).unwrap_or_default()
+    );
+    assert!(
+        kill_ok,
+        "kill failed: {}",
+        String::from_utf8_lossy(&kill_out.stderr)
+    );
     assert_eq!(
         sample_a, sample_b,
         "worker must stop advancing after the container's main process is killed \

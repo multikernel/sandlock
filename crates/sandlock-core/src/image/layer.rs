@@ -13,8 +13,7 @@ use std::path::Path;
 use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::sys::fs::{
     linkat_in_root, list_dir_in_root, mkdir_in_root, mkdirp_in_root, mknod_in_root,
-    openat2_in_root, remove_dir_all_in_root, statat_in_root, symlinkat_in_root,
-    unlinkat_in_root,
+    openat2_in_root, remove_dir_all_in_root, statat_in_root, symlinkat_in_root, unlinkat_in_root,
 };
 
 const WHITEOUT_PREFIX: &str = ".wh.";
@@ -231,9 +230,8 @@ impl Applier<'_> {
 
 /// Canonical relative form of a tar path; `None` for the root itself.
 fn normalize(raw: &[u8]) -> Result<Option<String>, SandlockError> {
-    let s = std::str::from_utf8(raw).map_err(|_| {
-        layer_error(&String::from_utf8_lossy(raw), "non-UTF-8 path")
-    })?;
+    let s = std::str::from_utf8(raw)
+        .map_err(|_| layer_error(&String::from_utf8_lossy(raw), "non-UTF-8 path"))?;
     let mut parts = Vec::new();
     for comp in s.split('/') {
         match comp {
@@ -305,7 +303,13 @@ mod tests {
         b.into_inner().unwrap()
     }
 
-    fn entry(b: &mut tar::Builder<Vec<u8>>, kind: tar::EntryType, path: &str, mode: u32, data: &[u8]) {
+    fn entry(
+        b: &mut tar::Builder<Vec<u8>>,
+        kind: tar::EntryType,
+        path: &str,
+        mode: u32,
+        data: &[u8],
+    ) {
         let mut h = tar::Header::new_gnu();
         h.set_path(path).unwrap();
         h.set_entry_type(kind);
@@ -341,17 +345,32 @@ mod tests {
     #[test]
     fn writes_files_with_implicit_parents() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| file(b, "a/b/greeting.txt", b"hello"))).unwrap();
-        assert_eq!(fs::read_to_string(root.path().join("a/b/greeting.txt")).unwrap(), "hello");
+        apply(
+            root.path(),
+            layer(|b| file(b, "a/b/greeting.txt", b"hello")),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("a/b/greeting.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
     fn hardlink_forward_reference_shares_inode() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| {
-            link(b, tar::EntryType::Link, "usr/bin/perl5.34.0", "usr/bin/perl");
-            file(b, "usr/bin/perl", b"#!perl");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                link(
+                    b,
+                    tar::EntryType::Link,
+                    "usr/bin/perl5.34.0",
+                    "usr/bin/perl",
+                );
+                file(b, "usr/bin/perl", b"#!perl");
+            }),
+        )
         .unwrap();
         let a = fs::metadata(root.path().join("usr/bin/perl")).unwrap();
         let c = fs::metadata(root.path().join("usr/bin/perl5.34.0")).unwrap();
@@ -362,17 +381,24 @@ mod tests {
     fn hardlink_to_lower_layer_file() {
         let root = tempfile::tempdir().unwrap();
         apply(root.path(), layer(|b| file(b, "bin/busybox", b"bb"))).unwrap();
-        apply(root.path(), layer(|b| link(b, tar::EntryType::Link, "bin/sh", "bin/busybox"))).unwrap();
+        apply(
+            root.path(),
+            layer(|b| link(b, tar::EntryType::Link, "bin/sh", "bin/busybox")),
+        )
+        .unwrap();
         assert_eq!(fs::read(root.path().join("bin/sh")).unwrap(), b"bb");
     }
 
     #[test]
     fn rewriting_a_file_does_not_touch_its_hardlinks() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| {
-            file(b, "a", b"old");
-            link(b, tar::EntryType::Link, "b", "a");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                file(b, "a", b"old");
+                link(b, tar::EntryType::Link, "b", "a");
+            }),
+        )
         .unwrap();
         apply(root.path(), layer(|b| file(b, "a", b"new"))).unwrap();
         assert_eq!(fs::read(root.path().join("a")).unwrap(), b"new");
@@ -383,15 +409,29 @@ mod tests {
     fn symlink_from_lower_layer_cannot_redirect_writes_outside() {
         let outside = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| link(b, tar::EntryType::Symlink, "up", "../../../../../../..")))
-            .unwrap();
-        apply(root.path(), layer(|b| {
-            link(b, tar::EntryType::Symlink, "abs", outside.path().to_str().unwrap());
-        }))
+        apply(
+            root.path(),
+            layer(|b| link(b, tar::EntryType::Symlink, "up", "../../../../../../..")),
+        )
+        .unwrap();
+        apply(
+            root.path(),
+            layer(|b| {
+                link(
+                    b,
+                    tar::EntryType::Symlink,
+                    "abs",
+                    outside.path().to_str().unwrap(),
+                );
+            }),
+        )
         .unwrap();
 
         apply(root.path(), layer(|b| file(b, "up/pwned", b"x"))).unwrap();
-        assert!(root.path().join("pwned").is_file(), ".. must clamp at the rootfs");
+        assert!(
+            root.path().join("pwned").is_file(),
+            ".. must clamp at the rootfs"
+        );
 
         let _ = apply(root.path(), layer(|b| file(b, "abs/pwned", b"x")));
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
@@ -400,27 +440,39 @@ mod tests {
     #[test]
     fn absolute_symlink_resolves_inside_rootfs() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| {
-            dir(b, "usr/lib/");
-            link(b, tar::EntryType::Symlink, "lib", "/usr/lib");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                dir(b, "usr/lib/");
+                link(b, tar::EntryType::Symlink, "lib", "/usr/lib");
+            }),
+        )
         .unwrap();
         apply(root.path(), layer(|b| file(b, "lib/libc.so", b"elf"))).unwrap();
-        assert_eq!(fs::read(root.path().join("usr/lib/libc.so")).unwrap(), b"elf");
+        assert_eq!(
+            fs::read(root.path().join("usr/lib/libc.so")).unwrap(),
+            b"elf"
+        );
     }
 
     #[test]
     fn whiteout_removes_lower_file_and_tree() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| {
-            file(b, "etc/motd", b"hi");
-            file(b, "var/cache/apt/pkg", b"deb");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                file(b, "etc/motd", b"hi");
+                file(b, "var/cache/apt/pkg", b"deb");
+            }),
+        )
         .unwrap();
-        apply(root.path(), layer(|b| {
-            file(b, "etc/.wh.motd", b"");
-            file(b, "var/cache/.wh.apt", b"");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                file(b, "etc/.wh.motd", b"");
+                file(b, "var/cache/.wh.apt", b"");
+            }),
+        )
         .unwrap();
         assert!(!root.path().join("etc/motd").exists());
         assert!(!root.path().join("var/cache/apt").exists());
@@ -430,16 +482,22 @@ mod tests {
     #[test]
     fn opaque_dir_hides_lower_but_keeps_same_layer_entries() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| {
-            file(b, "d/lower", b"");
-            file(b, "d/sub/lower", b"");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                file(b, "d/lower", b"");
+                file(b, "d/sub/lower", b"");
+            }),
+        )
         .unwrap();
-        apply(root.path(), layer(|b| {
-            file(b, "d/sub/upper", b"");
-            file(b, "d/.wh..wh..opq", b"");
-            file(b, "d/after", b"");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                file(b, "d/sub/upper", b"");
+                file(b, "d/.wh..wh..opq", b"");
+                file(b, "d/after", b"");
+            }),
+        )
         .unwrap();
         let d = root.path().join("d");
         assert!(!d.join("lower").exists());
@@ -451,15 +509,21 @@ mod tests {
     #[test]
     fn upper_entry_replaces_lower_entry_of_other_type() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| {
-            file(b, "x/inner", b"");
-            file(b, "y", b"");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                file(b, "x/inner", b"");
+                file(b, "y", b"");
+            }),
+        )
         .unwrap();
-        apply(root.path(), layer(|b| {
-            file(b, "x", b"now a file");
-            dir(b, "y/");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                file(b, "x", b"now a file");
+                dir(b, "y/");
+            }),
+        )
         .unwrap();
         assert!(root.path().join("x").is_file());
         assert!(root.path().join("y").is_dir());
@@ -468,11 +532,14 @@ mod tests {
     #[test]
     fn modes_keep_owner_access_and_drop_setuid() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| {
-            entry(b, tar::EntryType::Directory, "locked/", 0o555, b"");
-            entry(b, tar::EntryType::Regular, "locked/secret", 0o000, b"s");
-            entry(b, tar::EntryType::Regular, "su", 0o4755, b"");
-        }))
+        apply(
+            root.path(),
+            layer(|b| {
+                entry(b, tar::EntryType::Directory, "locked/", 0o555, b"");
+                entry(b, tar::EntryType::Regular, "locked/secret", 0o000, b"s");
+                entry(b, tar::EntryType::Regular, "su", 0o4755, b"");
+            }),
+        )
         .unwrap();
         let mode = |p: &str| fs::metadata(root.path().join(p)).unwrap().mode() & 0o7777;
         assert_eq!(mode("locked"), 0o755);
@@ -484,7 +551,11 @@ mod tests {
     #[test]
     fn device_nodes_are_skipped() {
         let root = tempfile::tempdir().unwrap();
-        apply(root.path(), layer(|b| entry(b, tar::EntryType::Char, "dev/null", 0o666, b""))).unwrap();
+        apply(
+            root.path(),
+            layer(|b| entry(b, tar::EntryType::Char, "dev/null", 0o666, b"")),
+        )
+        .unwrap();
         assert!(!root.path().join("dev/null").exists());
     }
 

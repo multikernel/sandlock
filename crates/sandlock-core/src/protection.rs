@@ -125,7 +125,10 @@ impl ProtectionPolicy {
     /// Look up the state for a given protection. Returns `Strict`
     /// for protections not explicitly named.
     pub fn state(&self, protection: Protection) -> ProtectionState {
-        self.states.get(&protection).copied().unwrap_or(ProtectionState::Strict)
+        self.states
+            .get(&protection)
+            .copied()
+            .unwrap_or(ProtectionState::Strict)
     }
 
     /// Set the state for a single protection. Internal API — public
@@ -196,9 +199,15 @@ mod policy_tests {
     fn unnamed_protections_default_to_strict_even_after_other_overrides() {
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::SignalScope, ProtectionState::Degradable);
-        assert_eq!(pol.state(Protection::SignalScope), ProtectionState::Degradable);
+        assert_eq!(
+            pol.state(Protection::SignalScope),
+            ProtectionState::Degradable
+        );
         assert_eq!(pol.state(Protection::FsTruncate), ProtectionState::Strict);
-        assert_eq!(pol.state(Protection::AbstractUnixSocketScope), ProtectionState::Strict);
+        assert_eq!(
+            pol.state(Protection::AbstractUnixSocketScope),
+            ProtectionState::Strict
+        );
     }
 
     #[test]
@@ -207,10 +216,17 @@ mod policy_tests {
         pol.set(Protection::FsIoctlDev, ProtectionState::Disabled);
         let collected: Vec<_> = pol.iter().collect();
         assert_eq!(collected.len(), 6);
-        assert!(collected.iter().any(|(p, s)| *p == Protection::FsIoctlDev && *s == ProtectionState::Disabled));
+        assert!(collected
+            .iter()
+            .any(|(p, s)| *p == Protection::FsIoctlDev && *s == ProtectionState::Disabled));
         for (p, s) in &collected {
             if *p != Protection::FsIoctlDev {
-                assert_eq!(*s, ProtectionState::Strict, "{:?} should default to Strict", p);
+                assert_eq!(
+                    *s,
+                    ProtectionState::Strict,
+                    "{:?} should default to Strict",
+                    p
+                );
             }
         }
     }

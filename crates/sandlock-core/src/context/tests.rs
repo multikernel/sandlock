@@ -106,10 +106,7 @@ fn test_notif_syscalls_net() {
 fn test_notif_syscalls_net_deny() {
     // --net-deny is default-allow but still needs every connect/sendto
     // routed to the on-behalf path so the DenyList can refuse matches.
-    let policy = Sandbox::builder()
-        .net_deny("10.0.0.0/8")
-        .build()
-        .unwrap();
+    let policy = Sandbox::builder().net_deny("10.0.0.0/8").build().unwrap();
     let nrs = notif_syscalls(&policy, None);
     assert!(nrs.contains(&(libc::SYS_connect as u32)));
     assert!(nrs.contains(&(libc::SYS_sendto as u32)));
@@ -128,28 +125,25 @@ fn test_notif_syscalls_sandbox_name_enables_hostname_virtualization() {
 #[test]
 fn test_notif_syscalls_faccessat2() {
     // Chroot mode
-    let policy = Sandbox::builder()
-        .chroot("/tmp")
-        .build()
-        .unwrap();
+    let policy = Sandbox::builder().chroot("/tmp").build().unwrap();
     let nrs = notif_syscalls(&policy, None);
     assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
-    assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
-            "chroot notif filter must include SYS_faccessat2 (439)");
-
+    assert!(
+        nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
+        "chroot notif filter must include SYS_faccessat2 (439)"
+    );
 }
 
 #[cfg(feature = "cow")]
 #[test]
 fn test_notif_syscalls_faccessat2_cow() {
-    let policy = Sandbox::builder()
-        .workdir("/tmp")
-        .build()
-        .unwrap();
+    let policy = Sandbox::builder().workdir("/tmp").build().unwrap();
     let nrs = notif_syscalls(&policy, None);
     assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
-    assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
-            "COW notif filter must include SYS_faccessat2 (439)");
+    assert!(
+        nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
+        "COW notif filter must include SYS_faccessat2 (439)"
+    );
 }
 
 #[test]
@@ -267,49 +261,58 @@ fn test_no_supervisor_blocklist_excludes_sysv_ipc_when_allowed() {
 
 #[test]
 fn test_arg_filters_has_clone_ioctl_prctl_socket() {
-    use crate::sys::structs::{
-        BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K,
-    };
+    use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K};
     let policy = Sandbox::builder().build().unwrap();
     let filters = arg_filters(&policy);
     // Should contain JEQ for clone syscall nr
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == libc::SYS_clone as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == libc::SYS_clone as u32));
     // Should contain JSET for CLONE_NS_FLAGS
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JSET | BPF_K)
-        && f.k == CLONE_NS_FLAGS as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JSET | BPF_K) && f.k == CLONE_NS_FLAGS as u32));
     // Should contain JEQ for ioctl syscall nr
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == libc::SYS_ioctl as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == libc::SYS_ioctl as u32));
     // Should contain JEQ for TIOCSTI, TIOCLINUX, and SIOCGIF*/SIOCETHTOOL
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == TIOCSTI as u32));
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == TIOCLINUX as u32));
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == SIOCGIFCONF as u32));
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == SIOCETHTOOL as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == TIOCSTI as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == TIOCLINUX as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == SIOCGIFCONF as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == SIOCETHTOOL as u32));
     // Should contain JEQ for prctl syscall nr
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == libc::SYS_prctl as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == libc::SYS_prctl as u32));
     // Should contain JEQ for PR_SET_DUMPABLE
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == PR_SET_DUMPABLE));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == PR_SET_DUMPABLE));
 }
 
 #[test]
 fn test_arg_filters_mprotect_traps_only_with_memory_limit() {
     use crate::sys::structs::{
-        BPF_ABS, BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, BPF_LD, BPF_W, OFFSET_ARGS2_LO,
+        BPF_ABS, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_W, OFFSET_ARGS2_LO,
     };
     // SYS_mprotect collides with AF_INET6 on x86_64, so the test looks for
     // the nr check followed by the prot load rather than the bare constant.
     let has_mprotect = |filters: &[crate::sys::structs::SockFilter]| {
-        filters.windows(2).any(|w| w[0].code == (BPF_JMP | BPF_JEQ | BPF_K)
-            && w[0].k == libc::SYS_mprotect as u32
-            && w[1].code == (BPF_LD | BPF_W | BPF_ABS)
-            && w[1].k == OFFSET_ARGS2_LO)
+        filters.windows(2).any(|w| {
+            w[0].code == (BPF_JMP | BPF_JEQ | BPF_K)
+                && w[0].k == libc::SYS_mprotect as u32
+                && w[1].code == (BPF_LD | BPF_W | BPF_ABS)
+                && w[1].k == OFFSET_ARGS2_LO
+        })
     };
     let unlimited = Sandbox::builder().build().unwrap();
     assert!(!has_mprotect(&arg_filters(&unlimited)));
@@ -320,8 +323,9 @@ fn test_arg_filters_mprotect_traps_only_with_memory_limit() {
         .unwrap();
     let filters = arg_filters(&limited);
     assert!(has_mprotect(&filters));
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JSET | BPF_K)
-        && f.k == libc::PROT_WRITE as u32));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JSET | BPF_K) && f.k == libc::PROT_WRITE as u32));
 }
 
 #[test]
@@ -331,17 +335,21 @@ fn test_arg_filters_raw_sockets() {
     let policy = Sandbox::builder().build().unwrap();
     let filters = arg_filters(&policy);
     // Should have AF_INET check
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == AF_INET));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == AF_INET));
     // Should have AF_INET6 check
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == AF_INET6));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == AF_INET6));
     // Should have ALU AND SOCK_TYPE_MASK
-    assert!(filters.iter().any(|f| f.code == (BPF_ALU | BPF_AND | BPF_K)
-        && f.k == SOCK_TYPE_MASK));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_ALU | BPF_AND | BPF_K) && f.k == SOCK_TYPE_MASK));
     // Should have JEQ SOCK_RAW
-    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
-        && f.k == SOCK_RAW));
+    assert!(filters
+        .iter()
+        .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == SOCK_RAW));
 }
 
 #[test]
@@ -358,7 +366,8 @@ fn test_arg_filters_udp_denied_by_default() {
 /// contributes the second only when SOCK_DGRAM is in the blocked set.
 fn count_jeq_2(filters: &[crate::sys::structs::SockFilter]) -> usize {
     use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_K};
-    filters.iter()
+    filters
+        .iter()
         .filter(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == 2)
         .count()
 }
@@ -411,7 +420,10 @@ fn test_syscall_name_to_nr_covers_defaults() {
 #[test]
 fn test_effective_nofile_clamps_to_both_inherited_bounds() {
     // A request below both bounds is applied verbatim, the ordinary case.
-    let split = libc::rlimit { rlim_cur: 1024, rlim_max: 1_048_576 };
+    let split = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 1_048_576,
+    };
     assert_eq!(effective_nofile(64, &split), 64);
 
     // A request *between* the inherited soft and hard limits must not widen the
@@ -424,7 +436,10 @@ fn test_effective_nofile_clamps_to_both_inherited_bounds() {
     // limit needs CAP_SYS_RESOURCE), so it clamps rather than aborting the
     // child.
     assert_eq!(effective_nofile(u32::MAX, &split), 1024);
-    let raised = libc::rlimit { rlim_cur: 4096, rlim_max: 4096 };
+    let raised = libc::rlimit {
+        rlim_cur: 4096,
+        rlim_max: 4096,
+    };
     assert_eq!(effective_nofile(u32::MAX, &raised), 4096);
 
     // An unlimited inheritance leaves the request alone.

@@ -258,10 +258,7 @@ mod tests {
         // override (IP-only, any port); deny must still win.
         use crate::seccomp::notif::NetworkPolicy as NP;
         let allow = NP::AllowList {
-            per_ip: HashMap::from([(
-                "10.1.2.3".parse::<IpAddr>().unwrap(),
-                PortAllow::Any,
-            )]),
+            per_ip: HashMap::from([("10.1.2.3".parse::<IpAddr>().unwrap(), PortAllow::Any)]),
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
         };
@@ -295,7 +292,10 @@ mod tests {
         let allowed: IpAddr = "10.0.0.1".parse().unwrap();
         let other: IpAddr = "10.0.0.2".parse().unwrap();
         assert_eq!(destination_verdict(&p, allowed, Some(443)), Ok(()));
-        assert_eq!(destination_verdict(&p, allowed, Some(80)), Err(ECONNREFUSED));
+        assert_eq!(
+            destination_verdict(&p, allowed, Some(80)),
+            Err(ECONNREFUSED)
+        );
         assert_eq!(destination_verdict(&p, other, Some(443)), Err(ECONNREFUSED));
     }
 

@@ -1,4 +1,4 @@
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 
 #[tokio::test]
 async fn test_echo() {
@@ -59,7 +59,8 @@ async fn test_denied_syscall() {
         .unwrap();
     // mount is in DEFAULT_BLOCKLIST_SYSCALLS; redirect stderr to /dev/null
     // (need /dev readable for this)
-    let result = policy.clone()
+    let result = policy
+        .clone()
         .run(&["sh", "-c", "mount -t tmpfs none /tmp 2>/dev/null; echo $?"])
         .await
         .unwrap();
@@ -78,23 +79,46 @@ async fn test_kill_not_running() {
 async fn test_invalid_sandbox_name() {
     // No name → auto-generated; valid. Use a simple command that exits fast.
     let result = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/proc")
-        .build().unwrap()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .build()
+        .unwrap()
         .run(&["true"])
         .await;
-    assert!(result.is_ok(), "sandbox with no name should auto-generate a valid name");
+    assert!(
+        result.is_ok(),
+        "sandbox with no name should auto-generate a valid name"
+    );
 
     // Empty name → error at ensure_runtime time (inside spawn).
-    let result = Sandbox::builder().build().unwrap().with_name("").run(&["true"]).await;
+    let result = Sandbox::builder()
+        .build()
+        .unwrap()
+        .with_name("")
+        .run(&["true"])
+        .await;
     assert!(result.is_err(), "empty sandbox name should fail");
 
     // NUL byte in name → error.
-    let result = Sandbox::builder().build().unwrap().with_name("bad\0name").run(&["true"]).await;
+    let result = Sandbox::builder()
+        .build()
+        .unwrap()
+        .with_name("bad\0name")
+        .run(&["true"])
+        .await;
     assert!(result.is_err(), "NUL byte in sandbox name should fail");
 
     // Name > 64 bytes → error.
     let long_name = "x".repeat(65);
-    let result = Sandbox::builder().build().unwrap().with_name(long_name).run(&["true"]).await;
+    let result = Sandbox::builder()
+        .build()
+        .unwrap()
+        .with_name(long_name)
+        .run(&["true"])
+        .await;
     assert!(result.is_err(), "sandbox name > 64 bytes should fail");
 
     // Name is a path component — reject /, ., ..
@@ -153,15 +177,23 @@ async fn test_default_policy_runs_ls() {
 async fn test_nested_sandbox() {
     // Outer: allows /etc
     let outer = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
         .build()
         .unwrap();
 
     // Inner: does NOT allow /etc — run cat /etc/group, should fail
     let inner = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
         .fs_read("/proc")
         .build()
         .unwrap();
@@ -180,7 +212,11 @@ async fn test_nested_sandbox() {
     // separately verifying that running Sandbox::run after another
     // Sandbox::run works (the seccomp filter stacks).
     outer_sb.kill().unwrap();
-    let _ = async { outer_sb.wait().await?; outer_sb.shutdown().await }.await;
+    let _ = async {
+        outer_sb.wait().await?;
+        outer_sb.shutdown().await
+    }
+    .await;
 
     // Sequential sandboxes: first sandbox applies Landlock + seccomp,
     // second sandbox from the same parent gets EBUSY on seccomp
@@ -200,8 +236,10 @@ async fn test_nested_sandbox() {
 /// filter that stacks under the inner's listener.
 #[tokio::test]
 async fn test_nested_sandbox_via_cli() {
-    let sandlock_bin = std::env::current_dir().unwrap()
-        .join("../../target/release/sandlock").canonicalize();
+    let sandlock_bin = std::env::current_dir()
+        .unwrap()
+        .join("../../target/release/sandlock")
+        .canonicalize();
     let sandlock_bin = match sandlock_bin {
         Ok(p) if p.exists() => p,
         _ => {
@@ -219,14 +257,14 @@ async fn test_nested_sandbox_via_cli() {
 
     let run_outer = |inner_cmd: &str| -> std::process::Output {
         let mut cmd = std::process::Command::new(bin);
-        cmd.args(["run", "--no-supervisor",
-                  "-r", "/usr", "-r", "/lib"]);
+        cmd.args(["run", "--no-supervisor", "-r", "/usr", "-r", "/lib"]);
         if std::path::Path::new("/lib64").exists() {
             cmd.args(["-r", "/lib64"]);
         }
-        cmd.args(["-r", "/bin", "-r", "/etc", "-r", "/proc", "-r", "/dev",
-                  "-r", bin_dir,
-                  "--", "sh", "-c", inner_cmd]);
+        cmd.args([
+            "-r", "/bin", "-r", "/etc", "-r", "/proc", "-r", "/dev", "-r", bin_dir, "--", "sh",
+            "-c", inner_cmd,
+        ]);
         cmd.output().expect("failed to spawn outer sandlock")
     };
 
@@ -240,7 +278,8 @@ async fn test_nested_sandbox_via_cli() {
     assert!(
         !out.status.success(),
         "inner sandbox should block /etc (status={:?}, stderr={})",
-        out.status, String::from_utf8_lossy(&out.stderr),
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
     );
 
     // Inner with /etc allowed — should succeed.
@@ -256,7 +295,8 @@ async fn test_nested_sandbox_via_cli() {
     );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("nested-ok"),
-        "stdout missing inner output: {}", String::from_utf8_lossy(&out.stdout),
+        "stdout missing inner output: {}",
+        String::from_utf8_lossy(&out.stdout),
     );
 
     // Negative: outer WITHOUT `--no-supervisor` keeps the listener slot;
@@ -267,15 +307,24 @@ async fn test_nested_sandbox_via_cli() {
     if std::path::Path::new("/lib64").exists() {
         outer_with_supervisor.args(["-r", "/lib64"]);
     }
-    outer_with_supervisor.args(["-r", "/bin", "-r", "/etc", "-r", "/proc", "-r", "/dev",
-                                "-r", bin_dir,
-                                "--", "sh", "-c", &inner_ok]);
-    let out = outer_with_supervisor.output().expect("failed to spawn outer sandlock");
+    outer_with_supervisor.args([
+        "-r", "/bin", "-r", "/etc", "-r", "/proc", "-r", "/dev", "-r", bin_dir, "--", "sh", "-c",
+        &inner_ok,
+    ]);
+    let out = outer_with_supervisor
+        .output()
+        .expect("failed to spawn outer sandlock");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(),
-        "inner should fail when outer holds the listener (stderr={})", stderr);
-    assert!(stderr.contains("--no-supervisor"),
-        "EBUSY error must hint at --no-supervisor; got stderr: {}", stderr);
+    assert!(
+        !out.status.success(),
+        "inner should fail when outer holds the listener (stderr={})",
+        stderr
+    );
+    assert!(
+        stderr.contains("--no-supervisor"),
+        "EBUSY error must hint at --no-supervisor; got stderr: {}",
+        stderr
+    );
 }
 
 /// Test that fs_denied blocks hardlink, rename, and symlink bypass attempts.
@@ -289,8 +338,12 @@ async fn test_denied_path_hardlink_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -306,7 +359,9 @@ async fn test_denied_path_hardlink_blocked() {
     );
     let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
-        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        result
+            .stdout_str()
+            .map_or(true, |s| !s.contains("TOP_SECRET")),
         "hardlink bypass: sandbox allowed reading denied file via hardlink"
     );
 }
@@ -317,8 +372,12 @@ async fn test_denied_path_hardlink_blocked() {
 async fn test_fifo_opens_meet_with_a_deny_active() {
     let tmp = tempfile::TempDir::new().unwrap();
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/etc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/dev")
         .fs_write(tmp.path())
         .fs_deny(tmp.path().join("secret.txt"))
         .build()
@@ -357,8 +416,12 @@ async fn test_fifo_opens_meet_a_partner_outside_the_sandbox() {
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/etc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/dev")
         .fs_write(tmp.path())
         .fs_deny(tmp.path().join("secret.txt"))
         .build()
@@ -371,7 +434,10 @@ async fn test_fifo_opens_meet_a_partner_outside_the_sandbox() {
         std::fs::read_to_string(&to_host).unwrap()
     });
 
-    let cmd = format!("cd {}; cat from_host; echo to-host > to_host", tmp.path().display());
+    let cmd = format!(
+        "cd {}; cat from_host; echo to-host > to_host",
+        tmp.path().display()
+    );
     let mut sandbox = policy.clone();
     let argv = ["sh", "-c", cmd.as_str()];
     let result = tokio::time::timeout(std::time::Duration::from_secs(20), sandbox.run(&argv))
@@ -396,8 +462,12 @@ async fn test_denied_path_preexisting_hardlink_blocked() {
     std::fs::hard_link(&secret, &alias).unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_deny(&secret) // deny only the "secret.txt" name
         .build()
@@ -406,12 +476,13 @@ async fn test_denied_path_preexisting_hardlink_blocked() {
     // Read via the alias name — not denied by path, but the same inode.
     let result = policy
         .clone()
-        
         .run(&["cat", alias.to_str().unwrap()])
         .await
         .unwrap();
     assert!(
-        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        result
+            .stdout_str()
+            .map_or(true, |s| !s.contains("TOP_SECRET")),
         "pre-existing hardlink bypass: read denied file's bytes via an alias name"
     );
 }
@@ -423,8 +494,12 @@ async fn test_denied_path_rename_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -440,7 +515,9 @@ async fn test_denied_path_rename_blocked() {
     );
     let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
-        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        result
+            .stdout_str()
+            .map_or(true, |s| !s.contains("TOP_SECRET")),
         "rename bypass: sandbox allowed reading denied file via rename"
     );
 }
@@ -463,8 +540,12 @@ async fn test_denied_path_renameat_blocked() {
     let renamed = tmp.path().join("renamed.txt");
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -477,13 +558,20 @@ async fn test_denied_path_renameat_blocked() {
         secret.display(),
         renamed.display(),
     );
-    let _ = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let _ = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap_or_default(),
         "TOP_SECRET",
         "renameat bypass: sandbox allowed renaming a denied file via renameat(2)"
     );
-    assert!(!renamed.exists(), "renameat bypass: denied file was renamed away");
+    assert!(
+        !renamed.exists(),
+        "renameat bypass: denied file was renamed away"
+    );
 }
 
 /// The deny gate must also check the rename *destination*: a file the
@@ -498,8 +586,12 @@ async fn test_denied_path_rename_onto_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -538,8 +630,12 @@ async fn test_denied_path_renameat_onto_blocked() {
     let planted = tmp.path().join("planted.txt");
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -553,7 +649,11 @@ async fn test_denied_path_renameat_onto_blocked() {
         secret.display(),
         planted = planted.display(),
     );
-    let _ = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let _ = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap_or_default(),
         "TOP_SECRET",
@@ -571,8 +671,12 @@ async fn test_denied_path_truncate_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -581,7 +685,11 @@ async fn test_denied_path_truncate_blocked() {
 
     // os.truncate on a path issues truncate(2), not open+ftruncate.
     let script = format!("import os; os.truncate('{}', 0)", secret.display());
-    let _ = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let _ = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap(),
         "TOP_SECRET",
@@ -599,8 +707,12 @@ async fn test_denied_path_unlink_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -623,8 +735,12 @@ async fn test_denied_path_symlink_blocked() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -640,7 +756,9 @@ async fn test_denied_path_symlink_blocked() {
     );
     let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
-        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        result
+            .stdout_str()
+            .map_or(true, |s| !s.contains("TOP_SECRET")),
         "symlink bypass: sandbox allowed reading denied file via symlink"
     );
 }
@@ -657,8 +775,12 @@ async fn test_denied_path_preexisting_symlink_blocked() {
     std::os::unix::fs::symlink(&secret, &link).unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_deny(&secret)
         .build()
@@ -667,7 +789,9 @@ async fn test_denied_path_preexisting_symlink_blocked() {
     let cmd = format!("cat {}", link.display());
     let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
-        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        result
+            .stdout_str()
+            .map_or(true, |s| !s.contains("TOP_SECRET")),
         "pre-existing symlink bypass: read denied file through symlink created before sandbox"
     );
 }
@@ -686,8 +810,12 @@ async fn test_denied_path_chained_symlinks_blocked() {
     std::os::unix::fs::symlink("link1", &link2).unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_deny(&secret)
         .build()
@@ -696,7 +824,9 @@ async fn test_denied_path_chained_symlinks_blocked() {
     let cmd = format!("cat {}", link2.display());
     let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
-        result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
+        result
+            .stdout_str()
+            .map_or(true, |s| !s.contains("TOP_SECRET")),
         "chained symlink bypass: read denied file through symlink chain"
     );
 }
@@ -709,8 +839,12 @@ async fn test_denied_path_allows_normal_writes() {
     std::fs::write(&secret, "TOP_SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/proc").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_read("/etc")
         .fs_read(tmp.path())
         .fs_write(tmp.path())
         .fs_deny(&secret)
@@ -731,22 +865,21 @@ async fn test_denied_path_allows_normal_writes() {
 #[tokio::test]
 async fn test_chroot() {
     // Build a self-contained chroot with the static rootfs-helper binary.
-    let chroot_dir = std::env::temp_dir().join(format!(
-        "sandlock-test-chroot-{}",
-        std::process::id()
-    ));
+    let chroot_dir =
+        std::env::temp_dir().join(format!("sandlock-test-chroot-{}", std::process::id()));
     let _ = std::fs::create_dir_all(chroot_dir.join("usr/bin"));
     let _ = std::fs::create_dir_all(chroot_dir.join("tmp"));
 
     // Static helper binary (compiled by build.rs)
-    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/rootfs-helper");
+    let helper =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper");
     if !helper.exists() {
         eprintln!("chroot test skipped (rootfs-helper not compiled by build.rs)");
         return;
     }
     let dest = chroot_dir.join("usr/bin/rootfs-helper");
-    let _ = std::fs::hard_link(&helper, &dest).or_else(|_| std::fs::copy(&helper, &dest).map(|_| ()));
+    let _ =
+        std::fs::hard_link(&helper, &dest).or_else(|_| std::fs::copy(&helper, &dest).map(|_| ()));
     // Busybox-style symlink: cat → rootfs-helper
     let _ = std::os::unix::fs::symlink("rootfs-helper", chroot_dir.join("usr/bin/cat"));
     // Merged-usr symlink: /bin → usr/bin
@@ -764,7 +897,10 @@ async fn test_chroot() {
         .unwrap();
 
     // cat the marker file — it should be at /marker.txt inside the chroot
-    let result = policy.clone().run_interactive(&["cat", "/marker.txt"]).await;
+    let result = policy
+        .clone()
+        .run_interactive(&["cat", "/marker.txt"])
+        .await;
 
     match result {
         Ok(r) => {
@@ -873,8 +1009,14 @@ async fn test_run_captures_large_stdout_and_stderr_together() {
         .unwrap();
 
     assert!(result.success(), "child should exit 0");
-    assert_eq!(result.stdout.as_ref().map(|b| b.len()), Some(OVER_PIPE_BUFFER));
-    assert_eq!(result.stderr.as_ref().map(|b| b.len()), Some(OVER_PIPE_BUFFER));
+    assert_eq!(
+        result.stdout.as_ref().map(|b| b.len()),
+        Some(OVER_PIPE_BUFFER)
+    );
+    assert_eq!(
+        result.stderr.as_ref().map(|b| b.len()),
+        Some(OVER_PIPE_BUFFER)
+    );
     assert!(
         result.stdout.as_ref().unwrap().iter().all(|&b| b == b'O'),
         "stdout must hold only its own payload",
@@ -897,18 +1039,26 @@ async fn test_run_captures_large_stdout_and_stderr_together() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cancelled_wait_keeps_the_capture_for_the_next_wait() {
     let mut sb = capture_policy().with_name("drain-cancel");
-    sb.spawn(&["sh", "-c", "printf hello; sleep 5"]).await.unwrap();
+    sb.spawn(&["sh", "-c", "printf hello; sleep 5"])
+        .await
+        .unwrap();
 
     // The child sleeps well past this, so the first wait is cancelled mid-flight.
     let first = tokio::time::timeout(std::time::Duration::from_millis(500), sb.wait()).await;
-    assert!(first.is_err(), "the child sleeps 5s: this wait must be cancelled, not complete");
+    assert!(
+        first.is_err(),
+        "the child sleeps 5s: this wait must be cancelled, not complete"
+    );
 
     sb.kill().unwrap();
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async { sb.wait().await?; sb.shutdown().await })
-        .await
-        .expect("the second wait() hung")
-        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        sb.wait().await?;
+        sb.shutdown().await
+    })
+    .await
+    .expect("the second wait() hung")
+    .unwrap();
 
     assert_eq!(
         result.stdout.as_deref(),

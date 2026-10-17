@@ -1,4 +1,4 @@
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 use std::path::PathBuf;
 
 /// Helper to find a free port.
@@ -8,13 +8,22 @@ fn free_port() -> u16 {
 }
 
 fn temp_file(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("sandlock-test-remap-{}-{}", name, std::process::id()))
+    std::env::temp_dir().join(format!(
+        "sandlock-test-remap-{}-{}",
+        name,
+        std::process::id()
+    ))
 }
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
 }
 
@@ -41,7 +50,11 @@ async fn test_port_remap_bind() {
         out = out.display()
     );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "OK");
@@ -90,7 +103,11 @@ async fn test_port_remap_loopback() {
         out = out.display()
     );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "PASS");
@@ -120,10 +137,18 @@ async fn test_port_remap_getsockname() {
         out = out.display()
     );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert_eq!(content, port.to_string(), "getsockname should return bound port");
+    assert_eq!(
+        content,
+        port.to_string(),
+        "getsockname should return bound port"
+    );
     let _ = std::fs::remove_file(&out);
 }
 
@@ -159,7 +184,11 @@ async fn test_port_remap_conflict() {
         out = out.display()
     );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     // Remap must be transparent: child asked for occupied_port and must
@@ -241,10 +270,18 @@ async fn test_port_remap_loopback_under_conflict() {
         out = out.display()
     );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert_eq!(content, "PASS", "loopback under conflict failed: {}", content);
+    assert_eq!(
+        content, "PASS",
+        "loopback under conflict failed: {}",
+        content
+    );
 
     drop(listener);
     let _ = std::fs::remove_file(&out);

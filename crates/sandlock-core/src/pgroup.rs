@@ -54,12 +54,17 @@ impl ProcessGroups {
 
     /// Whether `pgid` was a group of this sandbox, members or not.
     pub fn tracks(&self, pgid: i32) -> bool {
-        self.leaders.lock().map(|leaders| leaders.contains_key(&pgid)).unwrap_or(false)
+        self.leaders
+            .lock()
+            .map(|leaders| leaders.contains_key(&pgid))
+            .unwrap_or(false)
     }
 
     /// Sorted pgids that still have members.
     pub fn live(&self) -> io::Result<Vec<i32>> {
-        let leaders = self.leaders.lock()
+        let leaders = self
+            .leaders
+            .lock()
             .map_err(|_| io::Error::other("process group table poisoned"))?;
         let mut groups = Vec::new();
         for (&pgid, leader) in leaders.iter() {
@@ -122,7 +127,11 @@ fn signal_group(pgid: i32, key: &OwnedFd, sig: i32) -> io::Result<()> {
     if unsafe { libc::kill(-pgid, if reachable { sig } else { 0 }) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if reachable { Ok(()) } else { Err(refused) }
+    if reachable {
+        Ok(())
+    } else {
+        Err(refused)
+    }
 }
 
 pub(crate) fn has_exited(pidfd: RawFd) -> bool {
@@ -301,14 +310,47 @@ mod tests {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             let filter = [
-                libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 0 },
-                libc::sock_filter { code: 0x15, jt: 0, jf: 3, k: libc::SYS_pidfd_send_signal as u32 },
-                libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 16 + 3 * 8 },
-                libc::sock_filter { code: 0x45, jt: 0, jf: 1, k: 1 << 2 },
-                libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32 },
-                libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 3,
+                    k: libc::SYS_pidfd_send_signal as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 16 + 3 * 8,
+                },
+                libc::sock_filter {
+                    code: 0x45,
+                    jt: 0,
+                    jf: 1,
+                    k: 1 << 2,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ALLOW,
+                },
             ];
-            let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
+            let prog = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr() as *mut _,
+            };
             unsafe {
                 libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                 libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog);
@@ -326,7 +368,8 @@ mod tests {
             let (leader, member) = spawn_group(true);
             let groups = ProcessGroups::new();
             groups.track(leader, pidfd_open(leader as u32, 0).unwrap());
-            let reached = groups.live().unwrap() == [leader] && groups.signal(libc::SIGKILL).unwrap() == 1;
+            let reached =
+                groups.live().unwrap() == [leader] && groups.signal(libc::SIGKILL).unwrap() == 1;
             reap(leader);
             wait_gone(member.unwrap());
             reached
@@ -353,7 +396,8 @@ mod tests {
             groups.track(leader, pidfd_open(leader as u32, 0).unwrap());
             unsafe { libc::kill(leader, libc::SIGKILL) };
             reap(leader);
-            let refused = groups.signal(libc::SIGKILL).map_err(|e| e.raw_os_error()) == Err(Some(libc::EINVAL));
+            let refused = groups.signal(libc::SIGKILL).map_err(|e| e.raw_os_error())
+                == Err(Some(libc::EINVAL));
             unsafe { libc::kill(member.unwrap(), libc::SIGKILL) };
             refused
         }));

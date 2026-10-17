@@ -13,10 +13,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_rustls::LazyConfigAcceptor;
 
-use crate::http::HttpRule;
 use self::service::AclService;
 use self::tls::CertSigner;
 use self::upstream::Forwarder;
+use crate::http::HttpRule;
 
 pub(crate) use self::ca::resolve_ca;
 pub(crate) use self::service::OrigDestMap;
@@ -54,10 +54,16 @@ pub(crate) async fn spawn_transparent_proxy(
     ca_key_pem: Option<&str>,
     log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
 ) -> std::io::Result<HttpAclProxyHandle> {
-    let orig_dest: OrigDestMap =
-        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let orig_dest: OrigDestMap = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let forwarder = Forwarder::new()?;
-    let svc = AclService::new(allow, deny, inject, Arc::clone(&orig_dest), forwarder, log_fn);
+    let svc = AclService::new(
+        allow,
+        deny,
+        inject,
+        Arc::clone(&orig_dest),
+        forwarder,
+        log_fn,
+    );
 
     let signer = match (ca_cert_pem, ca_key_pem) {
         (Some(c), Some(k)) => Some(Arc::new(CertSigner::new(c, k)?)),
@@ -182,14 +188,23 @@ mod tests {
             .expect("resolve_ca ok")
             .expect("ephemeral CA generated");
         let allow = vec![crate::http::HttpRule::parse("GET allowed.test/*").expect("rule parses")];
-        let handle = super::spawn_transparent_proxy(allow, vec![], Arc::new(vec![]), Some(&ca.cert_pem), Some(&ca.key_pem), None)
-            .await
-            .expect("proxy spawns");
+        let handle = super::spawn_transparent_proxy(
+            allow,
+            vec![],
+            Arc::new(vec![]),
+            Some(&ca.cert_pem),
+            Some(&ca.key_pem),
+            None,
+        )
+        .await
+        .expect("proxy spawns");
         let addr = handle.addr;
 
         // rustls client that trusts only the generated CA.
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(first_cert_der(&ca.cert_pem)).expect("add CA root");
+        roots
+            .add(first_cert_der(&ca.cert_pem))
+            .expect("add CA root");
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -201,19 +216,17 @@ mod tests {
         // Connect and complete the TLS handshake with SNI "denied.test". A
         // successful handshake proves termination plus trust of the minted leaf.
         let tcp = TcpStream::connect(addr).await.expect("tcp connect");
-        let server_name = rustls::pki_types::ServerName::try_from("denied.test")
-            .expect("valid server name");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("denied.test").expect("valid server name");
         let mut tls = connector
             .connect(server_name, tcp)
             .await
             .expect("TLS handshake against minted leaf");
 
         // A disallowed request: GET denied.test/secret.
-        tls.write_all(
-            b"GET /secret HTTP/1.1\r\nHost: denied.test\r\nConnection: close\r\n\r\n",
-        )
-        .await
-        .expect("write request");
+        tls.write_all(b"GET /secret HTTP/1.1\r\nHost: denied.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
 
         let mut buf = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf))
@@ -222,7 +235,10 @@ mod tests {
             .expect("read response");
         let resp = String::from_utf8_lossy(&buf);
 
-        assert!(resp.starts_with("HTTP/1.1 403"), "expected 403, got: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "expected 403, got: {resp}"
+        );
         assert!(
             resp.contains("Blocked by sandlock HTTP ACL policy"),
             "body: {resp}"

@@ -227,7 +227,11 @@ fn write_error_log(path: &std::path::Path, format: LogFormat, err: &anyhow::Erro
         LogFormat::Json => serde_json::json!({ "level": "error", "msg": msg }).to_string(),
         LogFormat::Text => msg,
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{}", line);
     }
 }
@@ -252,15 +256,22 @@ fn run(cli: Cli) -> Result<()> {
     state::init_state_dir(cli.root.as_deref().and_then(|p| p.to_str()));
 
     match cli.command {
-        Command::Create { id, bundle, pid_file, console_socket: _, no_pivot: _, no_new_keyring: _ } => {
+        Command::Create {
+            id,
+            bundle,
+            pid_file,
+            console_socket: _,
+            no_pivot: _,
+            no_new_keyring: _,
+        } => {
             cmd_create(&id, &bundle, pid_file.as_deref())?;
         }
         Command::Start { id } => {
             cmd_start(&id)?;
         }
         Command::State { id } => {
-            let mut state = SandboxState::load(&id)
-                .with_context(|| format!("no such sandbox: {}", id))?;
+            let mut state =
+                SandboxState::load(&id).with_context(|| format!("no such sandbox: {}", id))?;
             // Reconcile: if we believe the sandbox is running but the process
             // is gone (killed out-of-band), transition to stopped so callers
             // see the current truth rather than stale state.
@@ -335,7 +346,13 @@ fn run(cli: Cli) -> Result<()> {
             cmd_checkpoint(&id, &image_path)?;
         }
         #[cfg(feature = "checkpoint")]
-        Command::Restore { id, image_path, bundle: _, no_pivot: _, no_new_keyring: _ } => {
+        Command::Restore {
+            id,
+            image_path,
+            bundle: _,
+            no_pivot: _,
+            no_new_keyring: _,
+        } => {
             cmd_restore(&id, &image_path)?;
         }
     }
@@ -357,7 +374,9 @@ enum ExitAction {
 fn supervisor_exit_action(info: Option<state::ExitInfo>) -> ExitAction {
     match info {
         Some(state::ExitInfo { code: Some(c), .. }) => ExitAction::Code(c),
-        Some(state::ExitInfo { signal: Some(s), .. }) => ExitAction::Raise(s),
+        Some(state::ExitInfo {
+            signal: Some(s), ..
+        }) => ExitAction::Raise(s),
         _ => ExitAction::Code(0),
     }
 }
@@ -413,7 +432,9 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
 
     // Create initial state
     let state = SandboxState::new(id, &bundle, spec.version());
-    state.save().with_context(|| format!("save state for sandbox {}", id))?;
+    state
+        .save()
+        .with_context(|| format!("save state for sandbox {}", id))?;
 
     // ── Pipe for synchronous PID notification ────────────────────────────────
     // Supervisor writes the child PID here immediately after forking, so the
@@ -441,7 +462,9 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         // ===== INTERMEDIATE CHILD (becomes daemon, then forks supervisor) =====
 
         // Close read end — parent reads the PID
-        unsafe { libc::close(read_fd); }
+        unsafe {
+            libc::close(read_fd);
+        }
 
         // Detach from the parent's session so we survive the parent exiting.
         unsafe { libc::setsid() };
@@ -465,13 +488,17 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         // ===== SUPERVISOR PROCESS (grandchild) =====
 
         // Close the read end (inherited from intermediate, not needed here)
-        unsafe { libc::close(read_fd); }
+        unsafe {
+            libc::close(read_fd);
+        }
 
         // Detach the daemon's working directory from the caller's so we don't
         // pin a filesystem the caller may later want to unmount.  The
         // sandbox's own cwd comes from the OCI spec via the sandbox policy,
         // independent of the supervisor's cwd.
-        unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char); }
+        unsafe {
+            libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+        }
 
         // Redirect only stdin to /dev/null — the supervisor daemon doesn't
         // need input.  stdout/stderr are intentionally *not* redirected:
@@ -517,9 +544,7 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
     //   (EOF)          — supervisor crashed before writing; treated as error
     let (supervisor_pid, init_pid) = {
         let mut buf = [0u8; 512];
-        let n = unsafe {
-            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         unsafe { libc::close(read_fd) };
         if n <= 0 {
             bail!("supervisor exited without reporting status (check system logs)");
@@ -577,7 +602,9 @@ fn cmd_restore(id: &str, image_path: &str) -> Result<()> {
     // dies before it can write its own Running state. The supervisor overwrites
     // this with Running once the child is resumed.
     let state = SandboxState::new(id, std::path::Path::new("/"), "1.0.2");
-    state.save().with_context(|| format!("save state for sandbox {}", id))?;
+    state
+        .save()
+        .with_context(|| format!("save state for sandbox {}", id))?;
 
     // ── Pipe for synchronous PID notification ────────────────────────────────
     let mut pid_pipe: [i32; 2] = [0; 2];
@@ -603,7 +630,9 @@ fn cmd_restore(id: &str, image_path: &str) -> Result<()> {
 
     if pid == 0 {
         // ===== INTERMEDIATE CHILD =====
-        unsafe { libc::close(read_fd); }
+        unsafe {
+            libc::close(read_fd);
+        }
         unsafe { libc::setsid() };
 
         let pid2 = unsafe { libc::fork() };
@@ -621,8 +650,12 @@ fn cmd_restore(id: &str, image_path: &str) -> Result<()> {
         }
 
         // ===== SUPERVISOR PROCESS (grandchild) =====
-        unsafe { libc::close(read_fd); }
-        unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char); }
+        unsafe {
+            libc::close(read_fd);
+        }
+        unsafe {
+            libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+        }
         unsafe {
             let devnull = libc::open(
                 b"/dev/null\0".as_ptr() as *const libc::c_char,
@@ -651,9 +684,7 @@ fn cmd_restore(id: &str, image_path: &str) -> Result<()> {
 
     let child_pid = {
         let mut buf = [0u8; 512];
-        let n = unsafe {
-            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         unsafe { libc::close(read_fd) };
         if n <= 0 {
             bail!("supervisor exited without reporting status (check system logs)");
@@ -687,8 +718,7 @@ fn cmd_restore(id: &str, image_path: &str) -> Result<()> {
 /// Signals the Supervisor to release the paused child (SIGCONT → execve).
 fn cmd_start(id: &str) -> Result<()> {
     // Verify the sandbox exists and is in Created state.
-    let state = SandboxState::load(id)
-        .with_context(|| format!("no such sandbox: {}", id))?;
+    let state = SandboxState::load(id).with_context(|| format!("no such sandbox: {}", id))?;
 
     match state.status {
         Status::Created => {} // expected
@@ -709,15 +739,10 @@ fn cmd_start(id: &str) -> Result<()> {
 ///
 /// Forwards a signal to the sandbox's init process.
 fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
-    let state = SandboxState::load(id)
-        .with_context(|| format!("no such sandbox: {}", id))?;
+    let state = SandboxState::load(id).with_context(|| format!("no such sandbox: {}", id))?;
 
     if state.pid <= 0 {
-        bail!(
-            "sandbox {} has no PID (status: {})",
-            id,
-            state.status
-        );
+        bail!("sandbox {} has no PID (status: {})", id, state.status);
     }
 
     let signum = parse_signal(signal)?;
@@ -726,10 +751,7 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
         // Only the daemon knows the session's groups: init does not lead
         // one, so its pid names no group. A daemon that is gone took the
         // session with it, since its reaper kills the session on owner death.
-        let _ = supervisor::send_command(
-            id,
-            supervisor::SupervisorCmd::Signal { signum },
-        );
+        let _ = supervisor::send_command(id, supervisor::SupervisorCmd::Signal { signum });
     } else {
         let ret = unsafe { libc::kill(state.pid, signum) };
         if ret < 0 {
@@ -753,7 +775,10 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     };
 
     if state.status == Status::Running && !force {
-        bail!("sandbox {} is still running; use --force or kill it first", id);
+        bail!(
+            "sandbox {} is still running; use --force or kill it first",
+            id
+        );
     }
 
     // If the supervisor is blocked waiting for `start`, send Shutdown so it
@@ -785,7 +810,12 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
 /// Asks the Supervisor to snapshot the running sandbox into an image directory.
 #[cfg(feature = "checkpoint")]
 fn cmd_checkpoint(id: &str, image_path: &str) -> Result<()> {
-    match supervisor::send_command(id, supervisor::SupervisorCmd::Checkpoint { dir: image_path.to_string() })? {
+    match supervisor::send_command(
+        id,
+        supervisor::SupervisorCmd::Checkpoint {
+            dir: image_path.to_string(),
+        },
+    )? {
         supervisor::SupervisorReply::Ok => Ok(()),
         supervisor::SupervisorReply::Err { msg } => bail!("checkpoint failed: {}", msg),
         other => bail!("unexpected supervisor reply: {:?}", other),
@@ -827,7 +857,10 @@ fn resolve_exec_request(
                 .as_ref()
                 .map(|e| {
                     e.iter()
-                        .filter_map(|v| v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                        .filter_map(|v| {
+                            v.split_once('=')
+                                .map(|(k, v)| (k.to_string(), v.to_string()))
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -935,12 +968,18 @@ fn cmd_exec(
         // supervisor that the shim already reaps.
         let mut rdy = [0i32; 2];
         if unsafe { libc::pipe2(rdy.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            bail!("pipe2 for exec proxy failed: {}", std::io::Error::last_os_error());
+            bail!(
+                "pipe2 for exec proxy failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
         let (rdy_r, rdy_w) = (rdy[0], rdy[1]);
         let kid = unsafe { libc::fork() };
         if kid < 0 {
-            bail!("fork exec proxy failed: {}", std::io::Error::last_os_error());
+            bail!(
+                "fork exec proxy failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
         if kid == 0 {
             // ===== EXEC PROXY =====
@@ -1000,7 +1039,9 @@ fn cmd_exec(
 
     // Second reply: Exit. Exit this CLI with the same status.
     let mut line2 = String::new();
-    reader.read_line(&mut line2).context("read exec exit reply")?;
+    reader
+        .read_line(&mut line2)
+        .context("read exec exit reply")?;
     let exit_reply: supervisor::SupervisorReply =
         serde_json::from_str(line2.trim()).context("parse exec exit reply")?;
     match exit_reply {
@@ -1052,10 +1093,23 @@ mod tests {
     #[test]
     fn accepts_runc_create_globals() {
         let cli = Cli::try_parse_from([
-            "sandlock-oci", "--root", "/r", "--log", "/l", "--log-format", "json",
-            "--systemd-cgroup", "--debug",
-            "create", "--bundle", "/b", "--pid-file", "/p",
-            "--no-pivot", "--no-new-keyring", "id",
+            "sandlock-oci",
+            "--root",
+            "/r",
+            "--log",
+            "/l",
+            "--log-format",
+            "json",
+            "--systemd-cgroup",
+            "--debug",
+            "create",
+            "--bundle",
+            "/b",
+            "--pid-file",
+            "/p",
+            "--no-pivot",
+            "--no-new-keyring",
+            "id",
         ])
         .expect("should parse runc-style create invocation");
         assert!(matches!(cli.command, Command::Create { .. }));
@@ -1073,8 +1127,14 @@ mod tests {
         ];
         for sub in subs {
             let mut argv = vec![
-                "sandlock-oci", "--root", "/r", "--log", "/l",
-                "--log-format", "json", "--systemd-cgroup",
+                "sandlock-oci",
+                "--root",
+                "/r",
+                "--log",
+                "/l",
+                "--log-format",
+                "json",
+                "--systemd-cgroup",
             ];
             argv.extend_from_slice(sub);
             Cli::try_parse_from(&argv)
@@ -1086,19 +1146,24 @@ mod tests {
     fn rootless_both_forms_parse() {
         let bare = Cli::try_parse_from(["sandlock-oci", "--rootless", "list"]).unwrap();
         assert_eq!(bare.rootless, Some(true));
-        let explicit =
-            Cli::try_parse_from(["sandlock-oci", "--rootless=false", "list"]).unwrap();
+        let explicit = Cli::try_parse_from(["sandlock-oci", "--rootless=false", "list"]).unwrap();
         assert_eq!(explicit.rootless, Some(false));
     }
 
     #[test]
     fn supervisor_exit_action_maps_status() {
         assert_eq!(
-            supervisor_exit_action(Some(state::ExitInfo { code: Some(7), signal: None })),
+            supervisor_exit_action(Some(state::ExitInfo {
+                code: Some(7),
+                signal: None
+            })),
             ExitAction::Code(7)
         );
         assert_eq!(
-            supervisor_exit_action(Some(state::ExitInfo { code: None, signal: Some(libc::SIGSEGV) })),
+            supervisor_exit_action(Some(state::ExitInfo {
+                code: None,
+                signal: Some(libc::SIGSEGV)
+            })),
             ExitAction::Raise(libc::SIGSEGV)
         );
         assert_eq!(supervisor_exit_action(None), ExitAction::Code(0));

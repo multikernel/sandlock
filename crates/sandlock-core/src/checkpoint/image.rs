@@ -1,8 +1,8 @@
-use serde::{Serialize, Deserialize};
-use std::path::{Path, PathBuf};
-use super::{Checkpoint, ProcessState, MemorySegment, MemoryMap, FdInfo};
-use crate::error::{SandlockError, SandboxRuntimeError};
+use super::{Checkpoint, FdInfo, MemoryMap, MemorySegment, ProcessState};
+use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::sandbox::Sandbox;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Save / Load -- directory-based format
@@ -118,11 +118,14 @@ impl Checkpoint {
 
     fn save_inner(&self, dir: &Path) -> Result<(), SandlockError> {
         // meta.json
-        write_json(&dir.join("meta.json"), &MetaJson {
-            name: self.name.clone(),
-            cow_snapshot: self.cow_snapshot.as_ref().map(|p| p.display().to_string()),
-            version: IMAGE_VERSION,
-        })?;
+        write_json(
+            &dir.join("meta.json"),
+            &MetaJson {
+                name: self.name.clone(),
+                cow_snapshot: self.cow_snapshot.as_ref().map(|p| p.display().to_string()),
+                version: IMAGE_VERSION,
+            },
+        )?;
 
         // policy.dat (bincode -- complex struct, not human-readable anyway)
         let policy_bytes = bincode::serialize(&self.policy).map_err(io_err)?;
@@ -141,38 +144,53 @@ impl Checkpoint {
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
 
         // process/info.json
-        write_json(&proc_dir.join("info.json"), &InfoJson {
-            pid: self.process_state.pid,
-            cwd: self.process_state.cwd.clone(),
-            exe: self.process_state.exe.clone(),
-        })?;
+        write_json(
+            &proc_dir.join("info.json"),
+            &InfoJson {
+                pid: self.process_state.pid,
+                cwd: self.process_state.cwd.clone(),
+                exe: self.process_state.exe.clone(),
+            },
+        )?;
 
         // process/fds.json
-        let fds: Vec<FdJson> = self.fd_table.iter().map(|f| FdJson {
-            fd: f.fd,
-            path: f.path.clone(),
-            flags: f.flags,
-            offset: f.offset,
-        }).collect();
+        let fds: Vec<FdJson> = self
+            .fd_table
+            .iter()
+            .map(|f| FdJson {
+                fd: f.fd,
+                path: f.path.clone(),
+                flags: f.flags,
+                offset: f.offset,
+            })
+            .collect();
         write_json(&proc_dir.join("fds.json"), &fds)?;
 
         // process/memory_map.json -- FULL region metadata (every mapping), so
         // restore can RemapFromFile the file-backed regions (e.g. the
         // executable text) that were never captured into memory_data.
-        let maps: Vec<MemoryMapJson> = self.process_state.memory_maps.iter().map(|m| MemoryMapJson {
-            start: m.start,
-            end: m.end,
-            perms: m.perms.clone(),
-            offset: m.offset,
-            path: m.path.clone(),
-        }).collect();
+        let maps: Vec<MemoryMapJson> = self
+            .process_state
+            .memory_maps
+            .iter()
+            .map(|m| MemoryMapJson {
+                start: m.start,
+                end: m.end,
+                perms: m.perms.clone(),
+                offset: m.offset,
+                path: m.path.clone(),
+            })
+            .collect();
         write_json(&proc_dir.join("memory_map.json"), &maps)?;
 
         // process/threads/0.bin -- main thread register state
         let threads_dir = proc_dir.join("threads");
         std::fs::create_dir(&threads_dir)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-        let reg_bytes: Vec<u8> = self.process_state.regs.iter()
+        let reg_bytes: Vec<u8> = self
+            .process_state
+            .regs
+            .iter()
             .flat_map(|r| r.to_le_bytes())
             .collect();
         std::fs::write(threads_dir.join("0.bin"), &reg_bytes)
@@ -198,18 +216,19 @@ impl Checkpoint {
     /// Load a checkpoint from a directory.
     pub fn load(dir: &Path) -> Result<Self, SandlockError> {
         if !dir.is_dir() {
-            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
-                format!("Checkpoint not found: {}", dir.display()),
-            )));
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+                "Checkpoint not found: {}",
+                dir.display()
+            ))));
         }
 
         // meta.json
         let meta: MetaJson = read_json(&dir.join("meta.json"))?;
         if meta.version != IMAGE_VERSION {
-            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
-                format!("unsupported checkpoint image version {} (expected {})",
-                    meta.version, IMAGE_VERSION),
-            )));
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+                "unsupported checkpoint image version {} (expected {})",
+                meta.version, IMAGE_VERSION
+            ))));
         }
 
         // policy.dat
@@ -220,8 +239,10 @@ impl Checkpoint {
         // app_state.bin
         let app_state_path = dir.join("app_state.bin");
         let app_state = if app_state_path.exists() {
-            Some(std::fs::read(&app_state_path)
-                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?)
+            Some(
+                std::fs::read(&app_state_path)
+                    .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?,
+            )
         } else {
             None
         };
@@ -234,28 +255,35 @@ impl Checkpoint {
 
         // process/fds.json
         let fds_json: Vec<FdJson> = read_json(&proc_dir.join("fds.json"))?;
-        let fd_table: Vec<FdInfo> = fds_json.into_iter().map(|f| FdInfo {
-            fd: f.fd,
-            path: f.path,
-            flags: f.flags,
-            offset: f.offset,
-        }).collect();
+        let fd_table: Vec<FdInfo> = fds_json
+            .into_iter()
+            .map(|f| FdInfo {
+                fd: f.fd,
+                path: f.path,
+                flags: f.flags,
+                offset: f.offset,
+            })
+            .collect();
 
         // process/memory_map.json -- FULL region list (every mapping).
         let maps_json: Vec<MemoryMapJson> = read_json(&proc_dir.join("memory_map.json"))?;
-        let memory_maps: Vec<MemoryMap> = maps_json.iter().map(|m| MemoryMap {
-            start: m.start,
-            end: m.end,
-            perms: m.perms.clone(),
-            offset: m.offset,
-            path: m.path.clone(),
-        }).collect();
+        let memory_maps: Vec<MemoryMap> = maps_json
+            .iter()
+            .map(|m| MemoryMap {
+                start: m.start,
+                end: m.end,
+                perms: m.perms.clone(),
+                offset: m.offset,
+                path: m.path.clone(),
+            })
+            .collect();
 
         // process/threads/0.bin
         let threads_dir = proc_dir.join("threads");
         let reg_bytes = std::fs::read(threads_dir.join("0.bin"))
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-        let regs: Vec<u64> = reg_bytes.chunks_exact(8)
+        let regs: Vec<u64> = reg_bytes
+            .chunks_exact(8)
             .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         // Read FP/extended registers; tolerate absence defensively.
@@ -331,12 +359,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("process/threads")).unwrap();
         std::fs::create_dir_all(dir.join("process/memory")).unwrap();
-        std::fs::write(dir.join("meta.json"),
-            br#"{"name":"x","cow_snapshot":null,"version":999}"#).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            br#"{"name":"x","cow_snapshot":null,"version":999}"#,
+        )
+        .unwrap();
         let res = Checkpoint::load(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("version"), "error should mention version, got: {msg}");
+        assert!(
+            msg.contains("version"),
+            "error should mention version, got: {msg}"
+        );
     }
 
     fn round_trip_policy(policy: Sandbox) -> Sandbox {

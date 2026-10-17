@@ -61,11 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let result = policy.clone().with_name("openat-audit")
-        .run_with_handlers(
-            &cmd_ref,
-            [(libc::SYS_openat, audit)],
-        )
+    let result = policy
+        .clone()
+        .with_name("openat-audit")
+        .run_with_handlers(&cmd_ref, [(libc::SYS_openat, audit)])
         .await?;
 
     println!(

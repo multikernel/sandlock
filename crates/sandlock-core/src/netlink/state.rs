@@ -46,11 +46,17 @@ impl NetlinkState {
     /// Register the socket for the lifetime of its responder.
     pub fn register(self: &Arc<Self>, cookie: u64, port_id: u32) -> Registration {
         self.cookies.lock().unwrap().insert(cookie, port_id);
-        Registration { state: Arc::clone(self), cookie }
+        Registration {
+            state: Arc::clone(self),
+            cookie,
+        }
     }
 
     pub(crate) fn contains_cookie(&self, cookie: u64) -> bool {
-        self.cookies.lock().map(|cookies| cookies.contains_key(&cookie)).unwrap_or(true)
+        self.cookies
+            .lock()
+            .map(|cookies| cookies.contains_key(&cookie))
+            .unwrap_or(true)
     }
 
     pub fn port_id(&self, pid: u32, fd: i32) -> Option<u32> {
@@ -98,7 +104,12 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
-        unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) }
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
     }
 
     #[tokio::test]
@@ -109,7 +120,10 @@ mod tests {
             let registration = state.register(tgid as u64, tgid as u32);
             let task = crate::netlink::proxy::spawn_responder(server, tgid as u32, registration);
             drop(client);
-            tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(state.cookies.lock().unwrap().is_empty());
         }
     }
@@ -137,7 +151,10 @@ mod tests {
         assert!(!task.is_finished());
         assert_eq!(state.cookies.lock().unwrap().len(), 1);
         drop(duplicate);
-        tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(state.cookies.lock().unwrap().is_empty());
     }
 }

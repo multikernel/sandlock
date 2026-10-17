@@ -11,7 +11,16 @@ fn http_options_need_the_http_feature() {
         Sandbox::builder().credential("openai", "env:OPENAI_API_KEY"),
     ] {
         let err = builder.build().unwrap_err();
-        assert!(matches!(err, SandboxError::FeatureDisabled { feature: "http", .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                SandboxError::FeatureDisabled {
+                    feature: "http",
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 }
 
@@ -73,7 +82,10 @@ async fn inject_ca_nonexistent_path_errors_at_run() {
         .build()
         .unwrap();
     let res = policy.run(&["true"]).await;
-    assert!(res.is_err(), "expected error for missing --http-inject-ca path");
+    assert!(
+        res.is_err(),
+        "expected error for missing --http-inject-ca path"
+    );
 }
 
 // --- SandboxBuilder integration ---
@@ -94,33 +106,25 @@ fn builder_http_rules() {
 
 #[test]
 fn builder_invalid_http_allow_returns_error() {
-    let result = Sandbox::builder()
-        .http_allow("GETexample.com")
-        .build();
+    let result = Sandbox::builder().http_allow("GETexample.com").build();
     assert!(result.is_err());
 }
 
 #[test]
 fn builder_invalid_http_deny_returns_error() {
-    let result = Sandbox::builder()
-        .http_deny("BADRULE")
-        .build();
+    let result = Sandbox::builder().http_deny("BADRULE").build();
     assert!(result.is_err());
 }
 
 #[test]
 fn builder_http_ca_without_key_returns_error() {
-    let result = Sandbox::builder()
-        .http_ca("/tmp/ca.pem")
-        .build();
+    let result = Sandbox::builder().http_ca("/tmp/ca.pem").build();
     assert!(result.is_err());
 }
 
 #[test]
 fn builder_http_key_without_ca_returns_error() {
-    let result = Sandbox::builder()
-        .http_key("/tmp/key.pem")
-        .build();
+    let result = Sandbox::builder().http_key("/tmp/key.pem").build();
     assert!(result.is_err());
 }
 
@@ -236,10 +240,7 @@ fn extra_deny_of_member_syscall_conflicts_with_allowed_group() {
 
 #[test]
 fn builder_parses_net_deny() {
-    let policy = Sandbox::builder()
-        .net_deny("10.0.0.0/8")
-        .build()
-        .unwrap();
+    let policy = Sandbox::builder().net_deny("10.0.0.0/8").build().unwrap();
     // Scheme-less deny expands to a TCP rule plus a UDP rule.
     assert_eq!(policy.net_deny.len(), 2);
 }
@@ -261,10 +262,13 @@ fn builder_net_allow_bind_comma_and_ranges() {
 
 #[test]
 fn builder_net_allow_bind_rejects_bad_specs() {
-    assert!(Sandbox::builder().net_allow_bind("9000-8000").build().is_err()); // reversed
-    assert!(Sandbox::builder().net_allow_bind("80,abc").build().is_err());    // bad port
-    assert!(Sandbox::builder().net_allow_bind("70000").build().is_err());     // > u16
-    assert!(Sandbox::builder().net_allow_bind("8080,").build().is_err());     // empty part
+    assert!(Sandbox::builder()
+        .net_allow_bind("9000-8000")
+        .build()
+        .is_err()); // reversed
+    assert!(Sandbox::builder().net_allow_bind("80,abc").build().is_err()); // bad port
+    assert!(Sandbox::builder().net_allow_bind("70000").build().is_err()); // > u16
+    assert!(Sandbox::builder().net_allow_bind("8080,").build().is_err()); // empty part
 }
 
 #[test]
@@ -541,7 +545,10 @@ fn relocate_high_moves_fd_above_stdio_range() {
     let f = std::fs::File::open("/dev/null").unwrap();
     let src = f.as_raw_fd();
     let hi = unsafe { relocate_high(src) };
-    assert!(hi >= 3, "relocated fd must be >= 3 (disjoint from 0/1/2), got {hi}");
+    assert!(
+        hi >= 3,
+        "relocated fd must be >= 3 (disjoint from 0/1/2), got {hi}"
+    );
     assert_ne!(hi, src, "relocate must produce a new fd");
 
     // It is a dup of the same description, not a fresh open.
@@ -553,7 +560,10 @@ fn relocate_high_moves_fd_above_stdio_range() {
 
     // And it carries CLOEXEC (F_DUPFD_CLOEXEC), so it won't leak past execve.
     let flags = unsafe { libc::fcntl(hi, libc::F_GETFD) };
-    assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0, "relocated fd must be CLOEXEC");
+    assert!(
+        flags >= 0 && (flags & libc::FD_CLOEXEC) != 0,
+        "relocated fd must be CLOEXEC"
+    );
 
     unsafe { libc::close(hi) };
 }
@@ -603,7 +613,9 @@ async fn a_cancelled_join_leaves_the_drain_parked() {
 /// not take it.
 #[tokio::test]
 async fn a_finished_capture_survives_a_cancellation_at_the_sibling_join() {
-    let mut stdout = Some(ParkedDrain::Running(tokio::spawn(async { b"hello".to_vec() })));
+    let mut stdout = Some(ParkedDrain::Running(tokio::spawn(async {
+        b"hello".to_vec()
+    })));
     // Held for the whole test, so this drain never finishes.
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     let mut stderr = Some(ParkedDrain::Running(tokio::spawn(async move {
@@ -617,7 +629,10 @@ async fn a_finished_capture_survives_a_cancellation_at_the_sibling_join() {
         finish_parked_drain(&mut stderr).await;
     })
     .await;
-    assert!(cancelled.is_err(), "the second join must still have been pending");
+    assert!(
+        cancelled.is_err(),
+        "the second join must still have been pending"
+    );
 
     assert!(
         matches!(stdout, Some(ParkedDrain::Done(ref buf)) if buf == b"hello"),

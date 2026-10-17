@@ -23,10 +23,17 @@ pub(crate) struct HttpAclProxyHandle {
 }
 
 fn disabled() -> io::Error {
-    io::Error::new(io::ErrorKind::Unsupported, "sandlock was built without the \"http\" feature")
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "sandlock was built without the \"http\" feature",
+    )
 }
 
-pub(crate) fn resolve_ca(_: Option<&Path>, _: Option<&Path>, _: bool) -> io::Result<Option<CaMaterial>> {
+pub(crate) fn resolve_ca(
+    _: Option<&Path>,
+    _: Option<&Path>,
+    _: bool,
+) -> io::Result<Option<CaMaterial>> {
     Err(disabled())
 }
 

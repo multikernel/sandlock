@@ -1,10 +1,11 @@
-use sandlock_core::{Sandbox, SandboxBuilder};
 use sandlock_core::sandbox::BranchAction;
+use sandlock_core::{Sandbox, SandboxBuilder};
 use std::fs;
 use std::path::PathBuf;
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sandlock-test-cow-{}-{}", name, std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("sandlock-test-cow-{}-{}", name, std::process::id()));
     let _ = fs::create_dir_all(&dir);
     dir
 }
@@ -28,10 +29,14 @@ async fn test_seccomp_cow_create_file() {
     fs::write(workdir.join("existing.txt"), "hello").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
-        .workdir(&workdir)  // workdir set → seccomp COW
+        .workdir(&workdir) // workdir set → seccomp COW
         .on_exit(BranchAction::Commit)
         .build()
         .unwrap();
@@ -41,7 +46,11 @@ async fn test_seccomp_cow_create_file() {
     let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
-            assert!(r.success(), "touch should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                r.success(),
+                "touch should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
             // After commit, new file should exist in workdir
             assert!(new_file.exists(), "new.txt should exist after commit");
         }
@@ -58,7 +67,11 @@ async fn test_seccomp_cow_abort() {
     fs::write(workdir.join("existing.txt"), "original").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -72,7 +85,10 @@ async fn test_seccomp_cow_abort() {
     match result {
         Ok(_) => {
             // After abort, new file should NOT exist
-            assert!(!new_file.exists(), "aborted.txt should not exist after abort");
+            assert!(
+                !new_file.exists(),
+                "aborted.txt should not exist after abort"
+            );
             // Original file should be unchanged
             let content = fs::read_to_string(workdir.join("existing.txt")).unwrap();
             assert_eq!(content, "original");
@@ -95,8 +111,13 @@ async fn test_seccomp_cow_relative_path_abort() {
     fs::write(workdir.join("orig.txt"), "original\n").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
         .cwd(&workdir)
@@ -105,17 +126,28 @@ async fn test_seccomp_cow_relative_path_abort() {
         .unwrap();
 
     // Use relative paths (triggers AT_FDCWD in openat) — the child's cwd is set via .cwd().
-    let result = policy.clone().run(&[
-        "sh", "-c", "echo MUTATED >> orig.txt; echo leak > leaked.txt"
-    ]).await;
+    let result = policy
+        .clone()
+        .run(&[
+            "sh",
+            "-c",
+            "echo MUTATED >> orig.txt; echo leak > leaked.txt",
+        ])
+        .await;
     match result {
         Ok(r) => {
             assert!(r.success(), "sh should succeed");
             // With abort, original file must be unchanged
             let content = fs::read_to_string(workdir.join("orig.txt")).unwrap();
-            assert_eq!(content, "original\n", "orig.txt should be unchanged after abort");
+            assert_eq!(
+                content, "original\n",
+                "orig.txt should be unchanged after abort"
+            );
             // New file must not exist
-            assert!(!workdir.join("leaked.txt").exists(), "leaked.txt should not exist after abort");
+            assert!(
+                !workdir.join("leaked.txt").exists(),
+                "leaked.txt should not exist after abort"
+            );
         }
         Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
     }
@@ -130,8 +162,13 @@ async fn test_seccomp_cow_relative_path_commit() {
     fs::write(workdir.join("orig.txt"), "original\n").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
         .cwd(&workdir)
@@ -139,19 +176,34 @@ async fn test_seccomp_cow_relative_path_commit() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&[
-        "sh", "-c", "echo APPENDED >> orig.txt; echo new > created.txt"
-    ]).await;
+    let result = policy
+        .clone()
+        .run(&[
+            "sh",
+            "-c",
+            "echo APPENDED >> orig.txt; echo new > created.txt",
+        ])
+        .await;
     match result {
         Ok(r) => {
             assert!(r.success(), "sh should succeed");
             // With commit, changes should be merged back
             let content = fs::read_to_string(workdir.join("orig.txt")).unwrap();
-            assert!(content.contains("APPENDED"), "orig.txt should have appended content after commit");
-            assert!(content.starts_with("original\n"), "orig.txt should preserve original content");
+            assert!(
+                content.contains("APPENDED"),
+                "orig.txt should have appended content after commit"
+            );
+            assert!(
+                content.starts_with("original\n"),
+                "orig.txt should preserve original content"
+            );
             // New file should exist
             let new_content = fs::read_to_string(workdir.join("created.txt")).unwrap();
-            assert_eq!(new_content.trim(), "new", "created.txt should exist after commit");
+            assert_eq!(
+                new_content.trim(),
+                "new",
+                "created.txt should exist after commit"
+            );
         }
         Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
     }
@@ -170,8 +222,13 @@ async fn test_seccomp_cow_open_directory() {
     let out_file = workdir.join("opendir_ok.txt");
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
         .cwd(&workdir)
@@ -193,7 +250,11 @@ async fn test_seccomp_cow_open_directory() {
     let result = policy.clone().run(&["sh", "-c", &script]).await;
     match result {
         Ok(r) => {
-            assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                r.success(),
+                "script should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
             let content = fs::read_to_string(&out_file).unwrap();
             assert_eq!(content, "ok");
         }
@@ -202,7 +263,6 @@ async fn test_seccomp_cow_open_directory() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
-
 
 /// Test that chdir works for directories created inside COW.
 ///
@@ -215,8 +275,13 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
     let out_file = workdir.join("chdir_ok.txt");
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
         .cwd(&workdir)
@@ -241,7 +306,11 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
     let result = policy.clone().run(&["sh", "-c", &script]).await;
     match result {
         Ok(r) => {
-            assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                r.success(),
+                "script should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
             let content = fs::read_to_string(&out_file).unwrap();
             assert!(
                 content.trim().ends_with("subdir/deep"),
@@ -266,14 +335,19 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
 #[tokio::test]
 async fn test_seccomp_cow_legacy_open_syscall() {
     let workdir = temp_dir("seccomp-legacy-open");
-    let out_file = std::env::temp_dir().join(format!(
-        "sandlock-test-legacy-open-{}", std::process::id()
-    ));
+    let out_file =
+        std::env::temp_dir().join(format!("sandlock-test-legacy-open-{}", std::process::id()));
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(&workdir).fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
         .workdir(&workdir)
         .cwd(&workdir)
         .on_exit(BranchAction::Abort)
@@ -283,31 +357,50 @@ async fn test_seccomp_cow_legacy_open_syscall() {
     // Use raw syscall ABI to create a file, then verify it's visible during
     // the run but discarded on abort. x86_64 uses legacy SYS_open; ARM64 and
     // riscv64 use the equivalent openat(AT_FDCWD, ...) ABI.
-    let script = format!(concat!(
-        "import ctypes, os, platform\n",
-        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
-        "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
-        "path = b'{wd}/newfile.txt'\n",
-        "if platform.machine() in ('aarch64', 'riscv64'):\n",
-        "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
-        "else:\n",
-        "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
-        "err = ctypes.get_errno()\n",
-        "if fd >= 0:\n",
-        "    os.write(fd, b'created via raw open')\n",
-        "    os.close(fd)\n",
-        "    content = open('{wd}/newfile.txt').read()\n",
-        "    open('{out}', 'w').write(content)\n",
-        "else:\n",
-        "    open('{out}', 'w').write(f'FAILED:errno={{err}}')\n",
-    ), wd = workdir.display(), out = out_file.display());
+    let script = format!(
+        concat!(
+            "import ctypes, os, platform\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "O_WRONLY = 1; O_CREAT = 64; O_TRUNC = 512\n",
+            "path = b'{wd}/newfile.txt'\n",
+            "if platform.machine() in ('aarch64', 'riscv64'):\n",
+            "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
+            "else:\n",
+            "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)\n",
+            "err = ctypes.get_errno()\n",
+            "if fd >= 0:\n",
+            "    os.write(fd, b'created via raw open')\n",
+            "    os.close(fd)\n",
+            "    content = open('{wd}/newfile.txt').read()\n",
+            "    open('{out}', 'w').write(content)\n",
+            "else:\n",
+            "    open('{out}', 'w').write(f'FAILED:errno={{err}}')\n",
+        ),
+        wd = workdir.display(),
+        out = out_file.display()
+    );
 
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let content = fs::read_to_string(&out_file).unwrap_or_default();
-    assert_eq!(content, "created via raw open", "raw open ABI should work with COW");
+    assert_eq!(
+        content, "created via raw open",
+        "raw open ABI should work with COW"
+    );
     // After abort, the file should not exist on the real filesystem
-    assert!(!workdir.join("newfile.txt").exists(), "newfile.txt should not exist after abort");
+    assert!(
+        !workdir.join("newfile.txt").exists(),
+        "newfile.txt should not exist after abort"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_file(&out_file);
@@ -322,14 +415,19 @@ async fn test_seccomp_cow_legacy_open_syscall() {
 #[tokio::test]
 async fn test_seccomp_cow_openat2_syscall() {
     let workdir = temp_dir("seccomp-openat2");
-    let out_file = std::env::temp_dir().join(format!(
-        "sandlock-test-openat2-{}", std::process::id()
-    ));
+    let out_file =
+        std::env::temp_dir().join(format!("sandlock-test-openat2-{}", std::process::id()));
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(&workdir).fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
         .workdir(&workdir)
         .cwd(&workdir)
         .on_exit(BranchAction::Abort)
@@ -355,11 +453,26 @@ async fn test_seccomp_cow_openat2_syscall() {
         "    open('{out}', 'w').write(f'FAILED:errno={{err}}')\n",
     ), wd = workdir.display(), out = out_file.display());
 
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let content = fs::read_to_string(&out_file).unwrap_or_default();
-    assert_eq!(content, "created via raw openat2", "raw openat2 should work with COW");
-    assert!(!workdir.join("newfile.txt").exists(), "newfile.txt should not exist after abort");
+    assert_eq!(
+        content, "created via raw openat2",
+        "raw openat2 should work with COW"
+    );
+    assert!(
+        !workdir.join("newfile.txt").exists(),
+        "newfile.txt should not exist after abort"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_file(&out_file);
@@ -376,14 +489,19 @@ async fn test_seccomp_cow_openat2_syscall() {
 async fn test_seccomp_cow_renameat_syscall() {
     let workdir = temp_dir("seccomp-renameat");
     fs::write(workdir.join("orig.txt"), "keep").unwrap();
-    let out_file = std::env::temp_dir().join(format!(
-        "sandlock-test-renameat-{}", std::process::id()
-    ));
+    let out_file =
+        std::env::temp_dir().join(format!("sandlock-test-renameat-{}", std::process::id()));
 
     let mut policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(&workdir).fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
         .workdir(&workdir)
         .cwd(&workdir)
         .on_exit(BranchAction::Abort)
@@ -391,30 +509,45 @@ async fn test_seccomp_cow_renameat_syscall() {
         .unwrap();
 
     // renameat is 264 on x86_64 and 38 on aarch64; riscv64 only has renameat2 (276).
-    let script = format!(concat!(
-        "import ctypes, os, platform\n",
-        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
-        "old = b'{wd}/orig.txt'; new = b'{wd}/moved.txt'\n",
-        "m = platform.machine()\n",
-        "if m == 'x86_64':\n",
-        "    r = libc.syscall(264, -100, old, -100, new)\n",
-        "elif m == 'aarch64':\n",
-        "    r = libc.syscall(38, -100, old, -100, new)\n",
-        "else:\n",
-        "    r = libc.syscall(276, -100, old, -100, new, 0)\n",
-        "err = ctypes.get_errno()\n",
-        "if r == 0 and not os.path.exists(old) and open(new).read() == 'keep':\n",
-        "    open('{out}', 'w').write('renamed')\n",
-        "else:\n",
-        "    open('{out}', 'w').write(f'FAILED:ret={{r}},errno={{err}}')\n",
-    ), wd = workdir.display(), out = out_file.display());
+    let script = format!(
+        concat!(
+            "import ctypes, os, platform\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "old = b'{wd}/orig.txt'; new = b'{wd}/moved.txt'\n",
+            "m = platform.machine()\n",
+            "if m == 'x86_64':\n",
+            "    r = libc.syscall(264, -100, old, -100, new)\n",
+            "elif m == 'aarch64':\n",
+            "    r = libc.syscall(38, -100, old, -100, new)\n",
+            "else:\n",
+            "    r = libc.syscall(276, -100, old, -100, new, 0)\n",
+            "err = ctypes.get_errno()\n",
+            "if r == 0 and not os.path.exists(old) and open(new).read() == 'keep':\n",
+            "    open('{out}', 'w').write('renamed')\n",
+            "else:\n",
+            "    open('{out}', 'w').write(f'FAILED:ret={{r}},errno={{err}}')\n",
+        ),
+        wd = workdir.display(),
+        out = out_file.display()
+    );
 
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let content = fs::read_to_string(&out_file).unwrap_or_default();
     assert_eq!(content, "renamed", "raw renameat should work with COW");
-    assert!(workdir.join("orig.txt").exists(), "orig.txt should be back after abort");
-    assert!(!workdir.join("moved.txt").exists(), "moved.txt should not exist after abort");
+    assert!(
+        workdir.join("orig.txt").exists(),
+        "orig.txt should be back after abort"
+    );
+    assert!(
+        !workdir.join("moved.txt").exists(),
+        "moved.txt should not exist after abort"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_file(&out_file);
@@ -438,8 +571,13 @@ async fn test_seccomp_cow_legacy_stat_honors_whiteout() {
     let helper_dir = helper.parent().unwrap().to_path_buf();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_read(&helper_dir)
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -448,9 +586,12 @@ async fn test_seccomp_cow_legacy_stat_honors_whiteout() {
         .build()
         .unwrap();
 
-    let script = "rm gone.txt ; legacy-stat gone.txt ; legacy-lstat gone.txt ; legacy-access gone.txt";
-    let result = policy.clone()
-        .run(&[helper.to_str().unwrap(), "sh", "-c", script]).await;
+    let script =
+        "rm gone.txt ; legacy-stat gone.txt ; legacy-lstat gone.txt ; legacy-access gone.txt";
+    let result = policy
+        .clone()
+        .run(&[helper.to_str().unwrap(), "sh", "-c", script])
+        .await;
     match result {
         Ok(r) => {
             let out = r.stdout_str().unwrap_or("").to_string();
@@ -482,15 +623,20 @@ async fn test_seccomp_cow_legacy_stat_honors_whiteout() {
 #[tokio::test]
 async fn test_seccomp_cow_excl_after_unlink() {
     let workdir = temp_dir("seccomp-excl-unlink");
-    let out_file = std::env::temp_dir().join(format!(
-        "sandlock-test-excl-unlink-{}", std::process::id()
-    ));
+    let out_file =
+        std::env::temp_dir().join(format!("sandlock-test-excl-unlink-{}", std::process::id()));
     fs::write(workdir.join("target.txt"), "original").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(&workdir).fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
         .workdir(&workdir)
         .cwd(&workdir)
         .on_exit(BranchAction::Commit)
@@ -498,35 +644,55 @@ async fn test_seccomp_cow_excl_after_unlink() {
         .unwrap();
 
     // Unlink the file, then recreate it with O_CREAT|O_EXCL via raw open ABI.
-    let script = format!(concat!(
-        "import ctypes, os, platform\n",
-        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
-        "path = b'{wd}/target.txt'\n",
-        "ret = libc.unlink(path)\n",
-        "if ret != 0:\n",
-        "    open('{out}', 'w').write(f'UNLINK_FAILED:{{ctypes.get_errno()}}')\n",
-        "    raise SystemExit(1)\n",
-        "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
-        "if platform.machine() in ('aarch64', 'riscv64'):\n",
-        "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
-        "else:\n",
-        "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
-        "err = ctypes.get_errno()\n",
-        "if fd >= 0:\n",
-        "    os.write(fd, b'recreated')\n",
-        "    os.close(fd)\n",
-        "    open('{out}', 'w').write('OK')\n",
-        "else:\n",
-        "    open('{out}', 'w').write(f'OPEN_FAILED:{{err}}')\n",
-    ), wd = workdir.display(), out = out_file.display());
+    let script = format!(
+        concat!(
+            "import ctypes, os, platform\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "path = b'{wd}/target.txt'\n",
+            "ret = libc.unlink(path)\n",
+            "if ret != 0:\n",
+            "    open('{out}', 'w').write(f'UNLINK_FAILED:{{ctypes.get_errno()}}')\n",
+            "    raise SystemExit(1)\n",
+            "O_WRONLY = 1; O_CREAT = 64; O_EXCL = 128\n",
+            "if platform.machine() in ('aarch64', 'riscv64'):\n",
+            "    fd = libc.syscall(56, -100, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
+            "else:\n",
+            "    fd = libc.syscall(2, path, O_WRONLY | O_CREAT | O_EXCL, 0o644)\n",
+            "err = ctypes.get_errno()\n",
+            "if fd >= 0:\n",
+            "    os.write(fd, b'recreated')\n",
+            "    os.close(fd)\n",
+            "    open('{out}', 'w').write('OK')\n",
+            "else:\n",
+            "    open('{out}', 'w').write(f'OPEN_FAILED:{{err}}')\n",
+        ),
+        wd = workdir.display(),
+        out = out_file.display()
+    );
 
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let content = fs::read_to_string(&out_file).unwrap_or_default();
-    assert_eq!(content, "OK", "O_EXCL after unlink should succeed, got: {}", content);
+    assert_eq!(
+        content, "OK",
+        "O_EXCL after unlink should succeed, got: {}",
+        content
+    );
     // After commit, the file should contain the new content
     let target = fs::read_to_string(workdir.join("target.txt")).unwrap_or_default();
-    assert_eq!(target, "recreated", "target.txt should have new content after commit");
+    assert_eq!(
+        target, "recreated",
+        "target.txt should have new content after commit"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_file(&out_file);
@@ -539,7 +705,11 @@ async fn test_seccomp_cow_read_existing() {
     fs::write(workdir.join("data.txt"), "hello world").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -574,15 +744,20 @@ async fn test_seccomp_cow_read_existing() {
 #[tokio::test]
 async fn test_seccomp_cow_read_deleted_file_is_enoent() {
     let workdir = temp_dir("seccomp-read-deleted");
-    let out_file = std::env::temp_dir().join(format!(
-        "sandlock-test-read-deleted-{}", std::process::id()
-    ));
+    let out_file =
+        std::env::temp_dir().join(format!("sandlock-test-read-deleted-{}", std::process::id()));
     fs::write(workdir.join("secret.txt"), "PREDELETE").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(&workdir).fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
         .workdir(&workdir)
         .cwd(&workdir)
         .on_exit(BranchAction::Abort)
@@ -598,7 +773,8 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
     // and the marker land in /tmp (not the COW workdir), so they are real writes.
     let secret = workdir.join("secret.txt");
     let leak_file = std::env::temp_dir().join(format!(
-        "sandlock-test-read-deleted-leak-{}", std::process::id()
+        "sandlock-test-read-deleted-leak-{}",
+        std::process::id()
     ));
     let cmd = format!(
         "rm -f {secret}; if dd if={secret} of={leak} status=none; then printf 'OPENED' > {marker}; else printf 'DENIED' > {marker}; fi",
@@ -608,16 +784,23 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
     );
 
     let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
-    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let marker = fs::read_to_string(&out_file).unwrap_or_default();
     let leaked = fs::read_to_string(&leak_file).unwrap_or_default();
     assert_eq!(
         marker, "DENIED",
-        "open of a deleted COW file must be denied (ENOENT), not read lower content (leaked: {:?})", leaked
+        "open of a deleted COW file must be denied (ENOENT), not read lower content (leaked: {:?})",
+        leaked
     );
     assert!(
         leaked.is_empty(),
-        "no pre-delete bytes may leak through the read path, got: {:?}", leaked
+        "no pre-delete bytes may leak through the read path, got: {:?}",
+        leaked
     );
 
     let _ = fs::remove_dir_all(&workdir);
@@ -634,14 +817,18 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
 #[tokio::test]
 async fn test_seccomp_cow_statx_created_file() {
     let workdir = temp_dir("seccomp-statx");
-    let out_file = std::env::temp_dir().join(format!(
-        "sandlock-test-statx-{}", std::process::id()
-    ));
+    let out_file = std::env::temp_dir().join(format!("sandlock-test-statx-{}", std::process::id()));
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(&workdir).fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
         .workdir(&workdir)
         .cwd(&workdir)
         .on_exit(BranchAction::Abort)
@@ -650,24 +837,40 @@ async fn test_seccomp_cow_statx_created_file() {
 
     // Create a file that lives only in the COW upper layer, then statx it
     // via the raw syscall (the path coreutils `stat`/`ls` take).
-    let script = format!(concat!(
-        "import ctypes, os, platform\n",
-        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
-        "libc.syscall.restype = ctypes.c_long\n",
-        "open('created.txt', 'w').write('hi')\n",
-        "buf = ctypes.create_string_buffer(256)\n",
-        "AT_FDCWD = -100\n",
-        "STATX_BASIC_STATS = 0x7ff\n",
-        "nr = 291 if platform.machine() in ('aarch64', 'riscv64') else 332\n",
-        "ret = libc.syscall(nr, AT_FDCWD, b'created.txt', 0, STATX_BASIC_STATS, buf)\n",
-        "err = ctypes.get_errno()\n",
-        "open('{out}', 'w').write('OK' if ret == 0 else f'FAIL:errno={{err}}')\n",
-    ), out = out_file.display());
+    let script = format!(
+        concat!(
+            "import ctypes, os, platform\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "libc.syscall.restype = ctypes.c_long\n",
+            "open('created.txt', 'w').write('hi')\n",
+            "buf = ctypes.create_string_buffer(256)\n",
+            "AT_FDCWD = -100\n",
+            "STATX_BASIC_STATS = 0x7ff\n",
+            "nr = 291 if platform.machine() in ('aarch64', 'riscv64') else 332\n",
+            "ret = libc.syscall(nr, AT_FDCWD, b'created.txt', 0, STATX_BASIC_STATS, buf)\n",
+            "err = ctypes.get_errno()\n",
+            "open('{out}', 'w').write('OK' if ret == 0 else f'FAIL:errno={{err}}')\n",
+        ),
+        out = out_file.display()
+    );
 
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let content = fs::read_to_string(&out_file).unwrap_or_default();
-    assert_eq!(content, "OK", "statx on COW-created file should succeed, got: {}", content);
+    assert_eq!(
+        content, "OK",
+        "statx on COW-created file should succeed, got: {}",
+        content
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_file(&out_file);
@@ -684,8 +887,13 @@ async fn test_seccomp_cow_exec_created_file() {
     let helper_dir = helper.parent().unwrap().to_path_buf();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_read(&helper_dir)
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -703,14 +911,13 @@ async fn test_seccomp_cow_exec_created_file() {
     // argv[0], so rewriting the path to /proc/self/fd/N must relocate
     // argv[0], or the helper sees basename "N" and exits 127.
     let cmd = format!("cp {} echo && ./echo EXEC_OK", helper.display());
-    let result = policy.clone().run(&[
-        "sh", "-c", &cmd,
-    ]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
 
     assert!(
         result.success(),
         "exec of COW-created binary should succeed (argv[0] preserved), exit={:?}, stderr={}",
-        result.code(), result.stderr_str().unwrap_or("")
+        result.code(),
+        result.stderr_str().unwrap_or("")
     );
     assert!(
         result.stdout_str().unwrap_or("").contains("EXEC_OK"),
@@ -733,8 +940,13 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
     let helper_dir = helper.parent().unwrap().to_path_buf();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_read(&helper_dir)
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -743,25 +955,33 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import ctypes, shutil, os\n",
-        "shutil.copy('{helper}', 'echo')\n",
-        "os.chmod('echo', 0o755)\n",
-        "libc = ctypes.CDLL(None, use_errno=True)\n",
-        "buf = ctypes.create_string_buffer(b'./echo\\0EXEC_OK_PACKED\\0')\n",
-        "base = ctypes.addressof(buf)\n",
-        "argv = (ctypes.c_void_p * 3)(base, base + 7, None)\n",
-        "envp = (ctypes.c_void_p * 1)(None)\n",
-        "libc.execve(ctypes.c_void_p(base), argv, envp)\n",
-        "raise SystemExit('execve failed errno=%d' % ctypes.get_errno())\n",
-    ), helper = helper.display());
+    let script = format!(
+        concat!(
+            "import ctypes, shutil, os\n",
+            "shutil.copy('{helper}', 'echo')\n",
+            "os.chmod('echo', 0o755)\n",
+            "libc = ctypes.CDLL(None, use_errno=True)\n",
+            "buf = ctypes.create_string_buffer(b'./echo\\0EXEC_OK_PACKED\\0')\n",
+            "base = ctypes.addressof(buf)\n",
+            "argv = (ctypes.c_void_p * 3)(base, base + 7, None)\n",
+            "envp = (ctypes.c_void_p * 1)(None)\n",
+            "libc.execve(ctypes.c_void_p(base), argv, envp)\n",
+            "raise SystemExit('execve failed errno=%d' % ctypes.get_errno())\n",
+        ),
+        helper = helper.display()
+    );
 
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     assert!(
         result.success(),
         "packed-argv exec should succeed, exit={:?}, stderr={}",
-        result.code(), result.stderr_str().unwrap_or("")
+        result.code(),
+        result.stderr_str().unwrap_or("")
     );
     assert!(
         result.stdout_str().unwrap_or("").contains("EXEC_OK_PACKED"),
@@ -804,12 +1024,19 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
     }
 
     let base = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(&workdir).workdir(&workdir).cwd(&workdir);
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir);
 
     {
-        let mut sb = base.clone()
+        let mut sb = base
+            .clone()
             .fs_storage(&keep_store)
             .on_exit(BranchAction::Keep)
             .build()
@@ -819,7 +1046,8 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
         // Dropped here, with no wait(): the caller walked away from the run.
     }
     {
-        let mut sb = base.clone()
+        let mut sb = base
+            .clone()
             .fs_storage(&on_error_store)
             .on_error(BranchAction::Keep)
             .build()
@@ -828,10 +1056,7 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
         sb.start().unwrap();
     }
     {
-        let mut sb = base.clone()
-            .fs_storage(&default_store)
-            .build()
-            .unwrap();
+        let mut sb = base.clone().fs_storage(&default_store).build().unwrap();
         sb.create(&["sh", "-c", "echo gone > g.txt"]).await.unwrap();
         sb.start().unwrap();
     }
@@ -846,15 +1071,18 @@ async fn test_abandoned_sandbox_honours_keep_and_still_reclaims_by_default() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
-        branch_count(&default_store), 0,
+        branch_count(&default_store),
+        0,
         "an abandoned sandbox with the default action must still reclaim its upper",
     );
     assert_eq!(
-        branch_count(&keep_store), 1,
+        branch_count(&keep_store),
+        1,
         "an abandoned sandbox configured on_exit(Keep) must still preserve its upper",
     );
     assert_eq!(
-        branch_count(&on_error_store), 1,
+        branch_count(&on_error_store),
+        1,
         "an abandoned sandbox configured on_error(Keep) must still preserve its upper",
     );
 
@@ -875,9 +1103,15 @@ fn disposition_sandbox(
     on_error: BranchAction,
 ) -> Sandbox {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(workdir).workdir(workdir).cwd(workdir)
+        .fs_write(workdir)
+        .workdir(workdir)
+        .cwd(workdir)
         .on_exit(on_exit)
         .on_error(on_error)
         .build()
@@ -920,36 +1154,68 @@ async fn test_branch_action_is_selected_by_the_child_exit_status() {
     let script_ok = "echo written > f.txt";
 
     let (code, landed) = run_and_report_landing(
-        "disp-fail-abort", script_fail, BranchAction::Commit, BranchAction::Abort,
-    ).await;
-    assert_eq!(code, Some(3), "the failing script must actually have failed");
+        "disp-fail-abort",
+        script_fail,
+        BranchAction::Commit,
+        BranchAction::Abort,
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(3),
+        "the failing script must actually have failed"
+    );
     assert!(
         !landed,
         "a non-zero exit must apply on_error (Abort), so the write must not reach the workdir",
     );
 
     let (code, landed) = run_and_report_landing(
-        "disp-fail-commit", script_fail, BranchAction::Abort, BranchAction::Commit,
-    ).await;
-    assert_eq!(code, Some(3), "the failing script must actually have failed");
+        "disp-fail-commit",
+        script_fail,
+        BranchAction::Abort,
+        BranchAction::Commit,
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(3),
+        "the failing script must actually have failed"
+    );
     assert!(
         landed,
         "a non-zero exit must apply on_error (Commit), so the write must reach the workdir",
     );
 
     let (code, landed) = run_and_report_landing(
-        "disp-ok-commit", script_ok, BranchAction::Commit, BranchAction::Abort,
-    ).await;
-    assert_eq!(code, Some(0), "the succeeding script must actually have succeeded");
+        "disp-ok-commit",
+        script_ok,
+        BranchAction::Commit,
+        BranchAction::Abort,
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the succeeding script must actually have succeeded"
+    );
     assert!(
         landed,
         "exit code 0 must apply on_exit (Commit), so the write must reach the workdir",
     );
 
     let (code, landed) = run_and_report_landing(
-        "disp-ok-abort", script_ok, BranchAction::Abort, BranchAction::Commit,
-    ).await;
-    assert_eq!(code, Some(0), "the succeeding script must actually have succeeded");
+        "disp-ok-abort",
+        script_ok,
+        BranchAction::Abort,
+        BranchAction::Commit,
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "the succeeding script must actually have succeeded"
+    );
     assert!(
         !landed,
         "exit code 0 must apply on_exit (Abort), so the write must not reach the workdir",
@@ -976,23 +1242,37 @@ async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper() 
 
     {
         let mut sb = Sandbox::builder()
-            .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+            .fs_read("/usr")
+            .fs_read("/lib")
+            .fs_read_if_exists("/lib64")
+            .fs_read("/bin")
+            .fs_read("/etc")
             .fs_read("/proc")
-            .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+            .fs_write(&workdir)
+            .workdir(&workdir)
+            .cwd(&workdir)
             .fs_storage(&storage)
             .on_exit(BranchAction::Keep)
             .build()
             .unwrap();
-        let result = sb.run(&["sh", "-c", "rm victim.txt && echo NEW > added.txt"]).await.unwrap();
+        let result = sb
+            .run(&["sh", "-c", "rm victim.txt && echo NEW > added.txt"])
+            .await
+            .unwrap();
         assert!(
             result.success(),
             "the child must have deleted and written, exit={:?}, stderr={}",
-            result.code(), result.stderr_str().unwrap_or(""),
+            result.code(),
+            result.stderr_str().unwrap_or(""),
         );
     }
 
     let preserved = sandlock_core::list_preserved(&storage);
-    assert_eq!(preserved.len(), 1, "the kept branch must be findable by a sweep");
+    assert_eq!(
+        preserved.len(),
+        1,
+        "the kept branch must be findable by a sweep"
+    );
     let branch = &preserved[0];
     assert_eq!(branch.reason, sandlock_core::PreserveReason::Kept);
     assert_eq!(
@@ -1013,8 +1293,14 @@ async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper() 
 
     // Keep does not merge: the workdir still holds the pre-run state, so the
     // marker's deletion is the only record that the file was removed.
-    assert_eq!(fs::read_to_string(workdir.join("victim.txt")).unwrap(), "ORIGINAL");
-    assert!(!workdir.join("added.txt").exists(), "Keep must not merge the upper");
+    assert_eq!(
+        fs::read_to_string(workdir.join("victim.txt")).unwrap(),
+        "ORIGINAL"
+    );
+    assert!(
+        !workdir.join("added.txt").exists(),
+        "Keep must not merge the upper"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -1028,9 +1314,16 @@ async fn test_kept_branch_marker_records_the_runs_deletion_not_only_its_upper() 
 /// shell or python, and writes only inside the workdir.
 fn cow_sandbox(workdir: &std::path::Path, on_exit: BranchAction) -> SandboxBuilder {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(workdir).workdir(workdir).cwd(workdir)
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(workdir)
+        .workdir(workdir)
+        .cwd(workdir)
         .on_exit(on_exit)
 }
 
@@ -1063,7 +1356,8 @@ async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
         assert!(
             result.success(),
             "the child must have written, exit={:?}, stderr={}",
-            result.code(), result.stderr_str().unwrap_or(""),
+            result.code(),
+            result.stderr_str().unwrap_or(""),
         );
         // Obstruct the MERGE, not the lock: the workdir stays, so the commit
         // flock opens, but a symlink where the staged file must land makes the
@@ -1071,13 +1365,20 @@ async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
         // by then. The child wrote `added.txt` into the upper (COW), so the base
         // path is free to plant here without the child having followed it.
         std::os::unix::fs::symlink("/dev/null", workdir.join("added.txt")).unwrap();
-        assert!(sb.commit().is_err(), "the obstructed merge must report its failure");
-        assert!(!sb.pending(), "a failed commit disposes the branch by preserving it");
+        assert!(
+            sb.commit().is_err(),
+            "the obstructed merge must report its failure"
+        );
+        assert!(
+            !sb.pending(),
+            "a failed commit disposes the branch by preserving it"
+        );
     }
 
     let preserved = sandlock_core::list_preserved(&storage);
     assert_eq!(
-        preserved.len(), 1,
+        preserved.len(),
+        1,
         "a merge that could not run must leave exactly one branch for a sweep, got {:?}",
         preserved,
     );
@@ -1118,7 +1419,8 @@ async fn test_default_storage_base_is_per_user_and_spans_pids() {
         assert!(
             result.success(),
             "the child must have written, exit={:?}, stderr={}",
-            result.code(), result.stderr_str().unwrap_or(""),
+            result.code(),
+            result.stderr_str().unwrap_or(""),
         );
     }
 
@@ -1143,14 +1445,24 @@ async fn test_default_storage_base_is_per_user_and_spans_pids() {
                 .into_iter()
                 .filter(|p| p.upper.join("default-base-marker.txt").exists())
                 .collect();
-            if hit.is_empty() { None } else { Some((b.clone(), hit)) }
+            if hit.is_empty() {
+                None
+            } else {
+                Some((b.clone(), hit))
+            }
         })
         .expect("the kept branch must be under a stable per-user default base");
-    assert_eq!(ours.len(), 1, "exactly one kept branch under the default base");
+    assert_eq!(
+        ours.len(),
+        1,
+        "exactly one kept branch under the default base"
+    );
 
     // The base name carries the uid, never the pid.
     assert!(
-        !base.to_string_lossy().contains(&format!("sandlock-cow-{}", std::process::id())),
+        !base
+            .to_string_lossy()
+            .contains(&format!("sandlock-cow-{}", std::process::id())),
         "the default base must not embed the pid: {}",
         base.display(),
     );
@@ -1171,7 +1483,10 @@ async fn test_default_storage_base_is_per_user_and_spans_pids() {
     )
     .unwrap();
 
-    let swept: Vec<u32> = sandlock_core::list_preserved(&base).into_iter().map(|p| p.pid).collect();
+    let swept: Vec<u32> = sandlock_core::list_preserved(&base)
+        .into_iter()
+        .map(|p| p.pid)
+        .collect();
     assert!(
         swept.contains(&std::process::id()),
         "our own pid's kept branch must be swept from the per-user base",
@@ -1218,19 +1533,32 @@ async fn test_o_excl_sees_both_the_workdir_and_the_upper() {
     assert!(
         result.success(),
         "the probe must have run, exit={:?}, stderr={}",
-        result.code(), result.stderr_str().unwrap_or(""),
+        result.code(),
+        result.stderr_str().unwrap_or(""),
     );
     let out = result.stdout_str().unwrap_or("").to_string();
-    assert!(out.contains("lower EEXIST"), "O_EXCL must see the workdir file, stdout={:?}", out);
-    assert!(out.contains("upper EEXIST"), "O_EXCL must see the file this run created, stdout={:?}", out);
+    assert!(
+        out.contains("lower EEXIST"),
+        "O_EXCL must see the workdir file, stdout={:?}",
+        out
+    );
+    assert!(
+        out.contains("upper EEXIST"),
+        "O_EXCL must see the file this run created, stdout={:?}",
+        out
+    );
     assert!(
         out.contains("fresh CREATED"),
-        "O_EXCL must still create a name neither layer holds, stdout={:?}", out,
+        "O_EXCL must still create a name neither layer holds, stdout={:?}",
+        out,
     );
 
     // Abort: the pre-existing file must be untouched by the probe.
     drop(sb);
-    assert_eq!(fs::read_to_string(workdir.join("lower.txt")).unwrap(), "LOWER");
+    assert_eq!(
+        fs::read_to_string(workdir.join("lower.txt")).unwrap(),
+        "LOWER"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -1269,7 +1597,8 @@ async fn test_unlink_type_mismatches_reach_the_child_as_eisdir_and_enotdir() {
     assert!(
         result.success(),
         "the probe must have run, exit={:?}, stderr={}",
-        result.code(), result.stderr_str().unwrap_or(""),
+        result.code(),
+        result.stderr_str().unwrap_or(""),
     );
     let out = result.stdout_str().unwrap_or("").to_string();
     for expected in [
@@ -1278,13 +1607,24 @@ async fn test_unlink_type_mismatches_reach_the_child_as_eisdir_and_enotdir() {
         "unlink_upper_dir EISDIR",
         "rmdir_upper_file ENOTDIR",
     ] {
-        assert!(out.contains(expected), "expected {:?} in stdout={:?}", expected, out);
+        assert!(
+            out.contains(expected),
+            "expected {:?} in stdout={:?}",
+            expected,
+            out
+        );
     }
 
     // Abort: nothing the probe touched may reach the workdir.
     drop(sb);
-    assert!(workdir.join("lower_dir").is_dir(), "a refused unlink must not have deleted the directory");
-    assert!(!workdir.join("upper_dir").exists(), "an aborted run must not publish its directory");
+    assert!(
+        workdir.join("lower_dir").is_dir(),
+        "a refused unlink must not have deleted the directory"
+    );
+    assert!(
+        !workdir.join("upper_dir").exists(),
+        "an aborted run must not publish its directory"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -1302,7 +1642,11 @@ async fn test_cow_child_rm_r_directory_stays_deleted() {
     fs::write(workdir.join("d/secret.txt"), "SECRET").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -1314,7 +1658,11 @@ async fn test_cow_child_rm_r_directory_stays_deleted() {
     let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
-            assert!(r.success(), "rm -r should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                r.success(),
+                "rm -r should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
             assert!(!workdir.join("d").exists(), "d should be gone after commit");
             assert!(!workdir.join("d/secret.txt").exists());
         }
@@ -1333,7 +1681,11 @@ async fn test_cow_child_mv_directory_preserves_contents() {
     fs::write(workdir.join("d/inner.txt"), "PRECIOUS").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -1345,7 +1697,11 @@ async fn test_cow_child_mv_directory_preserves_contents() {
     let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
-            assert!(r.success(), "mv should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                r.success(),
+                "mv should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
             assert!(!workdir.join("d").exists(), "d should be gone after commit");
             assert_eq!(
                 fs::read_to_string(workdir.join("d2/inner.txt")).unwrap(),
@@ -1368,7 +1724,11 @@ async fn test_cow_child_rmdir_nonempty_fails() {
     fs::write(workdir.join("d/inner.txt"), "DATA").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .workdir(&workdir)
@@ -1412,7 +1772,11 @@ async fn test_seccomp_cow_hardlink_cannot_cross_the_workdir_boundary() {
     fs::write(outside.join("outside.txt"), "OUTSIDE").unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(&workdir)
         .fs_write(&outside)
@@ -1502,8 +1866,13 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
     std::os::unix::fs::symlink("lower.txt", workdir.join("link")).unwrap();
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write(&workdir)
         .workdir(&workdir)
         .cwd(&workdir)
@@ -1524,14 +1893,32 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
         "print('lower', chmod2('lower.txt', 0o600, 0), mode('lower.txt'))\n",
         "print('link', chmod2('link', 0o400, 0x100), mode('lower.txt'))\n",
     );
-    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
     let stdout = result.stdout_str().unwrap_or("");
-    assert!(result.success(), "exit={:?} stderr={}", result.code(), result.stderr_str().unwrap_or(""));
-    assert!(stdout.contains("made 0 0o640"), "branch-created FIFO: {stdout}");
-    assert!(stdout.contains("lower 0 0o600"), "lower file in the merged view: {stdout}");
+    assert!(
+        result.success(),
+        "exit={:?} stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+    assert!(
+        stdout.contains("made 0 0o640"),
+        "branch-created FIFO: {stdout}"
+    );
+    assert!(
+        stdout.contains("lower 0 0o600"),
+        "lower file in the merged view: {stdout}"
+    );
     // The kernel's own answer for AT_SYMLINK_NOFOLLOW on a symlink, and the
     // target must be left alone.
-    assert!(stdout.contains("link -95 0o600"), "symlink with AT_SYMLINK_NOFOLLOW: {stdout}");
+    assert!(
+        stdout.contains("link -95 0o600"),
+        "symlink with AT_SYMLINK_NOFOLLOW: {stdout}"
+    );
 
     let real = fs::metadata(&lower).unwrap().permissions().mode() & 0o777;
     assert_eq!(real, 0o644, "the abort must leave the real file untouched");

@@ -537,7 +537,6 @@ impl NetworkPolicyLayers {
     }
 }
 
-
 /// Network policy and port-remapping state. Holds separate allow and deny
 /// `NetworkPolicy` layers per L4 protocol: the on-behalf handler picks the
 /// matching pair based on the dup'd fd's `SO_PROTOCOL`.
@@ -572,7 +571,8 @@ pub struct NetworkState {
     pub bind_deny_ports: HashSet<u16>,
     /// Per-PID network overrides from policy_fn (IP-only via the legacy
     /// `restrict_network(ips)` API; any port is permitted to listed IPs).
-    pub pid_ip_overrides: std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<std::net::IpAddr>>>>,
+    pub pid_ip_overrides:
+        std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<std::net::IpAddr>>>>,
     /// HTTP ACL proxy address (None if HTTP ACL not active).
     pub http_acl_addr: Option<std::net::SocketAddr>,
     /// TCP ports to intercept and redirect to the HTTP ACL proxy.
@@ -675,7 +675,10 @@ pub struct TimeRandomState {
 
 impl TimeRandomState {
     pub fn new(time_offset: Option<i64>, random_state: Option<rand_chacha::ChaCha8Rng>) -> Self {
-        Self { time_offset, random_state }
+        Self {
+            time_offset,
+            random_state,
+        }
     }
 }
 
@@ -722,7 +725,11 @@ pub(crate) fn file_id_of_path(path: &str) -> Option<FileId> {
     let c = std::ffi::CString::new(path).ok()?;
     let (handle_type, handle) =
         crate::sys::fs::file_handle(libc::AT_FDCWD, &c, libc::AT_SYMLINK_FOLLOW)?;
-    Some(FileId { dev, handle_type, handle })
+    Some(FileId {
+        dev,
+        handle_type,
+        handle,
+    })
 }
 
 /// Identity of an open fd.
@@ -733,7 +740,11 @@ pub(crate) fn file_id_of_fd(fd: std::os::unix::io::RawFd) -> Option<FileId> {
     }
     let empty = std::ffi::CString::new("").ok()?;
     let (handle_type, handle) = crate::sys::fs::file_handle(fd, &empty, libc::AT_EMPTY_PATH)?;
-    Some(FileId { dev: st.st_dev as u64, handle_type, handle })
+    Some(FileId {
+        dev: st.st_dev as u64,
+        handle_type,
+        handle,
+    })
 }
 
 impl DeniedSet {
@@ -958,7 +969,10 @@ mod tests {
         assert!(child >= 0, "fork failed");
         if child == 0 {
             // Async-signal-safe only: sleep, then leave without unwinding.
-            let ts = libc::timespec { tv_sec: 30, tv_nsec: 0 };
+            let ts = libc::timespec {
+                tv_sec: 30,
+                tv_nsec: 0,
+            };
             unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
             unsafe { libc::_exit(0) };
         }
@@ -980,7 +994,10 @@ mod tests {
         let idx = ProcessIndex::new();
         // Forge a stale entry by direct insertion under the lock.
         {
-            let stale_key = PidKey { pid: self_pid, start_time: 0 };
+            let stale_key = PidKey {
+                pid: self_pid,
+                start_time: 0,
+            };
             let stale = ProcessEntry {
                 key: stale_key,
                 tgid: self_pid,
@@ -996,7 +1013,10 @@ mod tests {
 
         // Unregistering by the stale key must NOT clobber the fresh
         // registration; only an exact-match unregister wins.
-        let stale_key = PidKey { pid: self_pid, start_time: 0 };
+        let stale_key = PidKey {
+            pid: self_pid,
+            start_time: 0,
+        };
         idx.unregister(stale_key);
         assert_eq!(idx.key_for(self_pid), Some(new_key));
     }
@@ -1040,7 +1060,10 @@ mod tests {
         let self_pid = unsafe { libc::getpid() };
         let idx = ProcessIndex::new();
         // Insert a stale entry for self with a wrong start_time.
-        let stale_key = PidKey { pid: self_pid, start_time: 0 };
+        let stale_key = PidKey {
+            pid: self_pid,
+            start_time: 0,
+        };
         let stale = ProcessEntry {
             key: stale_key,
             tgid: self_pid,

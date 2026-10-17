@@ -116,14 +116,16 @@ async fn test_restore_glibc_vdso_program_resumes() {
         .fs_read(&helper_dir)
         .fs_read(&tmp)
         .fs_write(&tmp)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let helper_s = helper.to_str().unwrap().to_string();
     let mut sb = policy.clone().with_name("vdso-src");
     {
         let _stdio = StdioRedirect::to_file(&tmp.join("helper.log"));
         sb.spawn_interactive(&[helper_s.as_str(), "clock-loop", counter_s.as_str()])
-            .await.unwrap();
+            .await
+            .unwrap();
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -131,14 +133,23 @@ async fn test_restore_glibc_vdso_program_resumes() {
     let cp = sb.checkpoint().await.unwrap();
 
     let read_counter = |path: &str| -> Option<u64> {
-        std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
     };
     let baseline = read_counter(&counter_s).expect("counter file should exist with a value");
-    assert!(baseline > 2, "counter should have advanced before checkpoint, got {baseline}");
+    assert!(
+        baseline > 2,
+        "counter should have advanced before checkpoint, got {baseline}"
+    );
 
     // Kill the original so only the restored process can advance the file.
     sb.kill().unwrap();
-    let _ = async { sb.wait().await?; sb.shutdown().await }.await;
+    let _ = async {
+        sb.wait().await?;
+        sb.shutdown().await
+    }
+    .await;
 
     // Sentinel: prove the *restored* process (not a leftover original) is writing.
     std::fs::write(&counter, b"0\n").unwrap();
@@ -168,7 +179,12 @@ async fn test_restore_glibc_vdso_program_resumes() {
 
     // Clean up before asserting so a failure never leaks the child/files.
     let _ = sb2.kill();
-    let exit = async { sb2.wait().await?; sb2.shutdown().await }.await.map(|r| r.exit_status);
+    let exit = async {
+        sb2.wait().await?;
+        sb2.shutdown().await
+    }
+    .await
+    .map(|r| r.exit_status);
     let _ = std::fs::remove_dir_all(&tmp);
 
     assert!(
@@ -181,7 +197,10 @@ async fn test_restore_glibc_vdso_program_resumes() {
     // splits adjacent mappings, so a restored VMA legitimately spans several
     // recorded ones. What must not happen is a *byte* being mapped that the
     // checkpoint never recorded.
-    assert!(!restored_maps.is_empty(), "could not read the restored layout");
+    assert!(
+        !restored_maps.is_empty(),
+        "could not read the restored layout"
+    );
     let mut allowed: Vec<(u64, u64)> = cp
         .process_state
         .memory_maps
@@ -200,7 +219,10 @@ async fn test_restore_glibc_vdso_program_resumes() {
     let mut strays = Vec::new();
     for (start, end, path) in &restored_maps {
         // The kernel always provides these; they are not checkpoint state.
-        if matches!(path.as_str(), "[vdso]" | "[vvar]" | "[vvar_vclock]" | "[vsyscall]") {
+        if matches!(
+            path.as_str(),
+            "[vdso]" | "[vvar]" | "[vvar_vclock]" | "[vsyscall]"
+        ) {
             continue;
         }
         if !covered.iter().any(|&(lo, hi)| *start >= lo && *end <= hi) {
@@ -225,13 +247,16 @@ async fn test_restore_resumes_inside_a_chroot() {
         return;
     }
 
-    let rootfs = std::env::temp_dir().join(format!("sandlock-restore-chroot-{}", std::process::id()));
+    let rootfs =
+        std::env::temp_dir().join(format!("sandlock-restore-chroot-{}", std::process::id()));
     std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
     std::fs::create_dir_all(rootfs.join("tmp")).unwrap();
     std::fs::copy(helper_binary(), rootfs.join("usr/bin/rootfs-helper")).unwrap();
     let counter = rootfs.join("tmp/clock.cnt");
     let read_counter = || -> Option<u64> {
-        std::fs::read_to_string(&counter).ok().and_then(|s| s.trim().parse().ok())
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
     };
 
     let policy = Sandbox::builder()
@@ -239,19 +264,25 @@ async fn test_restore_resumes_inside_a_chroot() {
         .fs_read("/usr")
         .fs_read("/tmp")
         .fs_write("/tmp")
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let mut sb = policy.clone().with_name("chroot-restore-src");
     {
         let _stdio = StdioRedirect::to_file(&rootfs.join("tmp/helper.log"));
         sb.spawn_interactive(&["/usr/bin/rootfs-helper", "clock-loop", "/tmp/clock.cnt"])
-            .await.unwrap();
+            .await
+            .unwrap();
     }
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let cp = sb.checkpoint().await.unwrap();
     let baseline = read_counter().expect("counter file should exist with a value");
     sb.kill().unwrap();
-    let _ = async { sb.wait().await?; sb.shutdown().await }.await;
+    let _ = async {
+        sb.wait().await?;
+        sb.shutdown().await
+    }
+    .await;
 
     std::fs::write(&counter, b"0\n").unwrap();
     let mut sb2 = policy.clone().with_name("chroot-restore-dst");
@@ -267,9 +298,16 @@ async fn test_restore_resumes_inside_a_chroot() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let _ = sb2.kill();
-    let _ = async { sb2.wait().await?; sb2.shutdown().await }.await;
+    let _ = async {
+        sb2.wait().await?;
+        sb2.shutdown().await
+    }
+    .await;
     let _ = std::fs::remove_dir_all(&rootfs);
 
     restored.expect("restore under chroot");
-    assert!(advanced, "restored process must resume inside the chroot past baseline {baseline}");
+    assert!(
+        advanced,
+        "restored process must resume inside the chroot past baseline {baseline}"
+    );
 }

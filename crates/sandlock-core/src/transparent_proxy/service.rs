@@ -72,7 +72,12 @@ fn request_authority(
     use hyper::http::uri::Authority;
 
     let hdr_auth: Option<Authority> = match headers.get("host") {
-        Some(v) => Some(v.to_str().map_err(|_| ())?.parse::<Authority>().map_err(|_| ())?),
+        Some(v) => Some(
+            v.to_str()
+                .map_err(|_| ())?
+                .parse::<Authority>()
+                .map_err(|_| ())?,
+        ),
         None => None,
     };
     let uri_auth: Option<Authority> = uri.authority().cloned();
@@ -283,7 +288,11 @@ impl AclService {
 fn text_response(status: StatusCode, msg: &str) -> Response<BoxBody<Bytes, BoxError>> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::from(msg.to_string())).map_err(|e| match e {}).boxed())
+        .body(
+            Full::new(Bytes::from(msg.to_string()))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
         .expect("response build")
 }
 
@@ -317,10 +326,22 @@ mod tests {
     #[test]
     fn request_authority_collapses_to_one_safe_host() {
         // Agreement, origin-form, a port, and a case-only difference all resolve.
-        assert_eq!(authority_of("http://allowed.example/v1", Some("allowed.example")).unwrap(), "allowed.example");
-        assert_eq!(authority_of("/v1", Some("allowed.example")).unwrap(), "allowed.example");
-        assert_eq!(authority_of("http://allowed.example/v1", Some("ALLOWED.EXAMPLE")).unwrap(), "allowed.example");
-        assert_eq!(authority_of("/v1", Some("allowed.example:443")).unwrap(), "allowed.example:443");
+        assert_eq!(
+            authority_of("http://allowed.example/v1", Some("allowed.example")).unwrap(),
+            "allowed.example"
+        );
+        assert_eq!(
+            authority_of("/v1", Some("allowed.example")).unwrap(),
+            "allowed.example"
+        );
+        assert_eq!(
+            authority_of("http://allowed.example/v1", Some("ALLOWED.EXAMPLE")).unwrap(),
+            "allowed.example"
+        );
+        assert_eq!(
+            authority_of("/v1", Some("allowed.example:443")).unwrap(),
+            "allowed.example:443"
+        );
 
         // The exfiltration vectors are all rejected:
         // absolute-form URI host vs a spoofed Host header,
@@ -328,7 +349,11 @@ mod tests {
         // and userinfo smuggling that hides the real forward host behind `@`,
         // in both origin-form and absolute-form.
         assert!(authority_of("/v1", Some("allowed.example:x@attacker.example")).is_err());
-        assert!(authority_of("http://allowed.example/v1", Some("allowed.example:x@attacker.example")).is_err());
+        assert!(authority_of(
+            "http://allowed.example/v1",
+            Some("allowed.example:x@attacker.example")
+        )
+        .is_err());
 
         // A request with no host at all is rejected (fail closed).
         assert!(authority_of("/v1", None).is_err());

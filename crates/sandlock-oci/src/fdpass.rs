@@ -145,12 +145,21 @@ mod tests {
 
         // Write through the RECEIVED fd, read from the original pipe read end.
         let received_w = got[0].as_raw_fd();
-        assert_eq!(unsafe { libc::write(received_w, b"Z".as_ptr() as *const _, 1) }, 1);
+        assert_eq!(
+            unsafe { libc::write(received_w, b"Z".as_ptr() as *const _, 1) },
+            1
+        );
         let mut buf = [0u8; 1];
-        assert_eq!(unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut _, 1) }, 1);
+        assert_eq!(
+            unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut _, 1) },
+            1
+        );
         assert_eq!(buf[0], b'Z');
 
-        unsafe { libc::close(pipe_r); libc::close(pipe_w); }
+        unsafe {
+            libc::close(pipe_r);
+            libc::close(pipe_w);
+        }
         let _ = (a, b);
     }
 

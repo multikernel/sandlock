@@ -98,10 +98,16 @@ impl Reference {
             return Err(bad("a tag and a digest together are ambiguous; use one"));
         }
         let (registry, repository) = match name.split_once('/') {
-            Some((host, rest)) if host.contains(['.', ':']) || host == "localhost" => (host, rest.to_string()),
+            Some((host, rest)) if host.contains(['.', ':']) || host == "localhost" => {
+                (host, rest.to_string())
+            }
             _ => ("docker.io", name.to_string()),
         };
-        let registry = if registry == "index.docker.io" { "docker.io" } else { registry };
+        let registry = if registry == "index.docker.io" {
+            "docker.io"
+        } else {
+            registry
+        };
         let repository = if registry == "docker.io" && !repository.contains('/') {
             format!("library/{repository}")
         } else {
@@ -117,15 +123,26 @@ impl Reference {
                 })
         };
         if !valid_path(&repository) {
-            return Err(bad("repository components are lowercase alphanumerics joined by '.', '_' or '-'"));
+            return Err(bad(
+                "repository components are lowercase alphanumerics joined by '.', '_' or '-'",
+            ));
         }
         if let Some(tag) = tag {
-            if tag.is_empty() || tag.len() > 128 || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            if tag.is_empty()
+                || tag.len() > 128
+                || !tag
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
                 return Err(bad("malformed tag"));
             }
         }
         let reference = digest.or(tag).unwrap_or("latest").to_string();
-        Ok(Reference { registry: registry.to_string(), repository, reference })
+        Ok(Reference {
+            registry: registry.to_string(),
+            repository,
+            reference,
+        })
     }
 
     fn host(&self) -> &str {
@@ -138,7 +155,10 @@ impl Reference {
 
     // Docker also talks plain HTTP to loopback registries by default.
     fn scheme(&self) -> &str {
-        let host = self.registry.rsplit_once(':').map_or(self.registry.as_str(), |(h, _)| h);
+        let host = self
+            .registry
+            .rsplit_once(':')
+            .map_or(self.registry.as_str(), |(h, _)| h);
         if host == "localhost" || host == "127.0.0.1" || host == "[::1]" {
             "http"
         } else {
@@ -163,7 +183,12 @@ impl Registry {
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        Ok(Registry { reference, client, basic, authorization: None })
+        Ok(Registry {
+            reference,
+            client,
+            basic,
+            authorization: None,
+        })
     }
 
     fn url(&self, path: &str) -> String {
@@ -174,16 +199,25 @@ impl Registry {
     /// Fetch a manifest or index. Content addressed by digest is verified
     /// and kept in the cache, so a digest reference is served offline.
     async fn manifest(&mut self, cache: &Cache, reference: &str) -> Result<Vec<u8>, SandlockError> {
-        let stored = oci::digest_hex(reference).ok().map(|hex| cache.dir.join("blobs/sha256").join(hex));
+        let stored = oci::digest_hex(reference)
+            .ok()
+            .map(|hex| cache.dir.join("blobs/sha256").join(hex));
         if let Some(bytes) = stored.as_ref().and_then(|p| std::fs::read(p).ok()) {
             return Ok(bytes);
         }
-        let resp = self.get(&self.url(&format!("manifests/{reference}")), Some(MANIFEST_TYPES)).await?;
+        let resp = self
+            .get(
+                &self.url(&format!("manifests/{reference}")),
+                Some(MANIFEST_TYPES),
+            )
+            .await?;
         let bytes = read_capped(resp, oci::MAX_JSON_BLOB, reference).await?;
         if let Some(path) = stored {
             let actual = sha256_hex(&bytes);
             if Some(actual.as_str()) != oci::digest_hex(reference).ok() {
-                return Err(registry_error(format!("manifest {reference}: digest mismatch: got sha256:{actual}")));
+                return Err(registry_error(format!(
+                    "manifest {reference}: digest mismatch: got sha256:{actual}"
+                )));
             }
             store_atomically(&path, &bytes)?;
         }
@@ -194,17 +228,26 @@ impl Registry {
     /// back for unpacking.
     async fn download(&self, desc: &Descriptor, dir: &Path) -> Result<(), SandlockError> {
         let hex = oci::digest_hex(&desc.digest)?;
-        let mut resp = self.get_authorized(&self.url(&format!("blobs/{}", desc.digest))).await?;
-        let mut file = tokio::fs::File::create(dir.join(hex)).await.map_err(SandboxRuntimeError::Io)?;
+        let mut resp = self
+            .get_authorized(&self.url(&format!("blobs/{}", desc.digest)))
+            .await?;
+        let mut file = tokio::fs::File::create(dir.join(hex))
+            .await
+            .map_err(SandboxRuntimeError::Io)?;
         let mut written = 0u64;
         while let Some(frame) = resp.body_mut().frame().await {
             let frame = frame.map_err(|e| registry_error(format!("blob {}: {e}", desc.digest)))?;
             if let Ok(data) = frame.into_data() {
                 written += data.len() as u64;
                 if written > desc.size {
-                    return Err(registry_error(format!("blob {}: larger than its descriptor", desc.digest)));
+                    return Err(registry_error(format!(
+                        "blob {}: larger than its descriptor",
+                        desc.digest
+                    )));
                 }
-                file.write_all(&data).await.map_err(SandboxRuntimeError::Io)?;
+                file.write_all(&data)
+                    .await
+                    .map_err(SandboxRuntimeError::Io)?;
             }
         }
         file.flush().await.map_err(SandboxRuntimeError::Io)?;
@@ -221,7 +264,11 @@ impl Registry {
         let ping = format!("{}://{}/v2/", r.scheme(), r.host());
         let resp = self.send(&ping, None).await?;
         if resp.status() == StatusCode::UNAUTHORIZED {
-            if let Some(challenge) = resp.headers().get(header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()) {
+            if let Some(challenge) = resp
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+            {
                 let challenge = challenge.to_string();
                 self.authorization = Some(self.authenticate(&challenge).await?);
             }
@@ -230,7 +277,11 @@ impl Registry {
     }
 
     /// GET that answers an auth challenge once, then retries.
-    async fn get(&mut self, url: &str, accept: Option<&str>) -> Result<Response<Incoming>, SandlockError> {
+    async fn get(
+        &mut self,
+        url: &str,
+        accept: Option<&str>,
+    ) -> Result<Response<Incoming>, SandlockError> {
         let resp = self.send(url, accept).await?;
         if resp.status() != StatusCode::UNAUTHORIZED {
             return check_status(resp, url);
@@ -251,8 +302,14 @@ impl Registry {
 
     /// One request, following redirects. Credentials only go to the
     /// registry itself, never to the storage a blob redirects to.
-    async fn send(&self, url: &str, accept: Option<&str>) -> Result<Response<Incoming>, SandlockError> {
-        let origin: Uri = url.parse().map_err(|e| registry_error(format!("{url}: {e}")))?;
+    async fn send(
+        &self,
+        url: &str,
+        accept: Option<&str>,
+    ) -> Result<Response<Incoming>, SandlockError> {
+        let origin: Uri = url
+            .parse()
+            .map_err(|e| registry_error(format!("{url}: {e}")))?;
         let mut uri = origin.clone();
         for _ in 0..=MAX_REDIRECTS {
             let mut req = Request::get(uri.clone());
@@ -264,10 +321,17 @@ impl Registry {
                     req = req.header(header::AUTHORIZATION, auth);
                 }
             }
-            let req = req.body(Empty::new()).map_err(|e| registry_error(format!("{uri}: {e}")))?;
+            let req = req
+                .body(Empty::new())
+                .map_err(|e| registry_error(format!("{uri}: {e}")))?;
             let resp = tokio::time::timeout(RESPONSE_TIMEOUT, self.client.request(req))
                 .await
-                .map_err(|_| registry_error(format!("{uri}: no response in {}s", RESPONSE_TIMEOUT.as_secs())))?
+                .map_err(|_| {
+                    registry_error(format!(
+                        "{uri}: no response in {}s",
+                        RESPONSE_TIMEOUT.as_secs()
+                    ))
+                })?
                 .map_err(|e| registry_error(format!("{uri}: {e}")))?;
             if !resp.status().is_redirection() {
                 return Ok(resp);
@@ -286,12 +350,17 @@ impl Registry {
         let (scheme, params) = parse_challenge(challenge);
         if scheme.eq_ignore_ascii_case("basic") {
             let basic = self.basic.as_ref().ok_or_else(|| {
-                registry_error(format!("{} requires credentials (docker login)", self.reference.registry))
+                registry_error(format!(
+                    "{} requires credentials (docker login)",
+                    self.reference.registry
+                ))
             })?;
             return Ok(format!("Basic {basic}"));
         }
         if !scheme.eq_ignore_ascii_case("bearer") {
-            return Err(registry_error(format!("unsupported auth scheme {scheme:?}")));
+            return Err(registry_error(format!(
+                "unsupported auth scheme {scheme:?}"
+            )));
         }
         let realm = params
             .iter()
@@ -303,16 +372,23 @@ impl Registry {
         if let Some((_, service)) = params.iter().find(|(k, _)| k == "service") {
             query.push(("service", service));
         }
-        let query: Vec<String> = query.iter().map(|(k, v)| format!("{k}={}", percent_encode(v))).collect();
+        let query: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{k}={}", percent_encode(v)))
+            .collect();
         let sep = if realm.contains('?') { '&' } else { '?' };
         let url = format!("{realm}{sep}{}", query.join("&"));
 
-        let uri: Uri = url.parse().map_err(|e| registry_error(format!("token realm {realm}: {e}")))?;
+        let uri: Uri = url
+            .parse()
+            .map_err(|e| registry_error(format!("token realm {realm}: {e}")))?;
         let mut req = Request::get(uri);
         if let Some(basic) = &self.basic {
             req = req.header(header::AUTHORIZATION, format!("Basic {basic}"));
         }
-        let req = req.body(Empty::new()).map_err(|e| registry_error(e.to_string()))?;
+        let req = req
+            .body(Empty::new())
+            .map_err(|e| registry_error(e.to_string()))?;
         let resp = tokio::time::timeout(RESPONSE_TIMEOUT, self.client.request(req))
             .await
             .map_err(|_| registry_error(format!("{realm}: no response")))?
@@ -337,14 +413,18 @@ fn check_status(resp: Response<Incoming>, url: &str) -> Result<Response<Incoming
     match resp.status() {
         s if s.is_success() => Ok(resp),
         StatusCode::NOT_FOUND => Err(registry_error(format!("{url}: not found"))),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-            Err(registry_error(format!("{url}: access denied (private image? try docker login)")))
-        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(registry_error(format!(
+            "{url}: access denied (private image? try docker login)"
+        ))),
         s => Err(registry_error(format!("{url}: HTTP {s}"))),
     }
 }
 
-async fn read_capped(resp: Response<Incoming>, cap: u64, what: &str) -> Result<Vec<u8>, SandlockError> {
+async fn read_capped(
+    resp: Response<Incoming>,
+    cap: u64,
+    what: &str,
+) -> Result<Vec<u8>, SandlockError> {
     let mut body = resp.into_body();
     let mut out = Vec::new();
     while let Some(frame) = body.frame().await {
@@ -368,7 +448,9 @@ fn resolve_location(base: &Uri, location: &str) -> Result<Uri, SandlockError> {
     } else {
         location.to_string()
     };
-    let uri: Uri = target.parse().map_err(|e: hyper::http::uri::InvalidUri| bad(e.to_string()))?;
+    let uri: Uri = target
+        .parse()
+        .map_err(|e: hyper::http::uri::InvalidUri| bad(e.to_string()))?;
     // Never downgrade a registry's HTTPS to plain HTTP on a redirect.
     if base.scheme_str() == Some("https") && uri.scheme_str() != Some("https") {
         return Err(bad("refusing to leave HTTPS".into()));
@@ -386,7 +468,12 @@ fn parse_challenge(header: &str) -> (String, Vec<(String, String)>) {
         while matches!(chars.peek(), Some(c) if *c == ',' || c.is_whitespace()) {
             chars.next();
         }
-        let key: String = chars.by_ref().take_while(|c| *c != '=').collect::<String>().trim().to_string();
+        let key: String = chars
+            .by_ref()
+            .take_while(|c| *c != '=')
+            .collect::<String>()
+            .trim()
+            .to_string();
         if key.is_empty() {
             break;
         }
@@ -401,7 +488,12 @@ fn parse_challenge(header: &str) -> (String, Vec<(String, String)>) {
                 }
             }
         } else {
-            value = chars.by_ref().take_while(|c| *c != ',').collect::<String>().trim().to_string();
+            value = chars
+                .by_ref()
+                .take_while(|c| *c != ',')
+                .collect::<String>()
+                .trim()
+                .to_string();
         }
         params.push((key.to_ascii_lowercase(), value));
     }
@@ -411,37 +503,50 @@ fn parse_challenge(header: &str) -> (String, Vec<(String, String)>) {
 fn percent_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'/' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'/' => {
+                (b as char).to_string()
+            }
             b => format!("%{b:02X}"),
         })
         .collect()
 }
 
 fn docker_config_dir() -> PathBuf {
-    std::env::var_os("DOCKER_CONFIG").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".docker")
-    })
+    std::env::var_os("DOCKER_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".docker")
+        })
 }
 
 /// Base64 `user:password` for `registry` from `docker login`'s config.
 /// Credential helpers are external programs and deliberately not run.
 fn credentials(config_dir: &Path, registry: &str) -> Option<String> {
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_dir.join("config.json")).ok()?).ok()?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_dir.join("config.json")).ok()?).ok()?;
     let wanted: &[&str] = if registry == "docker.io" {
         &["docker.io", "index.docker.io", "registry-1.docker.io"]
     } else {
         &[registry]
     };
-    config.get("auths")?.as_object()?.iter().find_map(|(key, entry)| {
-        let host = key.trim_start_matches("https://").trim_start_matches("http://");
-        let host = host.split('/').next().unwrap_or(host);
-        if !wanted.contains(&host) {
-            return None;
-        }
-        let auth = entry.get("auth")?.as_str()?;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(auth).ok()?;
-        decoded.contains(&b':').then(|| auth.to_string())
-    })
+    config
+        .get("auths")?
+        .as_object()?
+        .iter()
+        .find_map(|(key, entry)| {
+            let host = key
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            let host = host.split('/').next().unwrap_or(host);
+            if !wanted.contains(&host) {
+                return None;
+            }
+            let auth = entry.get("auth")?.as_str()?;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(auth)
+                .ok()?;
+            decoded.contains(&b':').then(|| auth.to_string())
+        })
 }
 
 fn store_atomically(path: &Path, bytes: &[u8]) -> Result<(), SandlockError> {
@@ -454,7 +559,11 @@ fn store_atomically(path: &Path, bytes: &[u8]) -> Result<(), SandlockError> {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, data).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn registry_error(msg: String) -> SandlockError {
@@ -477,13 +586,31 @@ mod tests {
     fn references_normalize_like_docker() {
         let t = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
         assert_eq!(parsed("ubuntu"), t("docker.io", "library/ubuntu", "latest"));
-        assert_eq!(parsed("python:3.12-slim"), t("docker.io", "library/python", "3.12-slim"));
-        assert_eq!(parsed("bitnami/redis:7"), t("docker.io", "bitnami/redis", "7"));
-        assert_eq!(parsed("index.docker.io/library/alpine"), t("docker.io", "library/alpine", "latest"));
-        assert_eq!(parsed("ghcr.io/org/tool:v1"), t("ghcr.io", "org/tool", "v1"));
-        assert_eq!(parsed("localhost:5000/img"), t("localhost:5000", "img", "latest"));
+        assert_eq!(
+            parsed("python:3.12-slim"),
+            t("docker.io", "library/python", "3.12-slim")
+        );
+        assert_eq!(
+            parsed("bitnami/redis:7"),
+            t("docker.io", "bitnami/redis", "7")
+        );
+        assert_eq!(
+            parsed("index.docker.io/library/alpine"),
+            t("docker.io", "library/alpine", "latest")
+        );
+        assert_eq!(
+            parsed("ghcr.io/org/tool:v1"),
+            t("ghcr.io", "org/tool", "v1")
+        );
+        assert_eq!(
+            parsed("localhost:5000/img"),
+            t("localhost:5000", "img", "latest")
+        );
         let digest = format!("sha256:{}", "a".repeat(64));
-        assert_eq!(parsed(&format!("ghcr.io/o/i@{digest}")), t("ghcr.io", "o/i", &digest));
+        assert_eq!(
+            parsed(&format!("ghcr.io/o/i@{digest}")),
+            t("ghcr.io", "o/i", &digest)
+        );
         assert!(Reference::parse(&format!("ghcr.io/o/i:v1@{digest}")).is_err());
         assert!(Reference::parse("Ubuntu").is_err());
         assert!(Reference::parse("ubuntu@sha256:short").is_err());
@@ -494,10 +621,19 @@ mod tests {
 
     #[test]
     fn scheme_is_plain_http_only_for_loopback() {
-        assert_eq!(Reference::parse("localhost:5000/a").unwrap().scheme(), "http");
-        assert_eq!(Reference::parse("127.0.0.1:5000/a").unwrap().scheme(), "http");
+        assert_eq!(
+            Reference::parse("localhost:5000/a").unwrap().scheme(),
+            "http"
+        );
+        assert_eq!(
+            Reference::parse("127.0.0.1:5000/a").unwrap().scheme(),
+            "http"
+        );
         assert_eq!(Reference::parse("ghcr.io/a").unwrap().scheme(), "https");
-        assert_eq!(Reference::parse("a").unwrap().host(), "registry-1.docker.io");
+        assert_eq!(
+            Reference::parse("a").unwrap().host(),
+            "registry-1.docker.io"
+        );
     }
 
     #[test]
@@ -506,17 +642,31 @@ mod tests {
             r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/ubuntu:pull,push""#,
         );
         assert_eq!(scheme, "Bearer");
-        assert_eq!(params[0], ("realm".into(), "https://auth.docker.io/token".into()));
+        assert_eq!(
+            params[0],
+            ("realm".into(), "https://auth.docker.io/token".into())
+        );
         assert_eq!(params[1], ("service".into(), "registry.docker.io".into()));
-        assert_eq!(params[2], ("scope".into(), "repository:library/ubuntu:pull,push".into()));
+        assert_eq!(
+            params[2],
+            ("scope".into(), "repository:library/ubuntu:pull,push".into())
+        );
         assert_eq!(parse_challenge("Basic realm=reg").0, "Basic");
     }
 
     #[test]
     fn redirects_resolve_and_never_downgrade() {
         let base: Uri = "https://reg.io/v2/a/blobs/x".parse().unwrap();
-        assert_eq!(resolve_location(&base, "/cdn/x").unwrap().to_string(), "https://reg.io/cdn/x");
-        assert_eq!(resolve_location(&base, "https://cdn.io/x?sig=1").unwrap().to_string(), "https://cdn.io/x?sig=1");
+        assert_eq!(
+            resolve_location(&base, "/cdn/x").unwrap().to_string(),
+            "https://reg.io/cdn/x"
+        );
+        assert_eq!(
+            resolve_location(&base, "https://cdn.io/x?sig=1")
+                .unwrap()
+                .to_string(),
+            "https://cdn.io/x?sig=1"
+        );
         assert!(resolve_location(&base, "http://cdn.io/x").is_err());
     }
 
@@ -530,8 +680,14 @@ mod tests {
             "helper.io": {},
         }, "credsStore": "desktop"});
         std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
-        assert_eq!(credentials(dir.path(), "docker.io").as_deref(), Some(auth.as_str()));
-        assert_eq!(credentials(dir.path(), "ghcr.io").as_deref(), Some(auth.as_str()));
+        assert_eq!(
+            credentials(dir.path(), "docker.io").as_deref(),
+            Some(auth.as_str())
+        );
+        assert_eq!(
+            credentials(dir.path(), "ghcr.io").as_deref(),
+            Some(auth.as_str())
+        );
         assert_eq!(credentials(dir.path(), "helper.io"), None);
         assert_eq!(credentials(dir.path(), "quay.io"), None);
     }
@@ -545,7 +701,10 @@ mod tests {
 
     /// A registry that demands a bearer token and serves blobs through a
     /// redirect to another authority, which must not see the token.
-    async fn serve(layout: Arc<TestLayout>, tag_target: String) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn serve(
+        layout: Arc<TestLayout>,
+        tag_target: String,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         use hyper::service::service_fn;
         use hyper_util::rt::TokioIo;
 
@@ -553,7 +712,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let layout = layout.clone();
                 let tag_target = tag_target.clone();
                 tokio::spawn(async move {
@@ -562,46 +723,70 @@ mod tests {
                         let tag_target = tag_target.clone();
                         async move {
                             let path = req.uri().path().to_string();
-                            let auth = req.headers().get(header::AUTHORIZATION).map(|v| v.to_str().unwrap().to_string());
+                            let auth = req
+                                .headers()
+                                .get(header::AUTHORIZATION)
+                                .map(|v| v.to_str().unwrap().to_string());
                             let reply = |status: u16, body: Vec<u8>| {
-                                Response::builder().status(status).body(http_body_util::Full::new(Bytes::from(body))).unwrap()
+                                Response::builder()
+                                    .status(status)
+                                    .body(http_body_util::Full::new(Bytes::from(body)))
+                                    .unwrap()
                             };
-                            let blob = |hex: &str| std::fs::read(layout.path().join("blobs/sha256").join(hex)).ok();
+                            let blob = |hex: &str| {
+                                std::fs::read(layout.path().join("blobs/sha256").join(hex)).ok()
+                            };
                             if path == "/token" {
                                 let q = req.uri().query().unwrap_or_default();
                                 assert!(q.contains("scope=repository:test/img:pull"), "{q}");
-                                return Ok::<_, std::convert::Infallible>(reply(200, br#"{"token":"t0k"}"#.to_vec()));
+                                return Ok::<_, std::convert::Infallible>(reply(
+                                    200,
+                                    br#"{"token":"t0k"}"#.to_vec(),
+                                ));
                             }
                             if let Some(hex) = path.strip_prefix("/storage/") {
                                 if auth.is_some() {
                                     return Ok(reply(400, b"token leaked to storage".to_vec()));
                                 }
-                                return Ok(blob(hex).map_or_else(|| reply(404, vec![]), |b| reply(200, b)));
+                                return Ok(
+                                    blob(hex).map_or_else(|| reply(404, vec![]), |b| reply(200, b))
+                                );
                             }
                             if auth.as_deref() != Some("Bearer t0k") {
                                 let mut r = reply(401, vec![]);
-                                let challenge = format!(r#"Bearer realm="http://{addr}/token",service="test""#);
-                                r.headers_mut().insert(header::WWW_AUTHENTICATE, challenge.parse().unwrap());
+                                let challenge =
+                                    format!(r#"Bearer realm="http://{addr}/token",service="test""#);
+                                r.headers_mut()
+                                    .insert(header::WWW_AUTHENTICATE, challenge.parse().unwrap());
                                 return Ok(r);
                             }
                             if path == "/v2/" {
                                 return Ok(reply(200, vec![]));
                             }
                             if let Some(r) = path.strip_prefix("/v2/test/img/manifests/") {
-                                let digest = if r.starts_with("sha256:") { r.to_string() } else { tag_target.clone() };
+                                let digest = if r.starts_with("sha256:") {
+                                    r.to_string()
+                                } else {
+                                    tag_target.clone()
+                                };
                                 let hex = digest.trim_start_matches("sha256:");
-                                return Ok(blob(hex).map_or_else(|| reply(404, vec![]), |b| reply(200, b)));
+                                return Ok(
+                                    blob(hex).map_or_else(|| reply(404, vec![]), |b| reply(200, b))
+                                );
                             }
                             if let Some(d) = path.strip_prefix("/v2/test/img/blobs/sha256:") {
                                 let mut r = reply(307, vec![]);
                                 let to = format!("http://localhost:{}/storage/{d}", addr.port());
-                                r.headers_mut().insert(header::LOCATION, to.parse().unwrap());
+                                r.headers_mut()
+                                    .insert(header::LOCATION, to.parse().unwrap());
                                 return Ok(r);
                             }
                             Ok(reply(404, vec![]))
                         }
                     });
-                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
                 });
             }
         });
@@ -613,15 +798,24 @@ mod tests {
         let layout = TestLayout::new();
         let img = layout.image(
             &[
-                ("application/vnd.oci.image.layer.v1.tar+gzip", gzip(&tar_of(&[("etc/motd", b"one")]))),
-                ("application/vnd.docker.image.rootfs.diff.tar.gzip", gzip(&tar_of(&[("etc/motd", b"two")]))),
+                (
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                    gzip(&tar_of(&[("etc/motd", b"one")])),
+                ),
+                (
+                    "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                    gzip(&tar_of(&[("etc/motd", b"two")])),
+                ),
             ],
             serde_json::json!({"config": {"Env": ["A=1"]}}),
         );
         let mut img = img;
         img["platform"] = serde_json::json!({"os": "linux", "architecture": super::oci::tests::host_arch_for_tests()});
         let index = serde_json::json!({"schemaVersion": 2, "manifests": [img]});
-        let index = layout.blob("application/vnd.oci.image.index.v1+json", index.to_string().as_bytes());
+        let index = layout.blob(
+            "application/vnd.oci.image.index.v1+json",
+            index.to_string().as_bytes(),
+        );
         let index_digest = index["digest"].as_str().unwrap().to_string();
 
         let (addr, server) = serve(Arc::new(layout), index_digest.clone()).await;
@@ -629,7 +823,10 @@ mod tests {
         let cache = Cache::new(Some(cache_dir.path()));
 
         let image = pull(&cache, &format!("{addr}/test/img:v1")).await.unwrap();
-        assert_eq!(std::fs::read(image.rootfs.join("etc/motd")).unwrap(), b"two");
+        assert_eq!(
+            std::fs::read(image.rootfs.join("etc/motd")).unwrap(),
+            b"two"
+        );
         assert_eq!(image.config.env, vec!["A=1"]);
 
         let by_digest = format!("{addr}/test/img@{index_digest}");
@@ -644,7 +841,11 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names.len(), 2, "one image and the manifest store, no staging left: {names:?}");
+        assert_eq!(
+            names.len(),
+            2,
+            "one image and the manifest store, no staging left: {names:?}"
+        );
         assert!(names.contains(&"blobs".to_string()));
     }
 }

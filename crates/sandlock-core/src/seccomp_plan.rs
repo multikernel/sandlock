@@ -11,14 +11,13 @@ use crate::resolved::ResolvedSandbox;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{jump, stmt};
 use crate::sys::structs::{
-    AF_INET, AF_INET6, BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K,
-    BPF_LD, BPF_RET, BPF_W, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, EPERM,
-    OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_NR,
-    PR_SET_DUMPABLE, PR_SET_PTRACER, PR_SET_SECUREBITS, SECCOMP_RET_ALLOW,
-    SECCOMP_RET_ERRNO, SIOCETHTOOL, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF,
-    SIOCGIFDSTADDR, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFNAME,
-    SIOCGIFNETMASK, SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, SYSV_IPC_BLOCKLIST_SYSCALLS,
-    TIOCLINUX, TIOCSTI, SockFilter,
+    SockFilter, AF_INET, AF_INET6, BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K,
+    BPF_LD, BPF_RET, BPF_W, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, EPERM, OFFSET_ARGS0_LO,
+    OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_NR, PR_SET_DUMPABLE, PR_SET_PTRACER,
+    PR_SET_SECUREBITS, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SIOCETHTOOL, SIOCGIFADDR,
+    SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX,
+    SIOCGIFNAME, SIOCGIFNETMASK, SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, SYSV_IPC_BLOCKLIST_SYSCALLS,
+    TIOCLINUX, TIOCSTI,
 };
 
 // ============================================================
@@ -116,7 +115,11 @@ const TIME_NOTIF_SYSCALLS: &[i64] = &[
 // and reads the real on-disk file.
 fn procfs_hosts_notif_syscalls() -> Vec<i64> {
     let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_getdents64];
-    v.extend([arch::sys_open(), arch::sys_getdents()].into_iter().flatten());
+    v.extend(
+        [arch::sys_open(), arch::sys_getdents()]
+            .into_iter()
+            .flatten(),
+    );
     v.push(libc::SYS_lseek);
     v.extend(crate::procfs::net_dispatch::metadata_syscalls());
     v
@@ -353,10 +356,7 @@ fn policy_event_syscalls() -> Vec<i64> {
     v
 }
 
-const PORT_REMAP_SYSCALLS: &[i64] = &[
-    libc::SYS_bind,
-    libc::SYS_getsockname,
-];
+const PORT_REMAP_SYSCALLS: &[i64] = &[libc::SYS_bind, libc::SYS_getsockname];
 
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
@@ -458,12 +458,13 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
 /// Names that do not exist on this architecture resolve to nothing and are
 /// skipped, so the result stays arch-correct.
 fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
-    let extra_denies = policy.extra_deny_syscalls.iter().flat_map(|name| {
-        match crate::sys::structs::syscall_group(name) {
-            Some(members) => members.iter().copied().collect::<Vec<_>>(),
-            None => vec![name.as_str()],
-        }
-    });
+    let extra_denies =
+        policy.extra_deny_syscalls.iter().flat_map(
+            |name| match crate::sys::structs::syscall_group(name) {
+                Some(members) => members.iter().copied().collect::<Vec<_>>(),
+                None => vec![name.as_str()],
+            },
+        );
     let mut set: SysnoSet = base
         .iter()
         .copied()
@@ -529,7 +530,12 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
     insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_clone, 0, 3));
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO));
-    insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NS_FLAGS as u32, 0, 1));
+    insns.push(jump(
+        BPF_JMP | BPF_JSET | BPF_K,
+        CLONE_NS_FLAGS as u32,
+        0,
+        1,
+    ));
     insns.push(stmt(BPF_RET | BPF_K, ret_errno));
 
     // --- clone3: not available ---
@@ -537,8 +543,16 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     // supervisor that reads them races a CLONE_VM peer rewriting the struct
     // before the kernel does. ENOSYS sends libc to clone, checked above.
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
-    insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_clone3 as u32, 0, 1));
-    insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
+    insns.push(jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        libc::SYS_clone3 as u32,
+        0,
+        1,
+    ));
+    insns.push(stmt(
+        BPF_RET | BPF_K,
+        SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+    ));
 
     // --- ioctl: block dangerous commands ---
     // Block terminal injection (TIOCSTI, TIOCLINUX) and network interface
@@ -623,7 +637,12 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
         // AF_INET -> skip to type check (jump over AF_INET6 check)
         insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0));
         // AF_INET6 -> type check; else skip everything remaining
-        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, after_domain as u8));
+        insns.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            AF_INET6,
+            0,
+            after_domain as u8,
+        ));
         // Load type (arg1) and mask off SOCK_NONBLOCK|SOCK_CLOEXEC
         insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS1_LO));
         insns.push(stmt(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK));
@@ -634,7 +653,12 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
             // No match on last type -> skip past RET ERRNO (jf=1)
             // No match on non-last -> check next type (jf=0)
             let jf: u8 = if remaining == 0 { 1 } else { 0 };
-            insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, sock_type, remaining as u8, jf));
+            insns.push(jump(
+                BPF_JMP | BPF_JEQ | BPF_K,
+                sock_type,
+                remaining as u8,
+                jf,
+            ));
         }
         // Deny return (reached by any matching JEQ)
         insns.push(stmt(BPF_RET | BPF_K, ret_errno));
@@ -655,7 +679,12 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
         insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
         insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_mprotect, 0, 3));
         insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS2_LO));
-        insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, libc::PROT_WRITE as u32, 1, 0));
+        insns.push(jump(
+            BPF_JMP | BPF_JSET | BPF_K,
+            libc::PROT_WRITE as u32,
+            1,
+            0,
+        ));
         insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     }
 

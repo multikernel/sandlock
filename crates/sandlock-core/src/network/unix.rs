@@ -60,8 +60,7 @@ fn pin_child_unix_target(
     };
     // `O_PATH` follows symlinks to the real socket inode and pins it without
     // performing any I/O on the socket.
-    let c_proc = std::ffi::CString::new(proc_path)
-        .map_err(|_| NotifAction::Errno(libc::EACCES))?;
+    let c_proc = std::ffi::CString::new(proc_path).map_err(|_| NotifAction::Errno(libc::EACCES))?;
     let pinned_raw = unsafe { libc::open(c_proc.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if pinned_raw < 0 {
         // Target missing or unreachable: refuse without leaking the reason.
@@ -114,8 +113,10 @@ fn proc_self_fd_sockaddr(fd: RawFd) -> Option<(libc::sockaddr_un, libc::socklen_
 /// carries. Single place so every on-behalf send encodes the destination the
 /// same way.
 fn sockaddr_un_bytes(sun: &libc::sockaddr_un, len: libc::socklen_t) -> Vec<u8> {
-    unsafe { std::slice::from_raw_parts(sun as *const libc::sockaddr_un as *const u8, len as usize) }
-        .to_vec()
+    unsafe {
+        std::slice::from_raw_parts(sun as *const libc::sockaddr_un as *const u8, len as usize)
+    }
+    .to_vec()
 }
 
 /// On-behalf `connect()` for a NAMED `AF_UNIX` socket in non-chroot mode:
@@ -278,8 +279,14 @@ pub(super) fn unix_sendmsg_gate(
     if hdr.connected() {
         return None; // connected socket: no address to gate
     }
-    let addr_bytes =
-        super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
+    let addr_bytes = super::read_sockaddr(
+        notif_fd,
+        notif.id,
+        notif.pid,
+        hdr.name_ptr,
+        hdr.namelen as usize,
+    )
+    .ok()?;
     // None unless this is a NAMED AF_UNIX target; IP/abstract fall through.
     let path = named_unix_socket_path(&addr_bytes)?;
 
@@ -371,8 +378,14 @@ pub(super) fn mmsg_entry_named_unix_path(
     if hdr.connected() {
         return None;
     }
-    let addr_bytes =
-        super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
+    let addr_bytes = super::read_sockaddr(
+        notif_fd,
+        notif.id,
+        notif.pid,
+        hdr.name_ptr,
+        hdr.namelen as usize,
+    )
+    .ok()?;
     named_unix_socket_path(&addr_bytes)
 }
 
@@ -402,13 +415,14 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
             // stop here and report a short send rather than passing it through.
             None => break,
         };
-        let (dup_fd, m) = match send_named_unix_msghdr(notif, notif_fd, sockfd, entry_ptr, &path, writable) {
-            Ok(pair) => pair,
-            Err(errno) => {
-                first_errno = Some(errno);
-                break;
-            }
-        };
+        let (dup_fd, m) =
+            match send_named_unix_msghdr(notif, notif_fd, sockfd, entry_ptr, &path, writable) {
+                Ok(pair) => pair,
+                Err(errno) => {
+                    first_errno = Some(errno);
+                    break;
+                }
+            };
         batch_bytes += m.data.len();
         if batch_bytes > super::materialize::MAX_SEND_BUF {
             first_errno = Some(libc::EMSGSIZE);
@@ -416,8 +430,14 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
         }
         entries.push((dup_fd, m, mmsg_msglen_addr(entry_ptr)));
     }
-    prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
-        first_errno.unwrap_or(libc::EACCES))
+    prepare_batch(
+        entries,
+        flags,
+        notif_fd,
+        notif.id,
+        notif.pid,
+        first_errno.unwrap_or(libc::EACCES),
+    )
 }
 
 #[cfg(test)]
@@ -461,6 +481,10 @@ mod tests {
     #[test]
     fn pin_child_unix_target_pins_absolute_path() {
         let pinned = pin_child_unix_target(std::process::id(), std::path::Path::new("/dev/null"));
-        assert!(pinned.is_ok(), "absolute path must pin, got {:?}", pinned.err());
+        assert!(
+            pinned.is_ok(),
+            "absolute path must pin, got {:?}",
+            pinned.err()
+        );
     }
 }

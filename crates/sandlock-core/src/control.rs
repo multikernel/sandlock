@@ -32,8 +32,8 @@
 
 pub(crate) mod ownership;
 
-use std::os::linux::net::SocketAddrExt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -84,7 +84,8 @@ impl ControlFd {
 
     fn set_nonblocking(&self) -> std::io::Result<()> {
         let flags = unsafe { libc::fcntl(self.0, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(self.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        if flags < 0 || unsafe { libc::fcntl(self.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
@@ -157,8 +158,12 @@ pub(crate) struct ControlSocket {
 /// `AddrInUse` means a live sandbox of this uid already owns the name.
 pub(crate) fn bind_control_socket(name: &str) -> std::io::Result<ControlSocket> {
     let claim = ownership::Claim::new(name)?;
-    let control = ControlFd::register(UnixListener::bind_addr(&instance_addr(&claim.entry.token)?)?.into());
-    Ok(ControlSocket { control, claim: Some(claim) })
+    let control =
+        ControlFd::register(UnixListener::bind_addr(&instance_addr(&claim.entry.token)?)?.into());
+    Ok(ControlSocket {
+        control,
+        claim: Some(claim),
+    })
 }
 
 // ============================================================
@@ -191,8 +196,14 @@ pub(crate) fn spawn_control_loop(
     // even though this clone's is None.
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
     tokio::spawn(async move {
-        let ControlSocket { control, claim: _claim } = sockets;
-        control_loop(control, ctx, controller, sandbox, info, unsafe { libc::getuid() }).await;
+        let ControlSocket {
+            control,
+            claim: _claim,
+        } = sockets;
+        control_loop(control, ctx, controller, sandbox, info, unsafe {
+            libc::getuid()
+        })
+        .await;
     })
 }
 
@@ -252,7 +263,11 @@ impl tokio::io::AsyncRead for ControlStream {
 }
 
 impl tokio::io::AsyncWrite for ControlStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         loop {
             let mut guard = std::task::ready!(self.0.poll_write_ready(cx))?;
             match guard.try_io(|inner| inner.get_ref().write(buf)) {
@@ -283,7 +298,9 @@ async fn control_loop(
     info: SandboxInfo,
     my_uid: u32,
 ) {
-    let Some(listener) = into_async(listener) else { return };
+    let Some(listener) = into_async(listener) else {
+        return;
+    };
 
     loop {
         let stream = match accept(&listener).await {
@@ -294,7 +311,9 @@ async fn control_loop(
         if peer_cred(stream.as_raw_fd()).map(|c| c.uid) != Some(my_uid) {
             continue;
         }
-        let Ok(stream) = AsyncFd::new(stream).map(ControlStream) else { continue };
+        let Ok(stream) = AsyncFd::new(stream).map(ControlStream) else {
+            continue;
+        };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             serve_one(stream, ctx.as_ref(), &controller, &sandbox, &info),
@@ -392,14 +411,23 @@ async fn serve_one(
     }
 }
 
-async fn handle_info(stream: &mut ControlStream, info: &SandboxInfo, controller: &crate::Controller) {
+async fn handle_info(
+    stream: &mut ControlStream,
+    info: &SandboxInfo,
+    controller: &crate::Controller,
+) {
     let info = SandboxInfo {
         main_exited: controller.main_exited(),
         live_groups: controller.process_groups().map_or(0, |groups| groups.len()),
         ..info.clone()
     };
     let resp = match serde_json::to_value(&info) {
-        Ok(data) => ControlResponse { v: 1, ok: true, data: Some(data), err: None },
+        Ok(data) => ControlResponse {
+            v: 1,
+            ok: true,
+            data: Some(data),
+            err: None,
+        },
         Err(e) => ControlResponse {
             v: 1,
             ok: false,
@@ -453,16 +481,23 @@ async fn handle_config(
 /// `sandlock kill` asks here before it signals the child's own group.
 async fn handle_kill(stream: &mut ControlStream, controller: &crate::Controller) {
     let resp = match controller.kill() {
-        Ok(()) => ControlResponse { v: 1, ok: true, data: None, err: None },
-        Err(e) => ControlResponse { v: 1, ok: false, data: None, err: Some(e.to_string()) },
+        Ok(()) => ControlResponse {
+            v: 1,
+            ok: true,
+            data: None,
+            err: None,
+        },
+        Err(e) => ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some(e.to_string()),
+        },
     };
     let _ = write_response(stream, &resp).await;
 }
 
-async fn handle_ports(
-    stream: &mut ControlStream,
-    ctx: Option<&Arc<SupervisorCtx>>,
-) {
+async fn handle_ports(stream: &mut ControlStream, ctx: Option<&Arc<SupervisorCtx>>) {
     let ports: std::collections::HashMap<u16, u16> = match ctx {
         Some(ctx) => ctx.network.lock().await.port_map.virtual_to_real.clone(),
         None => Default::default(),
@@ -493,10 +528,7 @@ async fn handle_ports(
 
 /// Write a length-prefixed JSON response.  Rejects bodies over 64 KB
 /// (mirrors the client-side cap in `send_control_request`).
-async fn write_response(
-    stream: &mut ControlStream,
-    resp: &ControlResponse,
-) -> std::io::Result<()> {
+async fn write_response(stream: &mut ControlStream, resp: &ControlResponse) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     const MAX_RESPONSE_BYTES: usize = 65536;
 
@@ -539,7 +571,10 @@ async fn write_response(
 
 /// Names owned by live supervisors in the caller's IPC namespace.
 pub fn list_sandboxes() -> std::io::Result<Vec<String>> {
-    let mut names: Vec<_> = ownership::list()?.into_iter().map(|entry| entry.name).collect();
+    let mut names: Vec<_> = ownership::list()?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
     names.sort();
     Ok(names)
 }
@@ -558,15 +593,32 @@ fn unresponsive(name: &str, e: std::io::Error) -> String {
 }
 
 fn connect_socket(addr: &SocketAddr) -> std::io::Result<OwnedFd> {
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
-    if fd < 0 { return Err(std::io::Error::last_os_error()); }
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     sun.sun_family = libc::AF_UNIX as _;
     let name = addr.as_abstract_name().expect("abstract control address");
-    for (dst, &src) in sun.sun_path[1..].iter_mut().zip(name) { *dst = src as _; }
+    for (dst, &src) in sun.sun_path[1..].iter_mut().zip(name) {
+        *dst = src as _;
+    }
     let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
-    if unsafe { libc::connect(fd.as_raw_fd(), (&sun as *const libc::sockaddr_un).cast(), len as _) } != 0 {
+    if unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&sun as *const libc::sockaddr_un).cast(),
+            len as _,
+        )
+    } != 0
+    {
         return Err(std::io::Error::last_os_error());
     }
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, 0) } < 0 {
@@ -598,11 +650,17 @@ fn connect_control(name: &str, my_uid: u32) -> Result<(UnixStream, libc::ucred),
     connect_entry(name, &entry, my_uid)
 }
 
-fn connect_entry(name: &str, entry: &ownership::Entry, my_uid: u32) -> Result<(UnixStream, libc::ucred), String> {
+fn connect_entry(
+    name: &str,
+    entry: &ownership::Entry,
+    my_uid: u32,
+) -> Result<(UnixStream, libc::ucred), String> {
     let addr = instance_addr(&entry.token).map_err(|e| e.to_string())?;
     let (stream, cred) = connect_as(&addr, my_uid).map_err(|e| match e.kind() {
         std::io::ErrorKind::ConnectionRefused => format!("sandbox '{name}' is still starting"),
-        std::io::ErrorKind::PermissionDenied => format!("socket for '{name}' is owned by another user"),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("socket for '{name}' is owned by another user")
+        }
         _ => format!("connect to sandbox '{name}': {e}"),
     })?;
     if cred.pid != entry.supervisor {
@@ -630,8 +688,13 @@ fn sandbox_pids_as(name: &str, my_uid: u32) -> Result<SandboxPids, String> {
         return Err(format!("registry for '{name}' is owned by another user"));
     }
     let entry = ownership::lookup(name).map_err(|e| e.to_string())?;
-    let child = entry.child.ok_or_else(|| format!("sandbox '{name}' is still starting"))?;
-    Ok(SandboxPids { child, supervisor: entry.supervisor })
+    let child = entry
+        .child
+        .ok_or_else(|| format!("sandbox '{name}' is still starting"))?;
+    Ok(SandboxPids {
+        child,
+        supervisor: entry.supervisor,
+    })
 }
 
 /// Send a request to a sandbox's control socket and return the response.
@@ -665,7 +728,13 @@ pub fn kill_sandbox(name: &str) -> Result<(), String> {
     let args = serde_json::Value::Object(Default::default());
     // Longer than the server's per-client cap, so waiting in its queue is not
     // mistaken for a wedge.
-    match exchange(name, stream, "kill", args, std::time::Duration::from_secs(8)) {
+    match exchange(
+        name,
+        stream,
+        "kill",
+        args,
+        std::time::Duration::from_secs(8),
+    ) {
         Ok(resp) if resp.ok => Ok(()),
         Ok(resp) => Err(resp.err.unwrap_or_else(|| "kill failed".into())),
         Err(e) if e.timed_out => crate::sys::syscall::pidfd_send_signal(&supervisor, libc::SIGKILL)
@@ -681,12 +750,21 @@ struct ExchangeError {
 
 impl ExchangeError {
     fn other(message: String) -> Self {
-        Self { timed_out: false, message }
+        Self {
+            timed_out: false,
+            message,
+        }
     }
 
     fn read(name: &str, e: std::io::Error) -> Self {
-        let timed_out = matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut);
-        Self { timed_out, message: unresponsive(name, e) }
+        let timed_out = matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        );
+        Self {
+            timed_out,
+            message: unresponsive(name, e),
+        }
     }
 }
 
@@ -715,18 +793,26 @@ fn exchange(
         .map_err(|e| ExchangeError::other(format!("serialize request: {}", e)))?;
 
     let len = (body.len() as u32).to_be_bytes();
-    stream.write_all(&len).map_err(|e| ExchangeError::other(format!("write len: {}", e)))?;
-    stream.write_all(&body).map_err(|e| ExchangeError::other(format!("write body: {}", e)))?;
+    stream
+        .write_all(&len)
+        .map_err(|e| ExchangeError::other(format!("write len: {}", e)))?;
+    stream
+        .write_all(&body)
+        .map_err(|e| ExchangeError::other(format!("write body: {}", e)))?;
 
     // Read response.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| ExchangeError::read(name, e))?;
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| ExchangeError::read(name, e))?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
     if resp_len > 65536 {
         return Err(ExchangeError::other("response too large".to_string()));
     }
     let mut resp_body = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_body).map_err(|e| ExchangeError::read(name, e))?;
+    stream
+        .read_exact(&mut resp_body)
+        .map_err(|e| ExchangeError::read(name, e))?;
 
     serde_json::from_slice(&resp_body)
         .map_err(|e| ExchangeError::other(format!("parse response: {}", e)))
@@ -751,7 +837,10 @@ mod tests {
         let name = format!("test-control-host-fork-{}", std::process::id());
         let sockets = bind_control_socket(&name).unwrap();
         let mut pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
         let child = unsafe { libc::fork() };
         assert!(child >= 0);
         if child == 0 {
@@ -762,7 +851,9 @@ mod tests {
                 libc::_exit(0);
             }
         }
-        unsafe { libc::close(pipe[0]); }
+        unsafe {
+            libc::close(pipe[0]);
+        }
         drop(sockets);
         let reused = bind_control_socket(&name);
         unsafe {
@@ -813,7 +904,10 @@ mod tests {
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status:#x}");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child status {status:#x}"
+        );
     }
 
     /// Registry PID lookups need no connections or running event loop.
@@ -845,7 +939,11 @@ mod tests {
     }
 
     fn info() -> SandboxInfo {
-        SandboxInfo { mode: Some("test".into()), main_exited: false, live_groups: 0 }
+        SandboxInfo {
+            mode: Some("test".into()),
+            main_exited: false,
+            live_groups: 0,
+        }
     }
 
     /// Bind a listener for `name`, run the control loop on it with
@@ -861,7 +959,15 @@ mod tests {
                 main_exit: crate::controller::MainExit::new(None),
                 pid: 0,
             };
-            control_loop(sockets.control, None, controller, sandbox, info(), expected_uid).await;
+            control_loop(
+                sockets.control,
+                None,
+                controller,
+                sandbox,
+                info(),
+                expected_uid,
+            )
+            .await;
         })
     }
 
@@ -872,7 +978,8 @@ mod tests {
         let body = br#"{"v":1,"verb":"info","args":{}}"#;
         s.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         s.write_all(body).unwrap();
-        s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         let mut out = Vec::new();
         let _ = s.read_to_end(&mut out);
         out
@@ -882,9 +989,15 @@ mod tests {
     async fn server_answers_its_own_uid() {
         let name = format!("test-ctrl-own-{}", std::process::id());
         let task = serve(&name, unsafe { libc::getuid() });
-        let out = tokio::task::spawn_blocking(move || raw_info_request(&name)).await.unwrap();
+        let out = tokio::task::spawn_blocking(move || raw_info_request(&name))
+            .await
+            .unwrap();
         task.abort();
-        assert!(out.len() > 4, "expected a response, got {} bytes", out.len());
+        assert!(
+            out.len() > 4,
+            "expected a response, got {} bytes",
+            out.len()
+        );
         let resp: ControlResponse = serde_json::from_slice(&out[4..]).unwrap();
         assert!(resp.ok);
         let got: SandboxInfo = serde_json::from_value(resp.data.unwrap()).unwrap();
@@ -895,9 +1008,15 @@ mod tests {
     async fn server_closes_on_another_uid_without_answering() {
         let name = format!("test-ctrl-foreign-{}", std::process::id());
         let task = serve(&name, unsafe { libc::getuid() }.wrapping_add(1));
-        let out = tokio::task::spawn_blocking(move || raw_info_request(&name)).await.unwrap();
+        let out = tokio::task::spawn_blocking(move || raw_info_request(&name))
+            .await
+            .unwrap();
         task.abort();
-        assert!(out.is_empty(), "another uid must get no bytes, got {:?}", out);
+        assert!(
+            out.is_empty(),
+            "another uid must get no bytes, got {:?}",
+            out
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -907,8 +1026,13 @@ mod tests {
         let expect = unsafe { libc::getuid() }.wrapping_add(1);
         let n = name.clone();
         let err = tokio::task::spawn_blocking(move || {
-            send_control_request_as(&n, "info", serde_json::Value::Object(Default::default()), expect)
-                .unwrap_err()
+            send_control_request_as(
+                &n,
+                "info",
+                serde_json::Value::Object(Default::default()),
+                expect,
+            )
+            .unwrap_err()
         })
         .await
         .unwrap();

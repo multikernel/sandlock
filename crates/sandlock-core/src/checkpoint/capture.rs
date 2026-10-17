@@ -1,23 +1,19 @@
-use std::io;
-use super::{Checkpoint, ProcessState, MemorySegment, MemoryMap, FdInfo};
+use super::{Checkpoint, FdInfo, MemoryMap, MemorySegment, ProcessState};
+use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::sandbox::Sandbox;
-use crate::error::{SandlockError, SandboxRuntimeError};
+use std::io;
 
 // ---------------------------------------------------------------------------
 // ptrace helpers -- PTRACE_SEIZE (doesn't auto-SIGSTOP like ATTACH)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ptrace_seize(pid: i32) -> io::Result<()> {
-    let ret = unsafe {
-        libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0)
-    };
+    let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
     // PTRACE_INTERRUPT stops the tracee without SIGSTOP side effects
-    let ret = unsafe {
-        libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0)
-    };
+    let ret = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -152,9 +148,13 @@ fn ptrace_getfpregs(pid: i32) -> io::Result<Vec<u8>> {
     // where the image is framed for the signal frame's `xrstor` as if complete.
     // 64 KiB is far above any current CPU's `CPUID.(EAX=0DH,ECX=0):EBX`.
     #[cfg(target_arch = "x86_64")]
-    { ptrace_getregset_bytes(pid, 0x202, 65536).or_else(|_| ptrace_getregset_bytes(pid, 2, 512)) }
+    {
+        ptrace_getregset_bytes(pid, 0x202, 65536).or_else(|_| ptrace_getregset_bytes(pid, 2, 512))
+    }
     #[cfg(not(target_arch = "x86_64"))]
-    { ptrace_getregset_bytes(pid, 2, 4096) }
+    {
+        ptrace_getregset_bytes(pid, 2, 4096)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,10 +234,9 @@ fn must_dump(map: &MemoryMap) -> bool {
     if map.is_special() {
         return false;
     }
-    let unreopenable = map
-        .path
-        .as_deref()
-        .map_or(false, |p| p.starts_with("/memfd:") || p.ends_with(" (deleted)"));
+    let unreopenable = map.path.as_deref().map_or(false, |p| {
+        p.starts_with("/memfd:") || p.ends_with(" (deleted)")
+    });
     if !map.writable() && !unreopenable {
         return false;
     }
@@ -322,10 +321,7 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, Sa
             } else {
                 format!("read {ret} of {size} bytes")
             };
-            return Err(refuse(format!(
-                "reading region {}: {why}",
-                describe(map),
-            )));
+            return Err(refuse(format!("reading region {}: {why}", describe(map),)));
         }
         segments.push(MemorySegment {
             start: map.start,
@@ -520,7 +516,11 @@ mod tests {
             target_arch = "aarch64",
             target_arch = "riscv64"
         ))]
-        assert!(pc != 0, "captured program counter should be non-zero, got {:#x}", pc);
+        assert!(
+            pc != 0,
+            "captured program counter should be non-zero, got {:#x}",
+            pc
+        );
     }
 
     #[test]
@@ -536,7 +536,10 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let fp = res.expect("fpreg capture should succeed");
-        assert!(!fp.is_empty(), "captured FP/extended register blob should be non-empty");
+        assert!(
+            !fp.is_empty(),
+            "captured FP/extended register blob should be non-empty"
+        );
     }
 
     /// Full capture -> save -> load roundtrip against a live child. `capture()`
@@ -559,8 +562,14 @@ mod tests {
         // Nothing backs these, so their contents live only in the process. They
         // return private, trading sharing for the data itself.
         assert!(must_dump(&region("rw-s", None)), "shared anonymous");
-        assert!(must_dump(&region("rw-s", Some("/memfd:scratch (deleted)"))), "shared memfd");
-        assert!(must_dump(&region("rw-s", Some("/SYSV00000000 (deleted)"))), "SysV shm");
+        assert!(
+            must_dump(&region("rw-s", Some("/memfd:scratch (deleted)"))),
+            "shared memfd"
+        );
+        assert!(
+            must_dump(&region("rw-s", Some("/SYSV00000000 (deleted)"))),
+            "SysV shm"
+        );
         assert!(must_dump(&region("rw-p", None)), "private anonymous");
     }
 
@@ -568,12 +577,22 @@ mod tests {
     fn regions_a_file_still_holds_are_left_to_be_remapped() {
         // Dumping these would bloat every image with bytes restore can read off
         // disk, and could push a checkpoint over the per-region ceiling.
-        assert!(!must_dump(&region("rw-s", Some("/data/db"))),
-            "a shared writable file mapping wrote through to the file");
-        assert!(!must_dump(&region("r--p", Some("/lib/libc.so"))),
-            "a read-only file mapping is remapped from the file");
-        assert!(!must_dump(&region("r-xp", Some("/bin/app"))), "program text");
-        assert!(!must_dump(&region("r--s", Some("/lib/libc.so"))), "shared read-only file");
+        assert!(
+            !must_dump(&region("rw-s", Some("/data/db"))),
+            "a shared writable file mapping wrote through to the file"
+        );
+        assert!(
+            !must_dump(&region("r--p", Some("/lib/libc.so"))),
+            "a read-only file mapping is remapped from the file"
+        );
+        assert!(
+            !must_dump(&region("r-xp", Some("/bin/app"))),
+            "program text"
+        );
+        assert!(
+            !must_dump(&region("r--s", Some("/lib/libc.so"))),
+            "shared read-only file"
+        );
     }
 
     #[test]
@@ -630,7 +649,12 @@ mod tests {
         // out without detaching would leave it in 't' (tracing stop) forever.
         let state = std::fs::read_to_string(format!("/proc/{child}/stat"))
             .ok()
-            .and_then(|s| s.rsplit(") ").next().and_then(|t| t.split(' ').next()).map(String::from));
+            .and_then(|s| {
+                s.rsplit(") ")
+                    .next()
+                    .and_then(|t| t.split(' ').next())
+                    .map(String::from)
+            });
 
         unsafe {
             libc::kill(child, libc::SIGKILL);
@@ -638,7 +662,9 @@ mod tests {
             libc::waitpid(child, &mut s, 0);
         }
 
-        let err = result.expect_err("a region it cannot dump must refuse").to_string();
+        let err = result
+            .expect_err("a region it cannot dump must refuse")
+            .to_string();
         // Assert that it refused, not which region tipped it over. The child is
         // a fork of the test harness, so it inherits mappings this test never
         // asked for, and on some hosts one of those is itself undumpable and is
@@ -689,7 +715,10 @@ mod tests {
         let maps = parse_proc_maps(unsafe { libc::getpid() }).expect("read our own maps");
         // By containment, not equality: the kernel is free to merge the new VMA
         // with an adjacent one that agrees with it.
-        let region = maps.iter().find(|m| m.start <= addr && addr < m.end).cloned();
+        let region = maps
+            .iter()
+            .find(|m| m.start <= addr && addr < m.end)
+            .cloned();
         unsafe { libc::munmap(p, len) };
 
         let region = region.expect("the mapping must appear in /proc/self/maps");
@@ -704,7 +733,10 @@ mod tests {
         // no file behind it rather than keying off the absence of a path, and it
         // is the assumption this test exists to hold down.
         assert!(
-            region.path.as_deref().map_or(true, |p| p.ends_with(" (deleted)")),
+            region
+                .path
+                .as_deref()
+                .map_or(true, |p| p.ends_with(" (deleted)")),
             "expected no path or a deleted one, got {:?}",
             region.path,
         );
@@ -731,25 +763,41 @@ mod tests {
 
         let cp = captured.expect("capture should succeed on this architecture");
         assert!(!cp.process_state.regs.is_empty(), "captured registers");
-        assert!(!cp.process_state.memory_maps.is_empty(), "captured memory maps");
+        assert!(
+            !cp.process_state.memory_maps.is_empty(),
+            "captured memory maps"
+        );
         assert!(!cp.fd_table.is_empty(), "captured fd table");
 
         // Save to a temp dir, load it back, and confirm the round-trip is faithful.
-        let dir = std::env::temp_dir()
-            .join(format!("sandlock-cp-roundtrip-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("sandlock-cp-roundtrip-{}", std::process::id()));
         cp.save(&dir).expect("save checkpoint");
         let loaded = Checkpoint::load(&dir).expect("load checkpoint");
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert_eq!(loaded.process_state.regs, cp.process_state.regs, "regs roundtrip");
-        assert_eq!(loaded.process_state.fpregs, cp.process_state.fpregs, "fpregs roundtrip");
+        assert_eq!(
+            loaded.process_state.regs, cp.process_state.regs,
+            "regs roundtrip"
+        );
+        assert_eq!(
+            loaded.process_state.fpregs, cp.process_state.fpregs,
+            "fpregs roundtrip"
+        );
         assert_eq!(
             loaded.process_state.memory_data.len(),
             cp.process_state.memory_data.len(),
             "memory segment count roundtrip"
         );
-        assert_eq!(loaded.fd_table.len(), cp.fd_table.len(), "fd count roundtrip");
-        assert_eq!(loaded.process_state.pid, cp.process_state.pid, "pid roundtrip");
+        assert_eq!(
+            loaded.fd_table.len(),
+            cp.fd_table.len(),
+            "fd count roundtrip"
+        );
+        assert_eq!(
+            loaded.process_state.pid, cp.process_state.pid,
+            "pid roundtrip"
+        );
         assert!(!loaded.process_state.exe.is_empty(), "exe path captured");
     }
 }

@@ -88,7 +88,10 @@ pub(crate) fn handle_random_open(
     unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) };
 
     // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
-    Some(NotifAction::InjectFdSend { srcfd: memfd, newfd_flags: libc::O_CLOEXEC as u32 })
+    Some(NotifAction::InjectFdSend {
+        srcfd: memfd,
+        newfd_flags: libc::O_CLOEXEC as u32,
+    })
 }
 
 #[cfg(test)]

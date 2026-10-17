@@ -30,8 +30,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use crate::error::{SandboxRuntimeError, SandlockError};
-use crate::sandbox::Sandbox;
 use crate::result::{ExitStatus, RunResult};
+use crate::sandbox::Sandbox;
 
 // ============================================================
 // Stage
@@ -59,8 +59,9 @@ impl Stage {
         let cmd_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
         // Names claim a per-UID socket name and a live collision is a hard
         // error, so every internally assigned name carries a unique id.
-        let mut sb = self.sandbox.with_name(
-            format!("stage-{}", crate::sandbox::unique_instance_id()));
+        let mut sb = self
+            .sandbox
+            .with_name(format!("stage-{}", crate::sandbox::unique_instance_id()));
         if let Some(dur) = timeout {
             match tokio::time::timeout(dur, sb.run_interactive(&cmd_refs)).await {
                 Ok(result) => result,
@@ -173,12 +174,7 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(unsafe {
-        (
-            OwnedFd::from_raw_fd(fds[0]),
-            OwnedFd::from_raw_fd(fds[1]),
-        )
-    })
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 /// Fork and run all stages concurrently with inter-stage pipes.
@@ -341,7 +337,9 @@ impl Gather {
 
     pub async fn run(self, timeout: Option<Duration>) -> Result<RunResult, SandlockError> {
         let consumer = self.consumer.ok_or_else(|| {
-            SandlockError::Runtime(SandboxRuntimeError::Child("Gather requires a consumer".into()))
+            SandlockError::Runtime(SandboxRuntimeError::Child(
+                "Gather requires a consumer".into(),
+            ))
         })?;
         if self.sources.is_empty() {
             return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
@@ -366,10 +364,7 @@ impl Gather {
 }
 
 /// Run the gather: spawn all producers and the consumer concurrently.
-async fn run_gather(
-    sources: Vec<NamedStage>,
-    consumer: Stage,
-) -> Result<RunResult, SandlockError> {
+async fn run_gather(sources: Vec<NamedStage>, consumer: Stage) -> Result<RunResult, SandlockError> {
     let n = sources.len();
 
     // Create a pipe for each source: source stdout → consumer fd
@@ -383,7 +378,13 @@ async fn run_gather(
     let mut fd_assignments: Vec<(String, i32)> = Vec::with_capacity(n);
     let mut next_fd = 3i32;
     for (i, ns) in sources.iter().enumerate() {
-        let target_fd = if i == n - 1 { 0 } else { let fd = next_fd; next_fd += 1; fd };
+        let target_fd = if i == n - 1 {
+            0
+        } else {
+            let fd = next_fd;
+            next_fd += 1;
+            fd
+        };
         fd_assignments.push((ns.name.clone(), target_fd));
     }
 
@@ -408,7 +409,8 @@ async fn run_gather(
         let mut sb = ns.stage.sandbox.clone().with_name(name);
         let stdout_fd = source_pipes[i].1.as_raw_fd();
         let cmd_refs: Vec<&str> = ns.stage.args.iter().map(|s| s.as_str()).collect();
-        sb.create_with_io(&cmd_refs, None, Some(stdout_fd), None).await?;
+        sb.create_with_io(&cmd_refs, None, Some(stdout_fd), None)
+            .await?;
         sb.start()?;
         sandboxes.push(sb);
     }
@@ -416,9 +418,13 @@ async fn run_gather(
     // Spawn consumer with extra fds from source pipes
     let mut consumer_sandbox = consumer.sandbox.clone();
     // Inject _SANDLOCK_GATHER env var
-    consumer_sandbox.env.insert("_SANDLOCK_GATHER".to_string(), gather_env);
+    consumer_sandbox
+        .env
+        .insert("_SANDLOCK_GATHER".to_string(), gather_env);
 
-    let mut consumer_sb = consumer_sandbox.clone().with_name(format!("gather-{run}-consumer"));
+    let mut consumer_sb = consumer_sandbox
+        .clone()
+        .with_name(format!("gather-{run}-consumer"));
     let stdin_fd = source_pipes[n - 1].0.as_raw_fd();
 
     // Build extra fd mappings for non-stdin sources
@@ -436,13 +442,15 @@ async fn run_gather(
     }
 
     let cmd_refs: Vec<&str> = consumer.args.iter().map(|s| s.as_str()).collect();
-    consumer_sb.create_with_gather_io(
-        &cmd_refs,
-        Some(stdin_fd),
-        Some(cap_stdout_w.as_raw_fd()),
-        Some(cap_stderr_w.as_raw_fd()),
-        extra_fds,
-    ).await?;
+    consumer_sb
+        .create_with_gather_io(
+            &cmd_refs,
+            Some(stdin_fd),
+            Some(cap_stdout_w.as_raw_fd()),
+            Some(cap_stderr_w.as_raw_fd()),
+            extra_fds,
+        )
+        .await?;
     consumer_sb.start()?;
     sandboxes.push(consumer_sb);
 

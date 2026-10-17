@@ -16,7 +16,11 @@ pub(super) async fn pull(cache: &Cache, name: &str) -> Result<Image, SandlockErr
     let id = docker
         .inspect_image(name)
         .await
-        .map_err(|e| docker_error(format!("image not found in local Docker storage: {name} ({e})")))?
+        .map_err(|e| {
+            docker_error(format!(
+                "image not found in local Docker storage: {name} ({e})"
+            ))
+        })?
         .id
         .ok_or_else(|| docker_error(format!("Docker returned no id for image {name}")))?;
     // Docker's image id is a content digest, so it keys the cache without
@@ -61,11 +65,15 @@ async fn connect() -> Result<Docker, SandlockError> {
 
 /// Stream the image-save archive to disk rather than holding an image in memory.
 async fn save(docker: &Docker, name: &str, dest: &Path) -> Result<(), SandlockError> {
-    let mut file = tokio::fs::File::create(dest).await.map_err(SandboxRuntimeError::Io)?;
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(SandboxRuntimeError::Io)?;
     let mut stream = docker.export_image(name);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| docker_error(format!("image save failed: {e}")))?;
-        file.write_all(&chunk).await.map_err(SandboxRuntimeError::Io)?;
+        file.write_all(&chunk)
+            .await
+            .map_err(SandboxRuntimeError::Io)?;
     }
     file.flush().await.map_err(SandboxRuntimeError::Io)?;
     Ok(())
@@ -74,4 +82,3 @@ async fn save(docker: &Docker, name: &str, dest: &Path) -> Result<(), SandlockEr
 fn docker_error(msg: String) -> SandlockError {
     SandboxRuntimeError::Child(format!("docker-daemon: {msg}")).into()
 }
-

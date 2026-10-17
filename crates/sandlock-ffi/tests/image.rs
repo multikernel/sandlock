@@ -11,9 +11,9 @@ use std::ptr;
 
 use sandlock_ffi::{
     sandlock_image_pull, sandlock_result_free, sandlock_result_stderr, sandlock_result_stdout,
-    sandlock_result_success, sandlock_run, sandlock_sandbox_build, sandlock_sandbox_builder_env_var,
-    sandlock_sandbox_builder_image, sandlock_sandbox_builder_new, sandlock_sandbox_free,
-    sandlock_sandbox_t, sandlock_string_free,
+    sandlock_result_success, sandlock_run, sandlock_sandbox_build,
+    sandlock_sandbox_builder_env_var, sandlock_sandbox_builder_image, sandlock_sandbox_builder_new,
+    sandlock_sandbox_free, sandlock_sandbox_t, sandlock_string_free,
 };
 
 fn cstr(s: &str) -> CString {
@@ -28,16 +28,19 @@ fn take_string(p: *mut c_char) -> String {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, data).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// An OCI layout holding one image: the static rootfs-helper plus a config
 /// that sets Env and a WorkingDir the layer does not contain.
 fn helper_image_layout(dir: &Path) {
-    let helper = fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper"),
-    )
-    .expect("rootfs-helper not built; sandlock-core's build.rs compiles it");
+    let helper =
+        fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper"))
+            .expect("rootfs-helper not built; sandlock-core's build.rs compiles it");
 
     let mut layer = tar::Builder::new(Vec::new());
     for d in ["usr/", "usr/bin/", "proc/", "dev/", "tmp/"] {
@@ -74,9 +77,15 @@ fn helper_image_layout(dir: &Path) {
         "config": blob("application/vnd.oci.image.config.v1+json", config.to_string().as_bytes()),
         "layers": [blob("application/vnd.oci.image.layer.v1.tar", &layer)],
     });
-    let manifest = blob("application/vnd.oci.image.manifest.v1+json", manifest.to_string().as_bytes());
-    fs::write(dir.join("index.json"), serde_json::json!({"schemaVersion": 2, "manifests": [manifest]}).to_string())
-        .unwrap();
+    let manifest = blob(
+        "application/vnd.oci.image.manifest.v1+json",
+        manifest.to_string().as_bytes(),
+    );
+    fs::write(
+        dir.join("index.json"),
+        serde_json::json!({"schemaVersion": 2, "manifests": [manifest]}).to_string(),
+    )
+    .unwrap();
 }
 
 fn pull(reference: &str, cache: &Path) -> Result<String, String> {
@@ -93,7 +102,8 @@ fn pull(reference: &str, cache: &Path) -> Result<String, String> {
 
 fn build(image_json: &str, env: &[(&str, &str)]) -> Result<*mut sandlock_sandbox_t, c_int> {
     let json = cstr(image_json);
-    let mut b = unsafe { sandlock_sandbox_builder_image(sandlock_sandbox_builder_new(), json.as_ptr()) };
+    let mut b =
+        unsafe { sandlock_sandbox_builder_image(sandlock_sandbox_builder_new(), json.as_ptr()) };
     for (k, v) in env {
         let (k, v) = (cstr(k), cstr(v));
         b = unsafe { sandlock_sandbox_builder_env_var(b, k.as_ptr(), v.as_ptr()) };
@@ -104,7 +114,11 @@ fn build(image_json: &str, env: &[(&str, &str)]) -> Result<*mut sandlock_sandbox
     if !err_msg.is_null() {
         unsafe { sandlock_string_free(err_msg) };
     }
-    if policy.is_null() { Err(err) } else { Ok(policy) }
+    if policy.is_null() {
+        Err(err)
+    } else {
+        Ok(policy)
+    }
 }
 
 fn run(policy: *mut sandlock_sandbox_t, argv: &[&str]) -> (bool, String, String) {
@@ -129,8 +143,13 @@ fn pulled_image_runs_with_its_env_and_working_dir() {
 
     let json = pull(&format!("oci:{}", layout.path().display()), cache.path()).unwrap();
     let image: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert!(Path::new(image["rootfs"].as_str().unwrap()).join("usr/bin/rootfs-helper").is_file());
-    assert_eq!(image["config"]["cmd"], serde_json::json!(["rootfs-helper", "pwd"]));
+    assert!(Path::new(image["rootfs"].as_str().unwrap())
+        .join("usr/bin/rootfs-helper")
+        .is_file());
+    assert_eq!(
+        image["config"]["cmd"],
+        serde_json::json!(["rootfs-helper", "pwd"])
+    );
     assert_eq!(image["config"]["working_dir"], "/work/here");
 
     let policy = build(&json, &[]).unwrap();
@@ -143,7 +162,9 @@ fn pulled_image_runs_with_its_env_and_working_dir() {
     // C ABI recorded on the built sandbox instead.
     let env = |extra: &[(&str, &str)]| {
         let json = cstr(&json);
-        let mut b = unsafe { sandlock_sandbox_builder_image(sandlock_sandbox_builder_new(), json.as_ptr()) };
+        let mut b = unsafe {
+            sandlock_sandbox_builder_image(sandlock_sandbox_builder_new(), json.as_ptr())
+        };
         for (k, v) in extra {
             let (k, v) = (cstr(k), cstr(v));
             b = unsafe { sandlock_sandbox_builder_env_var(b, k.as_ptr(), v.as_ptr()) };

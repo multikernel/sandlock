@@ -79,9 +79,14 @@ pub(super) struct LayoutDir {
 impl LayoutDir {
     pub fn open(root: &Path) -> Result<Self, SandlockError> {
         if !root.join("index.json").is_file() {
-            return Err(oci_error(format!("{}: not an OCI image layout (no index.json)", root.display())));
+            return Err(oci_error(format!(
+                "{}: not an OCI image layout (no index.json)",
+                root.display()
+            )));
         }
-        Ok(LayoutDir { root: root.to_path_buf() })
+        Ok(LayoutDir {
+            root: root.to_path_buf(),
+        })
     }
 }
 
@@ -91,7 +96,9 @@ impl Blobs for LayoutDir {
     }
 
     fn open(&self, hex: &str) -> io::Result<Box<dyn Read + '_>> {
-        Ok(Box::new(File::open(self.root.join("blobs/sha256").join(hex))?))
+        Ok(Box::new(File::open(
+            self.root.join("blobs/sha256").join(hex),
+        )?))
     }
 }
 
@@ -102,7 +109,10 @@ pub(super) struct BlobDir(pub PathBuf);
 #[cfg(feature = "http")]
 impl Blobs for BlobDir {
     fn index(&self) -> io::Result<Vec<u8>> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "a blob directory has no index"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a blob directory has no index",
+        ))
     }
 
     fn open(&self, hex: &str) -> io::Result<Box<dyn Read + '_>> {
@@ -137,14 +147,16 @@ impl LayoutArchive {
                 path.display()
             )));
         }
-        Ok(LayoutArchive { path: path.to_path_buf(), members })
+        Ok(LayoutArchive {
+            path: path.to_path_buf(),
+            members,
+        })
     }
 
     fn member(&self, name: &str) -> io::Result<io::Take<File>> {
-        let &(offset, size) = self
-            .members
-            .get(name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name} not in archive")))?;
+        let &(offset, size) = self.members.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("{name} not in archive"))
+        })?;
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
         Ok(file.take(size))
@@ -166,7 +178,9 @@ impl Blobs for LayoutArchive {
 /// Pick the manifest for this host from the layout's index, descending
 /// through nested indexes. `tag` selects by `org.opencontainers.image.ref.name`.
 pub(super) fn resolve(blobs: &dyn Blobs, tag: Option<&str>) -> Result<Manifest, SandlockError> {
-    let index = blobs.index().map_err(|e| oci_error(format!("index.json: {e}")))?;
+    let index = blobs
+        .index()
+        .map_err(|e| oci_error(format!("index.json: {e}")))?;
     let Parsed::Index(mut candidates) = parse_node(&index, "index.json")? else {
         return Err(oci_error("index.json is not an index".into()));
     };
@@ -194,24 +208,42 @@ pub(super) fn parse_node(bytes: &[u8], what: &str) -> Result<Parsed, SandlockErr
     let node: Node = parse_json(bytes, what)?;
     match (node.manifests, node.config) {
         (Some(manifests), _) => Ok(Parsed::Index(manifests)),
-        (None, Some(config)) => Ok(Parsed::Manifest(Manifest { config, layers: node.layers })),
-        (None, None) => Err(oci_error(format!("{what}: neither an index nor a manifest"))),
+        (None, Some(config)) => Ok(Parsed::Manifest(Manifest {
+            config,
+            layers: node.layers,
+        })),
+        (None, None) => Err(oci_error(format!(
+            "{what}: neither an index nor a manifest"
+        ))),
     }
 }
 
 pub(super) fn pick_platform(candidates: Vec<Descriptor>) -> Result<Descriptor, SandlockError> {
     let arch = host_arch();
-    let fits = |d: &Descriptor| d.platform.as_ref().is_none_or(|p| p.os == "linux" && p.architecture == arch);
+    let fits = |d: &Descriptor| {
+        d.platform
+            .as_ref()
+            .is_none_or(|p| p.os == "linux" && p.architecture == arch)
+    };
     let offered: Vec<String> = candidates
         .iter()
-        .filter_map(|d| d.platform.as_ref().map(|p| format!("{}/{}", p.os, p.architecture)))
+        .filter_map(|d| {
+            d.platform
+                .as_ref()
+                .map(|p| format!("{}/{}", p.os, p.architecture))
+        })
         .collect();
     let mut fitting = candidates.into_iter().filter(fits);
     match (fitting.next(), fitting.next()) {
         (Some(d), None) => Ok(d),
-        (Some(_), Some(_)) => Err(oci_error("several images fit this host; select one with :<tag>".into())),
+        (Some(_), Some(_)) => Err(oci_error(
+            "several images fit this host; select one with :<tag>".into(),
+        )),
         (None, _) if offered.is_empty() => Err(oci_error("index lists no images".into())),
-        (None, _) => Err(oci_error(format!("no linux/{arch} image (offered: {})", offered.join(", ")))),
+        (None, _) => Err(oci_error(format!(
+            "no linux/{arch} image (offered: {})",
+            offered.join(", ")
+        ))),
     }
 }
 
@@ -226,7 +258,10 @@ fn host_arch() -> &'static str {
 }
 
 pub(super) fn config(blobs: &dyn Blobs, manifest: &Manifest) -> Result<ImageConfig, SandlockError> {
-    let blob: ConfigBlob = parse_json(&read_json_blob(blobs, &manifest.config)?, &manifest.config.digest)?;
+    let blob: ConfigBlob = parse_json(
+        &read_json_blob(blobs, &manifest.config)?,
+        &manifest.config.digest,
+    )?;
     let run = blob.config.unwrap_or_default();
     Ok(ImageConfig {
         entrypoint: run.entrypoint.unwrap_or_default(),
@@ -237,7 +272,11 @@ pub(super) fn config(blobs: &dyn Blobs, manifest: &Manifest) -> Result<ImageConf
 }
 
 /// Apply every layer of `manifest`, in order, onto `root`.
-pub(super) fn unpack(blobs: &dyn Blobs, manifest: &Manifest, root: &Path) -> Result<(), SandlockError> {
+pub(super) fn unpack(
+    blobs: &dyn Blobs,
+    manifest: &Manifest,
+    root: &Path,
+) -> Result<(), SandlockError> {
     for desc in &manifest.layers {
         let raw = verified(blobs, desc)?;
         match compression(&desc.media_type)? {
@@ -277,7 +316,9 @@ fn compression(media_type: &str) -> Result<Compression, SandlockError> {
     } else if media_type.ends_with(".tar") {
         Ok(Compression::None)
     } else {
-        Err(oci_error(format!("unsupported layer media type {media_type:?}")))
+        Err(oci_error(format!(
+            "unsupported layer media type {media_type:?}"
+        )))
     }
 }
 
@@ -290,7 +331,10 @@ fn drain(mut r: impl Read, desc: &Descriptor) -> Result<(), SandlockError> {
 
 fn read_json_blob(blobs: &dyn Blobs, desc: &Descriptor) -> Result<Vec<u8>, SandlockError> {
     if desc.size > MAX_JSON_BLOB {
-        return Err(oci_error(format!("{}: {} bytes is too large for metadata", desc.digest, desc.size)));
+        return Err(oci_error(format!(
+            "{}: {} bytes is too large for metadata",
+            desc.digest, desc.size
+        )));
     }
     let mut buf = Vec::with_capacity(desc.size as usize);
     verified(blobs, desc)?
@@ -299,9 +343,14 @@ fn read_json_blob(blobs: &dyn Blobs, desc: &Descriptor) -> Result<Vec<u8>, Sandl
     Ok(buf)
 }
 
-fn verified<'a>(blobs: &'a dyn Blobs, desc: &Descriptor) -> Result<Verified<Box<dyn Read + 'a>>, SandlockError> {
+fn verified<'a>(
+    blobs: &'a dyn Blobs,
+    desc: &Descriptor,
+) -> Result<Verified<Box<dyn Read + 'a>>, SandlockError> {
     let hex = digest_hex(&desc.digest)?;
-    let inner = blobs.open(hex).map_err(|e| oci_error(format!("blob {}: {e}", desc.digest)))?;
+    let inner = blobs
+        .open(hex)
+        .map_err(|e| oci_error(format!("blob {}: {e}", desc.digest)))?;
     Ok(Verified {
         inner,
         ctx: ring::digest::Context::new(&ring::digest::SHA256),
@@ -313,10 +362,17 @@ fn verified<'a>(blobs: &'a dyn Blobs, desc: &Descriptor) -> Result<Verified<Box<
 /// The hex part of a `sha256:` digest, validated so it can name a file.
 pub(super) fn digest_hex(digest: &str) -> Result<&str, SandlockError> {
     match digest.split_once(':') {
-        Some(("sha256", hex)) if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) => {
+        Some(("sha256", hex))
+            if hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
+        {
             Ok(hex)
         }
-        _ => Err(oci_error(format!("unsupported or malformed digest {digest:?}"))),
+        _ => Err(oci_error(format!(
+            "unsupported or malformed digest {digest:?}"
+        ))),
     }
 }
 
@@ -333,17 +389,33 @@ impl<R: Read> Read for Verified<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n as u64 > self.remaining {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "blob larger than its descriptor"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "blob larger than its descriptor",
+            ));
         }
         self.remaining -= n as u64;
         self.ctx.update(&buf[..n]);
         if n == 0 && !buf.is_empty() {
             if self.remaining != 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "blob shorter than its descriptor"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "blob shorter than its descriptor",
+                ));
             }
-            let actual: String = self.ctx.clone().finish().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            let actual: String = self
+                .ctx
+                .clone()
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             if actual != self.expected {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("digest mismatch: got sha256:{actual}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("digest mismatch: got sha256:{actual}"),
+                ));
             }
         }
         Ok(n)
@@ -360,7 +432,11 @@ struct ZstdReader<R> {
 
 impl<R: BufRead> ZstdReader<R> {
     fn new(src: R) -> Self {
-        ZstdReader { src, frame: ruzstd::decoding::FrameDecoder::new(), in_frame: false }
+        ZstdReader {
+            src,
+            frame: ruzstd::decoding::FrameDecoder::new(),
+            in_frame: false,
+        }
     }
 }
 
@@ -368,7 +444,8 @@ impl<R: BufRead> Read for ZstdReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
         use ruzstd::decoding::BlockDecodingStrategy;
-        let invalid = |e: FrameDecoderError| io::Error::new(io::ErrorKind::InvalidData, format!("zstd: {e}"));
+        let invalid =
+            |e: FrameDecoderError| io::Error::new(io::ErrorKind::InvalidData, format!("zstd: {e}"));
         loop {
             if self.in_frame {
                 if self.frame.can_collect() > 0 {
@@ -376,7 +453,10 @@ impl<R: BufRead> Read for ZstdReader<R> {
                 }
                 if !self.frame.is_finished() {
                     self.frame
-                        .decode_blocks(&mut self.src, BlockDecodingStrategy::UptoBytes(buf.len().max(1)))
+                        .decode_blocks(
+                            &mut self.src,
+                            BlockDecodingStrategy::UptoBytes(buf.len().max(1)),
+                        )
                         .map_err(invalid)?;
                     continue;
                 }
@@ -387,7 +467,10 @@ impl<R: BufRead> Read for ZstdReader<R> {
             }
             match self.frame.init(&mut self.src) {
                 Ok(()) => self.in_frame = true,
-                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame { length, .. })) => {
+                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                    length,
+                    ..
+                })) => {
                     io::copy(&mut (&mut self.src).take(length as u64), &mut io::sink())?;
                 }
                 Err(e) => return Err(invalid(e)),
@@ -396,7 +479,10 @@ impl<R: BufRead> Read for ZstdReader<R> {
     }
 }
 
-pub(super) fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], what: &str) -> Result<T, SandlockError> {
+pub(super) fn parse_json<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    what: &str,
+) -> Result<T, SandlockError> {
     serde_json::from_slice(bytes).map_err(|e| oci_error(format!("{what}: {e}")))
 }
 
@@ -415,7 +501,11 @@ pub(super) mod tests {
     }
 
     pub(in crate::image) fn sha256_hex(data: &[u8]) -> String {
-        ring::digest::digest(&ring::digest::SHA256, data).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// Builds an OCI image layout directory for tests.
@@ -427,7 +517,11 @@ pub(super) mod tests {
         pub fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             fs::create_dir_all(dir.path().join("blobs/sha256")).unwrap();
-            fs::write(dir.path().join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+            fs::write(
+                dir.path().join("oci-layout"),
+                br#"{"imageLayoutVersion":"1.0.0"}"#,
+            )
+            .unwrap();
             TestLayout { dir }
         }
 
@@ -437,11 +531,25 @@ pub(super) mod tests {
             serde_json::json!({"mediaType": media_type, "digest": format!("sha256:{hex}"), "size": data.len()})
         }
 
-        pub fn image(&self, layers: &[(&str, Vec<u8>)], config: serde_json::Value) -> serde_json::Value {
-            let config = self.blob("application/vnd.oci.image.config.v1+json", config.to_string().as_bytes());
-            let layers: Vec<_> = layers.iter().map(|(mt, data)| self.blob(mt, data)).collect();
-            let manifest = serde_json::json!({"schemaVersion": 2, "config": config, "layers": layers});
-            self.blob("application/vnd.oci.image.manifest.v1+json", manifest.to_string().as_bytes())
+        pub fn image(
+            &self,
+            layers: &[(&str, Vec<u8>)],
+            config: serde_json::Value,
+        ) -> serde_json::Value {
+            let config = self.blob(
+                "application/vnd.oci.image.config.v1+json",
+                config.to_string().as_bytes(),
+            );
+            let layers: Vec<_> = layers
+                .iter()
+                .map(|(mt, data)| self.blob(mt, data))
+                .collect();
+            let manifest =
+                serde_json::json!({"schemaVersion": 2, "config": config, "layers": layers});
+            self.blob(
+                "application/vnd.oci.image.manifest.v1+json",
+                manifest.to_string().as_bytes(),
+            )
         }
 
         pub fn index(&self, manifests: Vec<serde_json::Value>) {
@@ -481,7 +589,10 @@ pub(super) mod tests {
             out.extend_from_slice(&0x184D2A50u32.to_le_bytes());
             out.extend_from_slice(&4u32.to_le_bytes());
             out.extend_from_slice(b"meta");
-            out.extend(ruzstd::encoding::compress_to_vec(*part, ruzstd::encoding::CompressionLevel::Fastest));
+            out.extend(ruzstd::encoding::compress_to_vec(
+                *part,
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ));
         }
         out
     }
@@ -496,7 +607,10 @@ pub(super) mod tests {
         desc
     }
 
-    fn unpack_layout(layout: &TestLayout, tag: Option<&str>) -> Result<(tempfile::TempDir, ImageConfig), SandlockError> {
+    fn unpack_layout(
+        layout: &TestLayout,
+        tag: Option<&str>,
+    ) -> Result<(tempfile::TempDir, ImageConfig), SandlockError> {
         let blobs = LayoutDir::open(layout.path())?;
         let manifest = resolve(&blobs, tag)?;
         let root = tempfile::tempdir().unwrap();
@@ -535,14 +649,33 @@ pub(super) mod tests {
     fn nested_index_selects_host_platform() {
         let layout = TestLayout::new();
         let cfg = serde_json::json!({"config": {}});
-        let host = layout.image(&[("application/vnd.oci.image.layer.v1.tar", tar_of(&[("host", b"")]))], cfg.clone());
-        let other = layout.image(&[("application/vnd.oci.image.layer.v1.tar", tar_of(&[("other", b"")]))], cfg);
-        let other_arch = if host_arch() == "s390x" { "amd64" } else { "s390x" };
+        let host = layout.image(
+            &[(
+                "application/vnd.oci.image.layer.v1.tar",
+                tar_of(&[("host", b"")]),
+            )],
+            cfg.clone(),
+        );
+        let other = layout.image(
+            &[(
+                "application/vnd.oci.image.layer.v1.tar",
+                tar_of(&[("other", b"")]),
+            )],
+            cfg,
+        );
+        let other_arch = if host_arch() == "s390x" {
+            "amd64"
+        } else {
+            "s390x"
+        };
         let nested = serde_json::json!({"schemaVersion": 2, "manifests": [
             with_platform(other, other_arch),
             with_platform(host, host_arch()),
         ]});
-        let nested = layout.blob("application/vnd.oci.image.index.v1+json", nested.to_string().as_bytes());
+        let nested = layout.blob(
+            "application/vnd.oci.image.index.v1+json",
+            nested.to_string().as_bytes(),
+        );
         layout.index(vec![nested]);
 
         let (root, _) = unpack_layout(&layout, None).unwrap();
@@ -554,8 +687,20 @@ pub(super) mod tests {
     fn tag_selects_among_several_images() {
         let layout = TestLayout::new();
         let cfg = serde_json::json!({});
-        let a = layout.image(&[("application/vnd.oci.image.layer.v1.tar", tar_of(&[("a", b"")]))], cfg.clone());
-        let b = layout.image(&[("application/vnd.oci.image.layer.v1.tar", tar_of(&[("b", b"")]))], cfg);
+        let a = layout.image(
+            &[(
+                "application/vnd.oci.image.layer.v1.tar",
+                tar_of(&[("a", b"")]),
+            )],
+            cfg.clone(),
+        );
+        let b = layout.image(
+            &[(
+                "application/vnd.oci.image.layer.v1.tar",
+                tar_of(&[("b", b"")]),
+            )],
+            cfg,
+        );
         layout.index(vec![with_tag(a, "one"), with_tag(b, "two")]);
 
         assert!(unpack_layout(&layout, None).is_err());
@@ -568,7 +713,11 @@ pub(super) mod tests {
     fn foreign_platform_only_is_rejected() {
         let layout = TestLayout::new();
         let img = layout.image(&[], serde_json::json!({}));
-        let foreign = if host_arch() == "s390x" { "amd64" } else { "s390x" };
+        let foreign = if host_arch() == "s390x" {
+            "amd64"
+        } else {
+            "s390x"
+        };
         layout.index(vec![with_platform(img, foreign)]);
         let err = unpack_layout(&layout, None).err().unwrap().to_string();
         assert!(err.contains(foreign), "{err}");
@@ -578,7 +727,10 @@ pub(super) mod tests {
     fn tampered_layer_fails_verification() {
         let layout = TestLayout::new();
         let img = layout.image(
-            &[("application/vnd.oci.image.layer.v1.tar", tar_of(&[("f", b"original")]))],
+            &[(
+                "application/vnd.oci.image.layer.v1.tar",
+                tar_of(&[("f", b"original")]),
+            )],
             serde_json::json!({}),
         );
         layout.index(vec![img]);
@@ -586,11 +738,18 @@ pub(super) mod tests {
         let manifest = resolve(&blobs, None).unwrap();
         let hex = digest_hex(&manifest.layers[0].digest).unwrap().to_string();
         let blob = layout.path().join("blobs/sha256").join(&hex);
-        let tampered = fs::read(&blob).unwrap().iter().map(|b| if *b == b'o' { b'O' } else { *b }).collect::<Vec<_>>();
+        let tampered = fs::read(&blob)
+            .unwrap()
+            .iter()
+            .map(|b| if *b == b'o' { b'O' } else { *b })
+            .collect::<Vec<_>>();
         fs::write(&blob, tampered).unwrap();
 
         let root = tempfile::tempdir().unwrap();
-        let err = unpack(&blobs, &manifest, root.path()).err().unwrap().to_string();
+        let err = unpack(&blobs, &manifest, root.path())
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("digest mismatch"), "{err}");
     }
 
@@ -606,7 +765,10 @@ pub(super) mod tests {
     fn archive_serves_the_same_blobs_as_the_directory() {
         let layout = TestLayout::new();
         let img = layout.image(
-            &[("application/vnd.oci.image.layer.v1.tar", tar_of(&[("inside", b"x")]))],
+            &[(
+                "application/vnd.oci.image.layer.v1.tar",
+                tar_of(&[("inside", b"x")]),
+            )],
             serde_json::json!({}),
         );
         layout.index(vec![img]);

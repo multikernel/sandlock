@@ -1,8 +1,8 @@
-use crate::sandbox::{ByteSize, Sandbox};
 use crate::error::SandlockError;
+use crate::sandbox::{ByteSize, Sandbox};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Program identity supplied by a profile alongside the policy.
 /// Not a `Sandbox` field — passed separately to the sandbox runner.
@@ -34,8 +34,12 @@ pub struct ProfileInput {
     pub limits: LimitsSection,
 }
 
-fn is_false(b: &bool) -> bool { !b }
-fn is_default<T: Default + PartialEq>(v: &T) -> bool { *v == T::default() }
+fn is_false(b: &bool) -> bool {
+    !b
+}
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
 
 // Field names follow the schema vocabulary and match `Sandbox`'s field names 1:1.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -356,10 +360,14 @@ fn pairs_as_map<S: serde::Serializer>(
 /// Expand `${HOME}` and split mount specs; semantic checks wait for `build`.
 pub fn resolve(input: ProfileInput) -> Result<ResolvedProfile, SandlockError> {
     let mut ex = Expander::new(input.filesystem.chroot.is_some());
-    let paths = |ex: &mut Expander, field: &str, ps: Vec<PathBuf>| -> Result<Vec<PathBuf>, SandlockError> {
-        ps.iter().map(|p| ex.path(field, p)).collect()
-    };
-    let path = |ex: &mut Expander, field: &str, p: Option<PathBuf>| -> Result<Option<PathBuf>, SandlockError> {
+    let paths =
+        |ex: &mut Expander, field: &str, ps: Vec<PathBuf>| -> Result<Vec<PathBuf>, SandlockError> {
+            ps.iter().map(|p| ex.path(field, p)).collect()
+        };
+    let path = |ex: &mut Expander,
+                field: &str,
+                p: Option<PathBuf>|
+     -> Result<Option<PathBuf>, SandlockError> {
         p.map(|p| ex.path(field, &p)).transpose()
     };
 
@@ -369,8 +377,15 @@ pub fn resolve(input: ProfileInput) -> Result<ResolvedProfile, SandlockError> {
         let (virt, host, read_only) = parse_mount_spec(spec)?;
         // Expand after the split so a resolved value containing a colon
         // cannot be read as a spec separator.
-        let pair = (ex.path("[filesystem].mount", &virt)?, ex.path("[filesystem].mount", &host)?);
-        if read_only { fs_mount_ro.push(pair) } else { fs_mount.push(pair) }
+        let pair = (
+            ex.path("[filesystem].mount", &virt)?,
+            ex.path("[filesystem].mount", &host)?,
+        );
+        if read_only {
+            fs_mount_ro.push(pair)
+        } else {
+            fs_mount.push(pair)
+        }
     }
 
     let c = input.config;
@@ -438,43 +453,89 @@ impl ResolvedProfile {
     pub fn build(self) -> Result<(Sandbox, ProgramSpec), SandlockError> {
         let mut b = Sandbox::builder();
 
-        if let Some(p) = self.http_ca     { b = b.http_ca(p); }
-        if let Some(p) = self.http_key    { b = b.http_key(p); }
-        for p in self.http_inject_ca      { b = b.http_inject_ca(p); }
-        if let Some(p) = self.http_ca_out { b = b.http_ca_out(p); }
-        if let Some(p) = self.fs_storage  { b = b.fs_storage(p); }
-        if let Some(p) = self.workdir     { b = b.workdir(p); }
+        if let Some(p) = self.http_ca {
+            b = b.http_ca(p);
+        }
+        if let Some(p) = self.http_key {
+            b = b.http_key(p);
+        }
+        for p in self.http_inject_ca {
+            b = b.http_inject_ca(p);
+        }
+        if let Some(p) = self.http_ca_out {
+            b = b.http_ca_out(p);
+        }
+        if let Some(p) = self.fs_storage {
+            b = b.fs_storage(p);
+        }
+        if let Some(p) = self.workdir {
+            b = b.workdir(p);
+        }
 
-        if let Some(s) = self.random_seed { b = b.random_seed(s); }
+        if let Some(s) = self.random_seed {
+            b = b.random_seed(s);
+        }
         if let Some(s) = self.time_start.as_deref() {
             let t = crate::sandbox::parse_timestamp("[determinism].time_start", s)
                 .map_err(SandlockError::Sandbox)?;
             b = b.time_start(t);
         }
-        if self.deterministic_dirs        { b = b.deterministic_dirs(true); }
-        if self.no_randomize_memory       { b = b.no_randomize_memory(true); }
+        if self.deterministic_dirs {
+            b = b.deterministic_dirs(true);
+        }
+        if self.no_randomize_memory {
+            b = b.no_randomize_memory(true);
+        }
 
-        for (k, v) in self.env.iter()     { b = b.env_var(k, v); }
-        if let Some(c) = self.cwd         { b = b.cwd(c); }
+        for (k, v) in self.env.iter() {
+            b = b.env_var(k, v);
+        }
+        if let Some(c) = self.cwd {
+            b = b.cwd(c);
+        }
         match (self.uid, self.gid) {
             (Some(u), Some(g)) => b = b.user(u, g),
             (None, None) => {}
-            _ => return Err(SandlockError::Sandbox(crate::error::SandboxError::Invalid(
-                "program.uid and program.gid must both be set".into(),
-            ))),
+            _ => {
+                return Err(SandlockError::Sandbox(crate::error::SandboxError::Invalid(
+                    "program.uid and program.gid must both be set".into(),
+                )))
+            }
         }
-        if self.clean_env                 { b = b.clean_env(true); }
-        if self.no_coredump               { b = b.no_coredump(true); }
-        if self.no_huge_pages             { b = b.no_huge_pages(true); }
+        if self.clean_env {
+            b = b.clean_env(true);
+        }
+        if self.no_coredump {
+            b = b.no_coredump(true);
+        }
+        if self.no_huge_pages {
+            b = b.no_huge_pages(true);
+        }
 
-        for p in self.fs_readable         { b = b.fs_read(p); }
-        for p in self.fs_writable         { b = b.fs_write(p); }
-        for p in self.fs_denied           { b = b.fs_deny(p); }
-        if let Some(c) = self.chroot      { b = b.chroot(c); }
-        for (v, h) in self.fs_mount       { b = b.fs_mount(v, h); }
-        for (v, h) in self.fs_mount_ro    { b = b.fs_mount_ro(v, h); }
-        if let Some(s) = self.on_exit.as_deref()  { b = b.on_exit(parse_branch_action("[filesystem].on_exit", s)?); }
-        if let Some(s) = self.on_error.as_deref() { b = b.on_error(parse_branch_action("[filesystem].on_error", s)?); }
+        for p in self.fs_readable {
+            b = b.fs_read(p);
+        }
+        for p in self.fs_writable {
+            b = b.fs_write(p);
+        }
+        for p in self.fs_denied {
+            b = b.fs_deny(p);
+        }
+        if let Some(c) = self.chroot {
+            b = b.chroot(c);
+        }
+        for (v, h) in self.fs_mount {
+            b = b.fs_mount(v, h);
+        }
+        for (v, h) in self.fs_mount_ro {
+            b = b.fs_mount_ro(v, h);
+        }
+        if let Some(s) = self.on_exit.as_deref() {
+            b = b.on_exit(parse_branch_action("[filesystem].on_exit", s)?);
+        }
+        if let Some(s) = self.on_error.as_deref() {
+            b = b.on_error(parse_branch_action("[filesystem].on_error", s)?);
+        }
 
         for entry in self.net_allow_bind.iter() {
             b = match entry {
@@ -488,32 +549,66 @@ impl ResolvedProfile {
                 PortSpec::Spec(s) => b.net_deny_bind(s),
             };
         }
-        for r in self.net_allow.iter()    { b = b.net_allow(r.as_str()); }
-        for r in self.net_deny.iter()     { b = b.net_deny(r.as_str()); }
-        if self.port_remap                { b = b.port_remap(true); }
+        for r in self.net_allow.iter() {
+            b = b.net_allow(r.as_str());
+        }
+        for r in self.net_deny.iter() {
+            b = b.net_deny(r.as_str());
+        }
+        if self.port_remap {
+            b = b.port_remap(true);
+        }
 
-        for p in self.http_ports.iter()   { b = b.http_port(*p); }
-        for r in self.http_allow.iter()   { b = b.http_allow(r); }
-        for r in self.http_deny.iter()    { b = b.http_deny(r); }
+        for p in self.http_ports.iter() {
+            b = b.http_port(*p);
+        }
+        for r in self.http_allow.iter() {
+            b = b.http_allow(r);
+        }
+        for r in self.http_deny.iter() {
+            b = b.http_deny(r);
+        }
 
-        if !self.extra_allow_syscalls.is_empty() { b = b.extra_allow_syscalls(self.extra_allow_syscalls); }
-        if !self.extra_deny_syscalls.is_empty()  { b = b.extra_deny_syscalls(self.extra_deny_syscalls); }
+        if !self.extra_allow_syscalls.is_empty() {
+            b = b.extra_allow_syscalls(self.extra_allow_syscalls);
+        }
+        if !self.extra_deny_syscalls.is_empty() {
+            b = b.extra_deny_syscalls(self.extra_deny_syscalls);
+        }
 
         if let Some(s) = self.max_memory.as_deref() {
             b = b.max_memory(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
         }
-        if let Some(n) = self.max_processes  { b = b.max_processes(n); }
-        if let Some(n) = self.max_open_files { b = b.max_open_files(n); }
-        if let Some(p) = self.max_cpu        { b = b.max_cpu(p); }
+        if let Some(n) = self.max_processes {
+            b = b.max_processes(n);
+        }
+        if let Some(n) = self.max_open_files {
+            b = b.max_open_files(n);
+        }
+        if let Some(p) = self.max_cpu {
+            b = b.max_cpu(p);
+        }
         if let Some(s) = self.max_disk.as_deref() {
             b = b.max_disk(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
         }
-        if let Some(g) = self.gpu_devices    { b = b.gpu_devices(g); }
-        if let Some(c) = self.cpu_cores      { b = b.cpu_cores(c); }
-        if let Some(n) = self.num_cpus       { b = b.num_cpus(n); }
+        if let Some(g) = self.gpu_devices {
+            b = b.gpu_devices(g);
+        }
+        if let Some(c) = self.cpu_cores {
+            b = b.cpu_cores(c);
+        }
+        if let Some(n) = self.num_cpus {
+            b = b.num_cpus(n);
+        }
 
         let policy = b.build()?;
-        Ok((policy, ProgramSpec { exec: self.exec, args: self.args }))
+        Ok((
+            policy,
+            ProgramSpec {
+                exec: self.exec,
+                args: self.args,
+            },
+        ))
     }
 }
 
@@ -523,7 +618,10 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
 }
 
 /// Parses an `[filesystem].on_exit` / `on_error` string into a `BranchAction`.
-fn parse_branch_action(field: &str, s: &str) -> Result<crate::sandbox::BranchAction, SandlockError> {
+fn parse_branch_action(
+    field: &str,
+    s: &str,
+) -> Result<crate::sandbox::BranchAction, SandlockError> {
     use crate::error::SandboxError;
     use crate::sandbox::BranchAction;
     Ok(match s {
@@ -550,13 +648,15 @@ pub fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf, bool), SandlockErr
     } else {
         (s, false)
     };
-    let (virt, host) = body.split_once(':').ok_or_else(|| SandlockError::Sandbox(SandboxError::Invalid(
-        format!("invalid mount spec {s:?}; expected \"VIRTUAL:HOST[:ro]\""),
-    )))?;
+    let (virt, host) = body.split_once(':').ok_or_else(|| {
+        SandlockError::Sandbox(SandboxError::Invalid(format!(
+            "invalid mount spec {s:?}; expected \"VIRTUAL:HOST[:ro]\""
+        )))
+    })?;
     if virt.is_empty() || host.is_empty() {
-        return Err(SandlockError::Sandbox(SandboxError::Invalid(
-            format!("invalid mount spec {s:?}; both VIRTUAL and HOST must be non-empty"),
-        )));
+        return Err(SandlockError::Sandbox(SandboxError::Invalid(format!(
+            "invalid mount spec {s:?}; both VIRTUAL and HOST must be non-empty"
+        ))));
     }
     Ok((PathBuf::from(virt), PathBuf::from(host), read_only))
 }
@@ -596,11 +696,20 @@ pub fn format_net_rule(rule: &crate::sandbox::NetRule) -> String {
     match rule.protocol {
         Protocol::Icmp => format!("icmp://{}", target),
         proto => {
-            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "tcp://" };
+            let scheme = if matches!(proto, Protocol::Udp) {
+                "udp://"
+            } else {
+                "tcp://"
+            };
             if rule.all_ports {
                 format!("{}{}", scheme, target)
             } else {
-                let ports: String = rule.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                let ports: String = rule
+                    .ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 format!("{}{}:{}", scheme, target, ports)
             }
         }
@@ -659,7 +768,11 @@ fn dedup_rendered(rules: impl Iterator<Item = String>) -> Vec<String> {
 pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput {
     let mut mount_specs: Vec<String> = Vec::new();
     for (virt, host) in &s.fs_mount {
-        let suffix = if s.fs_mount_ro.iter().any(|d| d == virt) { ":ro" } else { "" };
+        let suffix = if s.fs_mount_ro.iter().any(|d| d == virt) {
+            ":ro"
+        } else {
+            ""
+        };
         // Render paths lossy; profile mount specs are strings.
         mount_specs.push(format!(
             "{}:{}{}",
@@ -713,7 +826,9 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
         },
         filesystem: FilesystemSection {
             // The COW upper dir grant is spawn-time plumbing, not user policy.
-            read: s.fs_readable.iter()
+            read: s
+                .fs_readable
+                .iter()
                 .filter(|p| Some(p.as_path()) != s.cow_upper.as_deref())
                 .cloned()
                 .collect(),
@@ -757,17 +872,21 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
 #[cfg(feature = "profiles")]
 pub fn sandbox_to_toml(s: &Sandbox, extra_denied: &[String]) -> Result<String, SandlockError> {
     let input = sandbox_to_profile(s, extra_denied);
-    toml::to_string_pretty(&input).map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
-        format!("TOML serialize error: {e}"),
-    )))
+    toml::to_string_pretty(&input).map_err(|e| {
+        SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!(
+            "TOML serialize error: {e}"
+        )))
+    })
 }
 
 /// Serialize a `Sandbox` to a pretty JSON string (the `config` verb body).
 pub fn sandbox_to_json(s: &Sandbox, extra_denied: &[String]) -> Result<String, SandlockError> {
     let input = sandbox_to_profile(s, extra_denied);
-    serde_json::to_string_pretty(&input).map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
-        format!("JSON serialize error: {e}"),
-    )))
+    serde_json::to_string_pretty(&input).map_err(|e| {
+        SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!(
+            "JSON serialize error: {e}"
+        )))
+    })
 }
 
 /// Named profiles live only under the user's home, resolved as `${HOME}` is
@@ -778,10 +897,11 @@ pub fn profile_dir() -> Result<PathBuf, SandlockError> {
 }
 #[cfg(feature = "profiles")]
 fn parse_toml(content: &str) -> Result<ProfileInput, SandlockError> {
-    toml::from_str(content)
-        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
-            format!("TOML parse error: {e}"),
+    toml::from_str(content).map_err(|e| {
+        SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!(
+            "TOML parse error: {e}"
         )))
+    })
 }
 
 /// Parse a TOML profile string into a Sandbox + ProgramSpec.
@@ -800,20 +920,28 @@ pub fn resolve_profile(content: &str) -> Result<ResolvedProfile, SandlockError> 
 /// Load a profile by name.
 pub fn load_profile(name: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
     let path = profile_dir()?.join(format!("{}.toml", name));
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
-            format!("profile '{}': {}", name, e),
-        )))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!(
+            "profile '{}': {}",
+            name, e
+        )))
+    })?;
     parse_profile(&content)
 }
 
 /// List available profile names.
 pub fn list_profiles() -> Result<Vec<String>, SandlockError> {
     let dir = profile_dir()?;
-    if !dir.exists() { return Ok(Vec::new()); }
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!("read dir: {}", e))))? {
+    for entry in std::fs::read_dir(&dir).map_err(|e| {
+        SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!(
+            "read dir: {}",
+            e
+        )))
+    })? {
         if let Ok(entry) = entry {
             if let Some(name) = entry.path().file_stem() {
                 if entry.path().extension().map_or(false, |e| e == "toml") {
@@ -842,13 +970,16 @@ mod tests {
             allow_bind = [8080, "9000-9001"]
         "#;
         let json = serde_json::to_value(resolve_profile(toml).unwrap()).unwrap();
-        assert_eq!(json, serde_json::json!({
-            "fs_readable": ["/usr"],
-            "fs_mount": {"/v": "/c", "/u": "/d"},
-            "fs_mount_ro": {"/w": "/a:b"},
-            "max_memory": "64M",
-            "net_allow_bind": [8080, "9000-9001"],
-        }));
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "fs_readable": ["/usr"],
+                "fs_mount": {"/v": "/c", "/u": "/d"},
+                "fs_mount_ro": {"/w": "/a:b"},
+                "max_memory": "64M",
+                "net_allow_bind": [8080, "9000-9001"],
+            })
+        );
     }
 
     #[test]
@@ -904,8 +1035,14 @@ mod tests {
             args = ["${HOME}"]
         "#;
         let (policy, _spec) = parse_profile(toml).unwrap();
-        assert_eq!(policy.fs_readable, vec![PathBuf::from(format!("{home}/src"))]);
-        assert_eq!(policy.fs_writable, vec![PathBuf::from(format!("{home}/out"))]);
+        assert_eq!(
+            policy.fs_readable,
+            vec![PathBuf::from(format!("{home}/src"))]
+        );
+        assert_eq!(
+            policy.fs_writable,
+            vec![PathBuf::from(format!("{home}/out"))]
+        );
         assert_eq!(policy.cwd, Some(PathBuf::from(format!("{home}/src"))));
     }
 
@@ -994,8 +1131,14 @@ mod tests {
         "#;
         let input: ProfileInput = toml::from_str(toml).unwrap();
         let (policy, _spec) = parse_input(input).unwrap();
-        assert_eq!(policy.http_ca.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
-        assert_eq!(policy.http_key.as_deref(), Some(std::path::Path::new("/tmp/ca.key")));
+        assert_eq!(
+            policy.http_ca.as_deref(),
+            Some(std::path::Path::new("/tmp/ca.pem"))
+        );
+        assert_eq!(
+            policy.http_key.as_deref(),
+            Some(std::path::Path::new("/tmp/ca.key"))
+        );
     }
 
     #[cfg(feature = "http")]
@@ -1013,7 +1156,10 @@ mod tests {
         let input: ProfileInput = toml::from_str(toml).unwrap();
         let (policy, _prog) = parse_input(input).unwrap();
         assert_eq!(policy.http_inject_ca.len(), 1);
-        assert_eq!(policy.http_ca_out.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
+        assert_eq!(
+            policy.http_ca_out.as_deref(),
+            Some(std::path::Path::new("/tmp/ca.pem"))
+        );
     }
 
     #[test]
@@ -1034,11 +1180,17 @@ mod tests {
     #[test]
     fn parse_mount_spec_ro_suffix() {
         let (v, h, ro) = parse_mount_spec("/work:/host").unwrap();
-        assert_eq!((v.to_str().unwrap(), h.to_str().unwrap(), ro), ("/work", "/host", false));
+        assert_eq!(
+            (v.to_str().unwrap(), h.to_str().unwrap(), ro),
+            ("/work", "/host", false)
+        );
         let (_, _, ro) = parse_mount_spec("/work:/host:rw").unwrap();
         assert!(!ro);
         let (v, h, ro) = parse_mount_spec("/work:/host:ro").unwrap();
-        assert_eq!((v.to_str().unwrap(), h.to_str().unwrap(), ro), ("/work", "/host", true));
+        assert_eq!(
+            (v.to_str().unwrap(), h.to_str().unwrap(), ro),
+            ("/work", "/host", true)
+        );
         // a host path containing colons still parses; only a trailing :ro/:rw is an option
         let (_, h, ro) = parse_mount_spec("/v:/a:b:ro").unwrap();
         assert_eq!((h.to_str().unwrap(), ro), ("/a:b", true));
@@ -1128,7 +1280,10 @@ mod tests {
         "#;
 
         let (policy, spec) = parse_profile(toml).unwrap();
-        assert_eq!(spec.exec.as_deref(), Some(std::path::Path::new("/usr/bin/redis-cli")));
+        assert_eq!(
+            spec.exec.as_deref(),
+            Some(std::path::Path::new("/usr/bin/redis-cli"))
+        );
         assert_eq!(spec.args.len(), 4);
         assert!(policy.allows_sysv_ipc());
         assert_eq!(policy.extra_deny_syscalls.len(), 2);
@@ -1349,7 +1504,8 @@ fn profiles_disabled() -> SandlockError {
     crate::error::SandboxError::FeatureDisabled {
         what: "TOML profiles".into(),
         feature: "profiles",
-    }.into()
+    }
+    .into()
 }
 
 #[cfg(not(feature = "profiles"))]

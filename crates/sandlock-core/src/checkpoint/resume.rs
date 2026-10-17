@@ -74,7 +74,13 @@ impl StubChannel {
         let go_r = relocate_above(pipefd[0], STUB_FD + 1)?;
         let go_w = relocate_above(pipefd[1], STUB_FD + 1)?;
         let stub = relocate_above(stub_memfd()?, STUB_FD + 1)?;
-        Ok(StubChannel { ctrl, ready, go_r, go_w, stub })
+        Ok(StubChannel {
+            ctrl,
+            ready,
+            go_r,
+            go_w,
+            stub,
+        })
     }
 
     /// The `(child fd, supervisor fd)` pairs for `Sandbox`'s `extra_fds`.
@@ -106,7 +112,11 @@ fn memfd_with(bytes: &[u8]) -> io::Result<RawFd> {
     let mut off = 0usize;
     while off < bytes.len() {
         let n = unsafe {
-            libc::write(fd, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off)
+            libc::write(
+                fd,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
         };
         if n <= 0 {
             let e = io::Error::last_os_error();
@@ -128,7 +138,8 @@ fn memfd_with(bytes: &[u8]) -> io::Result<RawFd> {
 fn stub_memfd() -> io::Result<RawFd> {
     use std::os::fd::IntoRawFd;
 
-    crate::sys::syscall::sealed_exec_memfd("sandlock-restore-stub", STUB_ELF).map(IntoRawFd::into_raw_fd)
+    crate::sys::syscall::sealed_exec_memfd("sandlock-restore-stub", STUB_ELF)
+        .map(IntoRawFd::into_raw_fd)
 }
 
 /// Move `fd` to a number at or above `floor` and take ownership of it.
@@ -184,7 +195,11 @@ fn write_child_mem(pid: i32, addr: u64, bytes: &[u8]) -> io::Result<()> {
 fn wait_readable(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
     loop {
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let n = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as i32) };
         if n < 0 {
@@ -222,7 +237,11 @@ fn write_all(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     let mut done = 0usize;
     while done < bytes.len() {
         let n = unsafe {
-            libc::write(fd, bytes[done..].as_ptr() as *const libc::c_void, bytes.len() - done)
+            libc::write(
+                fd,
+                bytes[done..].as_ptr() as *const libc::c_void,
+                bytes.len() - done,
+            )
         };
         if n < 0 {
             let e = io::Error::last_os_error();
@@ -271,7 +290,10 @@ pub(crate) fn finish_restore(
 
     for (start, bytes) in &plan.anon {
         write_child_mem(pid, *start, bytes).map_err(|e| {
-            child_err(format!("restore fill region {start:#x} ({} bytes): {e}", bytes.len()))
+            child_err(format!(
+                "restore fill region {start:#x} ({} bytes): {e}",
+                bytes.len()
+            ))
         })?;
     }
 
@@ -311,8 +333,13 @@ mod tests {
         // A control fd allocated at 3 to 6 would be dup2'd onto itself in the
         // child, which leaves FD_CLOEXEC set and closes it at execve.
         let ch = StubChannel::new(b"blob").expect("channel");
-        for fd in [ch.ctrl.as_raw_fd(), ch.ready.as_raw_fd(),
-                   ch.go_r.as_raw_fd(), ch.go_w.as_raw_fd(), ch.stub.as_raw_fd()] {
+        for fd in [
+            ch.ctrl.as_raw_fd(),
+            ch.ready.as_raw_fd(),
+            ch.go_r.as_raw_fd(),
+            ch.go_w.as_raw_fd(),
+            ch.stub.as_raw_fd(),
+        ] {
             assert!(fd > STUB_FD, "fd {fd} must sit above the fixed control fds");
         }
         let mut pairs = ch.extra_fds();
@@ -328,7 +355,10 @@ mod tests {
         let ch = StubChannel::new(b"blob").expect("channel");
         let fd = ch.stub.as_raw_fd();
         let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-        assert!(seals & libc::F_SEAL_WRITE != 0, "stub memfd must be write-sealed");
+        assert!(
+            seals & libc::F_SEAL_WRITE != 0,
+            "stub memfd must be write-sealed"
+        );
         let got = std::fs::read(format!("/proc/self/fd/{fd}")).expect("read stub memfd");
         assert_eq!(got, STUB_ELF);
     }
@@ -338,7 +368,11 @@ mod tests {
         let ch = StubChannel::new(b"hello blob").expect("channel");
         let mut buf = [0u8; 16];
         let n = unsafe {
-            libc::read(ch.ctrl.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            libc::read(
+                ch.ctrl.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
         };
         assert_eq!(n, 10, "the stub must find the blob at offset 0");
         assert_eq!(&buf[..10], b"hello blob");
@@ -369,11 +403,16 @@ mod tests {
                 libc::close(ready[0]);
                 libc::close(go[1]);
                 let p = libc::mmap(
-                    std::ptr::null_mut(), 4096,
+                    std::ptr::null_mut(),
+                    4096,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
                 );
-                if p == libc::MAP_FAILED { libc::_exit(1) };
+                if p == libc::MAP_FAILED {
+                    libc::_exit(1)
+                };
                 // Announce the address, then block until the parent hangs up,
                 // so the write lands while the mapping is live.
                 let addr = p as u64;
@@ -383,23 +422,34 @@ mod tests {
                 libc::_exit(*(p as *const u8) as i32);
             }
         }
-        unsafe { libc::close(ready[1]); libc::close(go[0]) };
-        let mut addr_buf = [0u8; 8];
-        let n = unsafe {
-            libc::read(ready[0], addr_buf.as_mut_ptr() as *mut libc::c_void, 8)
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(go[0])
         };
-        assert_eq!(n, 8, "the child must report where the kernel mapped its page");
+        let mut addr_buf = [0u8; 8];
+        let n = unsafe { libc::read(ready[0], addr_buf.as_mut_ptr() as *mut libc::c_void, 8) };
+        assert_eq!(
+            n, 8,
+            "the child must report where the kernel mapped its page"
+        );
         let addr = u64::from_le_bytes(addr_buf);
 
         let res = write_child_mem(child, addr, &[0x5Au8; 4096]);
 
-        unsafe { libc::close(go[1]); libc::close(ready[0]) };
+        unsafe {
+            libc::close(go[1]);
+            libc::close(ready[0])
+        };
         let mut st = 0i32;
         unsafe { libc::waitpid(child, &mut st, 0) };
 
         res.expect("process_vm_writev into the child");
         assert!(libc::WIFEXITED(st), "child exited normally");
-        assert_eq!(libc::WEXITSTATUS(st), 0x5A, "the child observed the filled page");
+        assert_eq!(
+            libc::WEXITSTATUS(st),
+            0x5A,
+            "the child observed the filled page"
+        );
     }
 
     #[test]
@@ -482,8 +532,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn restore_stub_reconstructs_a_synthetic_image() {
-        use crate::checkpoint::{Checkpoint, MemoryMap, MemorySegment, ProcessState};
         use crate::checkpoint::restore_blob;
+        use crate::checkpoint::{Checkpoint, MemoryMap, MemorySegment, ProcessState};
 
         const CODE: u64 = 0x4500_0000_0000;
         const STACK: u64 = 0x4500_0001_0000;
@@ -503,24 +553,29 @@ mod tests {
         {
             let c = &mut code_page;
             let mut w = 0usize;
-            let mut put = |bytes: &[u8]| { c[w..w + bytes.len()].copy_from_slice(bytes); w += bytes.len(); };
-            put(&[0xbf]); put(&(OUT_FD as u32).to_le_bytes());     // mov edi, OUT_FD
-            put(&[0x48, 0xbe]); put(&(CODE + 64).to_le_bytes());   // mov rsi, CODE+64
-            put(&[0xba, 0x01, 0x00, 0x00, 0x00]);                  // mov edx, 1
-            put(&[0xb8, 0x01, 0x00, 0x00, 0x00]);                  // mov eax, 1 (write)
-            put(&[0x0f, 0x05]);                                    // syscall
-            put(&[0x89, 0xc7]);                                    // mov edi, eax
-            put(&[0xb8, 0x3c, 0x00, 0x00, 0x00]);                  // mov eax, 60 (exit)
-            put(&[0x0f, 0x05]);                                    // syscall
+            let mut put = |bytes: &[u8]| {
+                c[w..w + bytes.len()].copy_from_slice(bytes);
+                w += bytes.len();
+            };
+            put(&[0xbf]);
+            put(&(OUT_FD as u32).to_le_bytes()); // mov edi, OUT_FD
+            put(&[0x48, 0xbe]);
+            put(&(CODE + 64).to_le_bytes()); // mov rsi, CODE+64
+            put(&[0xba, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+            put(&[0xb8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (write)
+            put(&[0x0f, 0x05]); // syscall
+            put(&[0x89, 0xc7]); // mov edi, eax
+            put(&[0xb8, 0x3c, 0x00, 0x00, 0x00]); // mov eax, 60 (exit)
+            put(&[0x0f, 0x05]); // syscall
         }
         code_page[64] = SENTINEL;
 
         let mut regs = vec![0u64; 27];
-        regs[16] = CODE;          // rip
-        regs[17] = 0x33;          // cs (user 64-bit)
-        regs[18] = 0x202;         // eflags (IF set)
+        regs[16] = CODE; // rip
+        regs[17] = 0x33; // cs (user 64-bit)
+        regs[18] = 0x202; // eflags (IF set)
         regs[19] = STACK + 0xF00; // rsp
-        regs[20] = 0x2b;          // ss (user data)
+        regs[20] = 0x2b; // ss (user data)
 
         // The code page is r-x in the checkpoint, so the stub has to map it
         // writable for the fill and mprotect it back before handing control over.
@@ -534,12 +589,30 @@ mod tests {
                 regs,
                 fpregs: Vec::new(),
                 memory_maps: vec![
-                    MemoryMap { start: CODE, end: CODE + PAGE, perms: "r-xp".into(), offset: 0, path: None },
-                    MemoryMap { start: STACK, end: STACK + PAGE, perms: "rw-p".into(), offset: 0, path: None },
+                    MemoryMap {
+                        start: CODE,
+                        end: CODE + PAGE,
+                        perms: "r-xp".into(),
+                        offset: 0,
+                        path: None,
+                    },
+                    MemoryMap {
+                        start: STACK,
+                        end: STACK + PAGE,
+                        perms: "rw-p".into(),
+                        offset: 0,
+                        path: None,
+                    },
                 ],
                 memory_data: vec![
-                    MemorySegment { start: CODE, data: code_page },
-                    MemorySegment { start: STACK, data: vec![0u8; PAGE as usize] },
+                    MemorySegment {
+                        start: CODE,
+                        data: code_page,
+                    },
+                    MemorySegment {
+                        start: STACK,
+                        data: vec![0u8; PAGE as usize],
+                    },
                 ],
             },
             fd_table: Vec::new(),
@@ -582,7 +655,11 @@ mod tests {
                 let argv = [stub_name.as_ptr(), std::ptr::null()];
                 let envp: [*const libc::c_char; 1] = [std::ptr::null()];
                 libc::syscall(
-                    libc::SYS_execveat, STUB_FD, c"".as_ptr(), argv.as_ptr(), envp.as_ptr(),
+                    libc::SYS_execveat,
+                    STUB_FD,
+                    c"".as_ptr(),
+                    argv.as_ptr(),
+                    envp.as_ptr(),
                     libc::AT_EMPTY_PATH,
                 );
                 libc::_exit(127);
@@ -616,7 +693,10 @@ mod tests {
             "restored code must write exactly one sentinel byte; child exit status \
              {st:#x} (payload exits with write()'s return value), /proc syscall {stalled_in}",
         );
-        assert_eq!(got[0], SENTINEL, "the restored program ran from its checkpoint rip");
+        assert_eq!(
+            got[0], SENTINEL,
+            "the restored program ran from its checkpoint rip"
+        );
     }
 
     /// End-to-end proof for riscv64: same protocol as the x86_64 test above,
@@ -625,8 +705,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "riscv64")]
     fn restore_stub_reconstructs_a_synthetic_image() {
-        use crate::checkpoint::{Checkpoint, MemoryMap, MemorySegment, ProcessState};
         use crate::checkpoint::restore_blob;
+        use crate::checkpoint::{Checkpoint, MemoryMap, MemorySegment, ProcessState};
 
         // riscv64 Sv39 gives 256 GiB of user virtual space, so the addresses
         // must stay below 0x40_0000_0000.  Pick a region that stays clear of
@@ -656,7 +736,10 @@ mod tests {
         {
             let c = &mut code_page;
             let mut w = 0usize;
-            let mut put = |bytes: &[u8]| { c[w..w + bytes.len()].copy_from_slice(bytes); w += bytes.len(); };
+            let mut put = |bytes: &[u8]| {
+                c[w..w + bytes.len()].copy_from_slice(bytes);
+                w += bytes.len();
+            };
             put(&0x00A00513u32.to_le_bytes()); // addi a0, zero, 10
             put(&0x200005B7u32.to_le_bytes()); // lui  a1, 0x20000
             put(&0x04058593u32.to_le_bytes()); // addi a1, a1, 0x40
@@ -671,8 +754,8 @@ mod tests {
         // riscv64 user_regs_struct: 32 × u64.
         // Index 0=pc, 2=sp; all others zero.
         let mut regs = vec![0u64; 32];
-        regs[0] = CODE;                 // pc
-        regs[2] = STACK + 0xF00;        // sp
+        regs[0] = CODE; // pc
+        regs[2] = STACK + 0xF00; // sp
 
         // The code page is r-x in the checkpoint, so the stub has to map it
         // writable for the fill and mprotect it back before handing control over.
@@ -686,12 +769,30 @@ mod tests {
                 regs,
                 fpregs: Vec::new(),
                 memory_maps: vec![
-                    MemoryMap { start: CODE, end: CODE + PAGE, perms: "r-xp".into(), offset: 0, path: None },
-                    MemoryMap { start: STACK, end: STACK + PAGE, perms: "rw-p".into(), offset: 0, path: None },
+                    MemoryMap {
+                        start: CODE,
+                        end: CODE + PAGE,
+                        perms: "r-xp".into(),
+                        offset: 0,
+                        path: None,
+                    },
+                    MemoryMap {
+                        start: STACK,
+                        end: STACK + PAGE,
+                        perms: "rw-p".into(),
+                        offset: 0,
+                        path: None,
+                    },
                 ],
                 memory_data: vec![
-                    MemorySegment { start: CODE, data: code_page },
-                    MemorySegment { start: STACK, data: vec![0u8; PAGE as usize] },
+                    MemorySegment {
+                        start: CODE,
+                        data: code_page,
+                    },
+                    MemorySegment {
+                        start: STACK,
+                        data: vec![0u8; PAGE as usize],
+                    },
                 ],
             },
             fd_table: Vec::new(),
@@ -728,7 +829,11 @@ mod tests {
                 let argv = [stub_name.as_ptr(), std::ptr::null()];
                 let envp: [*const libc::c_char; 1] = [std::ptr::null()];
                 libc::syscall(
-                    libc::SYS_execveat, STUB_FD, c"".as_ptr(), argv.as_ptr(), envp.as_ptr(),
+                    libc::SYS_execveat,
+                    STUB_FD,
+                    c"".as_ptr(),
+                    argv.as_ptr(),
+                    envp.as_ptr(),
                     libc::AT_EMPTY_PATH,
                 );
                 libc::_exit(127);
@@ -757,6 +862,9 @@ mod tests {
             "restored code must write exactly one sentinel byte; child exit status \
              {st:#x} (payload exits with write()'s return value), /proc syscall {stalled_in}",
         );
-        assert_eq!(got[0], SENTINEL, "the restored program ran from its checkpoint pc");
+        assert_eq!(
+            got[0], SENTINEL,
+            "the restored program ran from its checkpoint pc"
+        );
     }
 }

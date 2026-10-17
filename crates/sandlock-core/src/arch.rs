@@ -46,9 +46,9 @@ fn sysno(name: &str) -> Option<i64> {
 macro_rules! legacy_syscall {
     ($fn:ident, $name:literal) => {
         #[doc = concat!(
-            "`", $name, "` syscall number on this architecture, or `None` if ",
-            "the generic syscall ABI (aarch64, riscv64) omits it."
-        )]
+                    "`", $name, "` syscall number on this architecture, or `None` if ",
+                    "the generic syscall ABI (aarch64, riscv64) omits it."
+                )]
         pub fn $fn() -> Option<i64> {
             sysno($name)
         }
@@ -162,7 +162,10 @@ mod tests {
             assert_eq!(sys_open(), None);
             assert_eq!(sys_fork(), None);
             assert_eq!(sys_vfork(), None);
-            assert_eq!(fork_like_syscalls(), vec![libc::SYS_clone, libc::SYS_clone3]);
+            assert_eq!(
+                fork_like_syscalls(),
+                vec![libc::SYS_clone, libc::SYS_clone3]
+            );
         }
     }
 

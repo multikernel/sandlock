@@ -8,6 +8,20 @@ on:
   workflow_dispatch:
 
 jobs:
+  formatting:
+    name: Rust formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust formatter
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
   rust:
     name: Rust tests (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}

@@ -6,14 +6,17 @@
 //! inter-stage pipes.
 
 use sandlock_core::sandbox::BranchAction;
-use sandlock_core::{AbortReason, ChangeKind, Sandbox, Stage, Transaction, TxnDisposition, TxnError};
+use sandlock_core::{
+    AbortReason, ChangeKind, Sandbox, Stage, Transaction, TxnDisposition, TxnError,
+};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sandlock-test-txn-{}-{}", name, std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("sandlock-test-txn-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::create_dir_all(&dir);
     dir
@@ -24,7 +27,11 @@ fn temp_dir(name: &str) -> PathBuf {
 /// `on_exit`/`on_error` are left at their defaults (the transaction owns commit).
 fn stage_policy(workdir: &Path) -> Sandbox {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(workdir)
         .workdir(workdir)
@@ -37,7 +44,11 @@ fn stage_policy(workdir: &Path) -> Sandbox {
 /// to skip the behavioral tests EXPLICITLY, so a real regression in the
 /// transaction logic hard-fails instead of hiding behind a tolerated error.
 async fn sandbox_available() -> bool {
-    let mut sb = Sandbox::builder().fs_read("/usr").fs_read("/bin").build().unwrap();
+    let mut sb = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .build()
+        .unwrap();
     matches!(sb.run(&["true"]).await, Ok(r) if r.success())
 }
 
@@ -67,10 +78,20 @@ async fn test_txn_commits_on_success() {
     .await
     .expect("transaction should run");
 
-    assert!(outcome.committed(), "transaction should commit; disposition: {:?}", outcome.disposition);
+    assert!(
+        outcome.committed(),
+        "transaction should commit; disposition: {:?}",
+        outcome.disposition
+    );
     assert_eq!(outcome.stages.len(), 3, "all three stages should have run");
-    assert!(workdir.join("a.txt").exists(), "a.txt must be committed to workdir");
-    assert!(workdir.join("b.txt").exists(), "b.txt must be committed to workdir");
+    assert!(
+        workdir.join("a.txt").exists(),
+        "a.txt must be committed to workdir"
+    );
+    assert!(
+        workdir.join("b.txt").exists(),
+        "b.txt must be committed to workdir"
+    );
     assert_eq!(fs::read_to_string(workdir.join("a.txt")).unwrap(), "plan\n");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -96,7 +117,14 @@ async fn test_txn_stage_can_exec_what_an_earlier_stage_created() {
     let policy = stage_policy(&workdir);
 
     let outcome = Transaction::new([
-        Stage::new(&policy, &["sh", "-c", "printf '#!/bin/sh\\nexit 0\\n' > x.sh && chmod 755 x.sh"]),
+        Stage::new(
+            &policy,
+            &[
+                "sh",
+                "-c",
+                "printf '#!/bin/sh\\nexit 0\\n' > x.sh && chmod 755 x.sh",
+            ],
+        ),
         // `exec` so the stage's own status IS the exec's outcome: 126 when the
         // kernel refuses it, not a shell error swallowed into 1.
         Stage::new(&policy, &["sh", "-c", "exec ./x.sh"]),
@@ -106,11 +134,15 @@ async fn test_txn_stage_can_exec_what_an_earlier_stage_created() {
     .expect("transaction should run");
 
     assert_eq!(
-        outcome.disposition, TxnDisposition::Committed,
+        outcome.disposition,
+        TxnDisposition::Committed,
         "a stage must be able to exec a file an earlier stage created in the shared upper",
     );
     assert!(outcome.committed(), "the transaction should have committed");
-    assert!(workdir.join("x.sh").exists(), "x.sh must be committed to the workdir");
+    assert!(
+        workdir.join("x.sh").exists(),
+        "x.sh must be committed to the workdir"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -119,7 +151,10 @@ async fn test_txn_stage_can_exec_what_an_earlier_stage_created() {
 /// how far the stages have got from outside the transaction.
 fn upper_holds(storage: &Path, name: &str) -> bool {
     fs::read_dir(storage)
-        .map(|rd| rd.flatten().any(|e| e.path().join("upper").join(name).exists()))
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().join("upper").join(name).exists())
+        })
         .unwrap_or(false)
 }
 
@@ -141,9 +176,15 @@ async fn test_txn_waits_for_a_concurrent_commit_lock() {
     let workdir = temp_dir("commit-lock-wait-wd");
     let storage = temp_dir("commit-lock-wait-st");
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .build()
         .unwrap();
@@ -194,7 +235,10 @@ async fn test_txn_waits_for_a_concurrent_commit_lock() {
         outcome.disposition
     );
     assert_eq!(fs::read_to_string(workdir.join("a.txt")).unwrap(), "plan\n");
-    assert_eq!(fs::read_to_string(workdir.join("b.txt")).unwrap(), "built\n");
+    assert_eq!(
+        fs::read_to_string(workdir.join("b.txt")).unwrap(),
+        "built\n"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -213,9 +257,15 @@ async fn test_txn_preserves_the_upper_when_the_commit_lock_never_frees() {
     let workdir = temp_dir("lock-preserve-wd");
     let storage = temp_dir("lock-preserve-st");
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .build()
         .unwrap();
@@ -240,13 +290,21 @@ async fn test_txn_preserves_the_upper_when_the_commit_lock_never_frees() {
     drop(held);
 
     // All-or-nothing still holds on the workdir side: nothing was merged.
-    assert!(!workdir.join("a.txt").exists(), "nothing may be merged when the lock was never taken");
-    assert!(!workdir.join("b.txt").exists(), "nothing may be merged when the lock was never taken");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "nothing may be merged when the lock was never taken"
+    );
+    assert!(
+        !workdir.join("b.txt").exists(),
+        "nothing may be merged when the lock was never taken"
+    );
 
     // ...and the work itself survives, with its bytes, so it can still be
     // published out of band.
-    let branches: Vec<PathBuf> =
-        fs::read_dir(&storage).unwrap().map(|e| e.unwrap().path()).collect();
+    let branches: Vec<PathBuf> = fs::read_dir(&storage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
     assert_eq!(
         branches.len(),
         1,
@@ -266,13 +324,24 @@ async fn test_txn_preserves_the_upper_when_the_commit_lock_never_frees() {
     // The failure is typed as a CONFLICT — the retryable channel — not as a
     // stage or configuration failure, and it names the preserved upper.
     match &err {
-        TxnError::Conflict { workdir: wd, preserved_upper, .. } => {
+        TxnError::Conflict {
+            workdir: wd,
+            preserved_upper,
+            ..
+        } => {
             assert_eq!(wd, &workdir, "the conflict must name the contended workdir");
-            assert_eq!(preserved_upper, &upper, "the conflict must name the preserved upper");
+            assert_eq!(
+                preserved_upper, &upper,
+                "the conflict must name the preserved upper"
+            );
         }
         other => panic!("expected a commit-lock conflict, got: {other:?}"),
     }
-    assert_eq!(err.exit_code(), 75, "a conflict reports EX_TEMPFAIL: retry it");
+    assert_eq!(
+        err.exit_code(),
+        75,
+        "a conflict reports EX_TEMPFAIL: retry it"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -300,9 +369,15 @@ async fn test_txn_cancelled_during_the_commit_lock_wait_keeps_the_change_set() {
     let workdir = temp_dir("cancel-commit-wd");
     let storage = temp_dir("cancel-commit-st");
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .build()
         .unwrap();
@@ -334,7 +409,10 @@ async fn test_txn_cancelled_during_the_commit_lock_wait_keeps_the_change_set() {
                 early = &mut txn => panic!("the transaction finished while the lock was held: {early:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
-            assert!(std::time::Instant::now() < deadline, "stages never reached the commit");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stages never reached the commit"
+            );
         }
         // Grace for the last stage to be reaped and the commit to be entered.
         tokio::select! {
@@ -360,9 +438,17 @@ async fn test_txn_cancelled_during_the_commit_lock_wait_keeps_the_change_set() {
     };
     drop(held);
 
-    assert_eq!(preserved.len(), 1, "expected exactly one preserved branch, got {preserved:?}");
+    assert_eq!(
+        preserved.len(),
+        1,
+        "expected exactly one preserved branch, got {preserved:?}"
+    );
     let p = &preserved[0];
-    assert_eq!(p.workdir, workdir.canonicalize().unwrap(), "the marker must name the workdir");
+    assert_eq!(
+        p.workdir,
+        workdir.canonicalize().unwrap(),
+        "the marker must name the workdir"
+    );
     assert_eq!(
         p.reason,
         sandlock_core::PreserveReason::CommitDeferred,
@@ -381,8 +467,14 @@ async fn test_txn_cancelled_during_the_commit_lock_wait_keeps_the_change_set() {
         "the cancelled run's stage 1 write must survive",
     );
     // Nothing was published: all-or-nothing still holds on the workdir side.
-    assert!(!workdir.join("a.txt").exists(), "the lock was never taken, so nothing may be merged");
-    assert!(!workdir.join("b.txt").exists(), "the lock was never taken, so nothing may be merged");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "the lock was never taken, so nothing may be merged"
+    );
+    assert!(
+        !workdir.join("b.txt").exists(),
+        "the lock was never taken, so nothing may be merged"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -410,7 +502,10 @@ async fn test_txn_aborts_on_stage_failure() {
     .await
     .expect("transaction should run");
 
-    assert!(!outcome.committed(), "a failing stage must abort the transaction");
+    assert!(
+        !outcome.committed(),
+        "a failing stage must abort the transaction"
+    );
     // The reason is typed: a caller can tell WHICH stage failed and how, with no
     // string matching.
     assert_eq!(
@@ -422,12 +517,22 @@ async fn test_txn_aborts_on_stage_failure() {
         "abort must name the failing stage and its status",
     );
     assert_eq!(
-        outcome.exit_code(), 1,
+        outcome.exit_code(),
+        1,
         "the outcome reports the failing stage's own exit code",
     );
-    assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after abort");
-    assert!(!workdir.join("b.txt").exists(), "b.txt must NOT leak after abort");
-    assert_eq!(fs::read_to_string(workdir.join("existing.txt")).unwrap(), "original\n");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "a.txt must NOT leak after abort"
+    );
+    assert!(
+        !workdir.join("b.txt").exists(),
+        "b.txt must NOT leak after abort"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("existing.txt")).unwrap(),
+        "original\n"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -443,9 +548,15 @@ async fn test_txn_reclaims_upper() {
     let workdir = temp_dir("reclaim-wd");
     let storage = temp_dir("reclaim-st");
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .build()
         .unwrap();
@@ -455,18 +566,30 @@ async fn test_txn_reclaims_upper() {
         Stage::new(&policy, &["sh", "-c", "echo x > a.txt"]),
         Stage::new(&policy, &["sh", "-c", "exit 1"]),
     ])
-    .run(None).await.expect("transaction should run");
+    .run(None)
+    .await
+    .expect("transaction should run");
     assert!(!aborted.committed());
-    assert_eq!(branch_count(&storage), 0, "aborted transaction must reclaim its upper from the storage dir");
+    assert_eq!(
+        branch_count(&storage),
+        0,
+        "aborted transaction must reclaim its upper from the storage dir"
+    );
 
     // Commit path: also reclaimed after the merge.
     let committed = Transaction::new([
         Stage::new(&policy, &["sh", "-c", "echo y > b.txt"]),
         Stage::new(&policy, &["sh", "-c", "cat b.txt"]),
     ])
-    .run(None).await.expect("transaction should run");
+    .run(None)
+    .await
+    .expect("transaction should run");
     assert!(committed.committed());
-    assert_eq!(branch_count(&storage), 0, "committed transaction must reclaim its upper from the storage dir");
+    assert_eq!(
+        branch_count(&storage),
+        0,
+        "committed transaction must reclaim its upper from the storage dir"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -494,14 +617,20 @@ async fn test_txn_timeout_aborts_and_keeps_completed_stage_results() {
     .expect("transaction should run");
 
     assert!(!outcome.committed(), "a timed-out transaction must abort");
-    assert_eq!(outcome.disposition, TxnDisposition::Aborted(AbortReason::TimedOut));
+    assert_eq!(
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::TimedOut)
+    );
     assert_eq!(
         outcome.stages.len(),
         1,
         "the first stage completed before the deadline; its result must survive the cancellation",
     );
     assert!(outcome.stages[0].success(), "the completed stage exited 0");
-    assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after a timeout abort");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "a.txt must NOT leak after a timeout abort"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -538,8 +667,13 @@ async fn test_txn_stage_failure_is_not_masked_by_a_backgrounded_descendant() {
     // backgrounded job's stdin from /dev/null, so without it the descendant never
     // launches and never holds the stderr pipe — the scenario this test needs.
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev/null")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev/null")
         .fs_write(&workdir)
         .workdir(&workdir)
         .cwd(&workdir)
@@ -567,7 +701,10 @@ async fn test_txn_stage_failure_is_not_masked_by_a_backgrounded_descendant() {
     .expect("transaction should run");
     let elapsed = start.elapsed();
 
-    assert!(!outcome.committed(), "a failing stage must abort the transaction");
+    assert!(
+        !outcome.committed(),
+        "a failing stage must abort the transaction"
+    );
     assert_eq!(
         outcome.disposition,
         TxnDisposition::Aborted(AbortReason::StageFailed {
@@ -576,9 +713,16 @@ async fn test_txn_stage_failure_is_not_masked_by_a_backgrounded_descendant() {
         }),
         "the stage's own failure must be reported, not TimedOut from a hung drain",
     );
-    assert_eq!(outcome.stages.len(), 2, "both stages' results must be recorded");
+    assert_eq!(
+        outcome.stages.len(),
+        2,
+        "both stages' results must be recorded"
+    );
     let stderr = String::from_utf8_lossy(outcome.stages[1].stderr.as_deref().unwrap_or(&[]));
-    assert!(stderr.contains("boom"), "the failing stage's stderr must be captured, got: {stderr:?}");
+    assert!(
+        stderr.contains("boom"),
+        "the failing stage's stderr must be captured, got: {stderr:?}"
+    );
     assert!(
         elapsed < Duration::from_secs(6),
         "must return promptly once the stage exits, not wait out the deadline; took {elapsed:?}",
@@ -604,8 +748,14 @@ async fn test_txn_reports_changes_on_commit_and_abort() {
         Stage::new(&p_c, &["sh", "-c", "echo new > added.txt"]),
         Stage::new(&p_c, &["sh", "-c", "echo after > existing.txt"]),
     ])
-    .run(None).await.expect("transaction should run");
-    assert!(committed.committed(), "disposition: {:?}", committed.disposition);
+    .run(None)
+    .await
+    .expect("transaction should run");
+    assert!(
+        committed.committed(),
+        "disposition: {:?}",
+        committed.disposition
+    );
 
     let mut got: Vec<(ChangeKind, String)> = committed
         .changes
@@ -629,14 +779,23 @@ async fn test_txn_reports_changes_on_commit_and_abort() {
         Stage::new(&p_a, &["sh", "-c", "echo new > added.txt"]),
         Stage::new(&p_a, &["sh", "-c", "exit 1"]),
     ])
-    .run(None).await.expect("transaction should run");
+    .run(None)
+    .await
+    .expect("transaction should run");
     assert!(!aborted.committed());
     assert_eq!(
-        aborted.changes.iter().map(|c| c.path.display().to_string()).collect::<Vec<_>>(),
+        aborted
+            .changes
+            .iter()
+            .map(|c| c.path.display().to_string())
+            .collect::<Vec<_>>(),
         vec!["added.txt".to_string()],
         "an aborted transaction must still report what it discarded",
     );
-    assert!(!wd_a.join("added.txt").exists(), "nothing may be merged on abort");
+    assert!(
+        !wd_a.join("added.txt").exists(),
+        "nothing may be merged on abort"
+    );
 
     let _ = fs::remove_dir_all(&wd_c);
     let _ = fs::remove_dir_all(&wd_a);
@@ -656,7 +815,10 @@ async fn test_txn_dry_run_reports_without_committing() {
 
     let outcome = Transaction::new([
         Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
-        Stage::new(&policy, &["sh", "-c", "cat a.txt && echo after > existing.txt"]),
+        Stage::new(
+            &policy,
+            &["sh", "-c", "cat a.txt && echo after > existing.txt"],
+        ),
     ])
     .dry_run(None)
     .await
@@ -665,11 +827,18 @@ async fn test_txn_dry_run_reports_without_committing() {
     assert!(!outcome.committed(), "a dry run must never commit");
     assert_eq!(outcome.disposition, TxnDisposition::DryRun);
     assert_eq!(outcome.stages.len(), 2, "a dry run still runs every stage");
-    let mut paths: Vec<String> = outcome.changes.iter().map(|c| c.path.display().to_string()).collect();
+    let mut paths: Vec<String> = outcome
+        .changes
+        .iter()
+        .map(|c| c.path.display().to_string())
+        .collect();
     paths.sort();
     assert_eq!(paths, vec!["a.txt".to_string(), "existing.txt".to_string()]);
 
-    assert!(!workdir.join("a.txt").exists(), "a dry run must not create a.txt in the workdir");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "a dry run must not create a.txt in the workdir"
+    );
     assert_eq!(
         fs::read_to_string(workdir.join("existing.txt")).unwrap(),
         "before\n",
@@ -690,7 +859,9 @@ async fn test_txn_rejects_branch_action() {
     let workdir = temp_dir("guard-action");
     let plain = stage_policy(&workdir);
     let with_action = Sandbox::builder()
-        .fs_read("/usr").fs_write(&workdir).workdir(&workdir)
+        .fs_read("/usr")
+        .fs_write(&workdir)
+        .workdir(&workdir)
         .on_exit(BranchAction::Keep)
         .build()
         .unwrap();
@@ -699,13 +870,22 @@ async fn test_txn_rejects_branch_action() {
         Stage::new(&plain, &["true"]),
         Stage::new(&with_action, &["true"]),
     ])
-    .run(None).await.unwrap_err();
+    .run(None)
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, TxnError::Invalid(_)),
         "a misconfigured transaction must not masquerade as a stage or commit failure, got: {err:?}"
     );
-    assert_eq!(err.exit_code(), 78, "a configuration error reports EX_CONFIG");
-    assert!(err.to_string().contains("on_exit/on_error"), "expected the on_exit guardrail, got: {err}");
+    assert_eq!(
+        err.exit_code(),
+        78,
+        "a configuration error reports EX_CONFIG"
+    );
+    assert!(
+        err.to_string().contains("on_exit/on_error"),
+        "expected the on_exit guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -717,9 +897,18 @@ async fn test_txn_rejects_missing_workdir() {
     let with_wd = stage_policy(&workdir);
     let no_wd = Sandbox::builder().fs_read("/usr").build().unwrap();
 
-    let err = Transaction::new([Stage::new(&with_wd, &["true"]), Stage::new(&no_wd, &["true"])])
-        .run(None).await.unwrap_err().to_string();
-    assert!(err.contains("no workdir"), "expected the workdir guardrail, got: {err}");
+    let err = Transaction::new([
+        Stage::new(&with_wd, &["true"]),
+        Stage::new(&no_wd, &["true"]),
+    ])
+    .run(None)
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("no workdir"),
+        "expected the workdir guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -734,12 +923,25 @@ async fn test_txn_rejects_too_few_stages() {
     let workdir = temp_dir("guard-count");
     let policy = stage_policy(&workdir);
     let err = Transaction::new([Stage::new(&policy, &["true"])])
-        .run(None).await.unwrap_err().to_string();
-    assert!(err.contains("at least 2 stages"), "expected the stage-count guardrail, got: {err}");
+        .run(None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("at least 2 stages"),
+        "expected the stage-count guardrail, got: {err}"
+    );
 
     // An empty transaction must be rejected by the same check, not indexed into.
-    let err = Transaction::new([]).run(None).await.unwrap_err().to_string();
-    assert!(err.contains("at least 2 stages"), "expected the stage-count guardrail, got: {err}");
+    let err = Transaction::new([])
+        .run(None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("at least 2 stages"),
+        "expected the stage-count guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -753,8 +955,14 @@ async fn test_txn_rejects_mismatched_workdir() {
     let s0 = stage_policy(&wd1);
     let s1 = stage_policy(&wd2); // valid workdir, but not the same one
     let err = Transaction::new([Stage::new(&s0, &["true"]), Stage::new(&s1, &["true"])])
-        .run(None).await.unwrap_err().to_string();
-    assert!(err.contains("share one workdir"), "expected the shared-workdir guardrail, got: {err}");
+        .run(None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("share one workdir"),
+        "expected the shared-workdir guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&wd1);
     let _ = fs::remove_dir_all(&wd2);
@@ -768,13 +976,22 @@ async fn test_txn_rejects_no_supervisor() {
     let ok = stage_policy(&workdir);
     // Same workdir (so the workdir guardrail doesn't fire first) but no supervisor.
     let nosup = Sandbox::builder()
-        .fs_read("/usr").fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_read("/usr")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .no_supervisor(true)
         .build()
         .unwrap();
     let err = Transaction::new([Stage::new(&ok, &["true"]), Stage::new(&nosup, &["true"])])
-        .run(None).await.unwrap_err().to_string();
-    assert!(err.contains("no_supervisor"), "expected the no_supervisor guardrail, got: {err}");
+        .run(None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no_supervisor"),
+        "expected the no_supervisor guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -787,13 +1004,25 @@ async fn test_txn_rejects_chroot() {
     let rootfs = temp_dir("guard-chroot-root");
     let ok = stage_policy(&workdir);
     let with_chroot = Sandbox::builder()
-        .fs_read("/usr").fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_read("/usr")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .chroot(&rootfs)
         .build()
         .unwrap();
-    let err = Transaction::new([Stage::new(&ok, &["true"]), Stage::new(&with_chroot, &["true"])])
-        .run(None).await.unwrap_err().to_string();
-    assert!(err.contains("chroot"), "expected the chroot guardrail, got: {err}");
+    let err = Transaction::new([
+        Stage::new(&ok, &["true"]),
+        Stage::new(&with_chroot, &["true"]),
+    ])
+    .run(None)
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("chroot"),
+        "expected the chroot guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&rootfs);
@@ -807,13 +1036,22 @@ async fn test_txn_rejects_mismatched_fs_storage() {
     let storage = temp_dir("guard-store-st");
     let s0 = stage_policy(&workdir); // no fs_storage
     let s1 = Sandbox::builder()
-        .fs_read("/usr").fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_read("/usr")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .build()
         .unwrap();
     let err = Transaction::new([Stage::new(&s0, &["true"]), Stage::new(&s1, &["true"])])
-        .run(None).await.unwrap_err().to_string();
-    assert!(err.contains("fs_storage/max_disk"), "expected the fs_storage guardrail, got: {err}");
+        .run(None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("fs_storage/max_disk"),
+        "expected the fs_storage guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -827,9 +1065,18 @@ async fn test_txn_dry_run_enforces_the_same_guardrails() {
     let with_wd = stage_policy(&workdir);
     let no_wd = Sandbox::builder().fs_read("/usr").build().unwrap();
 
-    let err = Transaction::new([Stage::new(&with_wd, &["true"]), Stage::new(&no_wd, &["true"])])
-        .dry_run(None).await.unwrap_err().to_string();
-    assert!(err.contains("no workdir"), "dry_run must enforce the workdir guardrail, got: {err}");
+    let err = Transaction::new([
+        Stage::new(&with_wd, &["true"]),
+        Stage::new(&no_wd, &["true"]),
+    ])
+    .dry_run(None)
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("no workdir"),
+        "dry_run must enforce the workdir guardrail, got: {err}"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -851,15 +1098,27 @@ async fn test_txn_aborts_on_first_stage_failure() {
         Stage::new(&policy, &["sh", "-c", "echo b > b.txt"]),
         Stage::new(&policy, &["sh", "-c", "echo c > c.txt"]),
     ])
-    .run(None).await.expect("transaction should run");
+    .run(None)
+    .await
+    .expect("transaction should run");
 
     assert!(!outcome.committed(), "first-stage failure must abort");
     assert_eq!(
         outcome.disposition,
-        TxnDisposition::Aborted(AbortReason::StageFailed { index: 0, status: sandlock_core::ExitStatus::Code(1) }),
+        TxnDisposition::Aborted(AbortReason::StageFailed {
+            index: 0,
+            status: sandlock_core::ExitStatus::Code(1)
+        }),
     );
-    assert_eq!(outcome.stages.len(), 1, "transaction must stop at the failed stage — later stages must not run");
-    assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after abort");
+    assert_eq!(
+        outcome.stages.len(),
+        1,
+        "transaction must stop at the failed stage — later stages must not run"
+    );
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "a.txt must NOT leak after abort"
+    );
     assert!(!workdir.join("b.txt").exists(), "stage 2 must not have run");
     assert!(!workdir.join("c.txt").exists(), "stage 3 must not have run");
 
@@ -877,9 +1136,15 @@ async fn test_txn_timeout_reclaims_upper() {
     let workdir = temp_dir("to-reclaim-wd");
     let storage = temp_dir("to-reclaim-st");
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .build()
         .unwrap();
@@ -892,7 +1157,11 @@ async fn test_txn_timeout_reclaims_upper() {
     .await
     .expect("transaction should run");
     assert!(!outcome.committed(), "timed-out transaction must abort");
-    assert_eq!(branch_count(&storage), 0, "timed-out transaction must reclaim its upper from the storage dir");
+    assert_eq!(
+        branch_count(&storage),
+        0,
+        "timed-out transaction must reclaim its upper from the storage dir"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -919,10 +1188,21 @@ async fn test_txn_deletion_commit_applies_abort_preserves() {
     .run(None)
     .await
     .expect("transaction should run");
-    assert!(committed.committed(), "commit expected; disposition: {:?}", committed.disposition);
-    assert!(!wd_c.join("keep.txt").exists(), "committed deletion must remove keep.txt from the workdir");
+    assert!(
+        committed.committed(),
+        "commit expected; disposition: {:?}",
+        committed.disposition
+    );
+    assert!(
+        !wd_c.join("keep.txt").exists(),
+        "committed deletion must remove keep.txt from the workdir"
+    );
     assert_eq!(
-        committed.changes.iter().map(|c| (c.kind(), c.path.display().to_string())).collect::<Vec<_>>(),
+        committed
+            .changes
+            .iter()
+            .map(|c| (c.kind(), c.path.display().to_string()))
+            .collect::<Vec<_>>(),
         vec![(ChangeKind::Deleted, "keep.txt".to_string())],
         "a deletion must be reported as a change",
     );
@@ -940,7 +1220,8 @@ async fn test_txn_deletion_commit_applies_abort_preserves() {
     .expect("transaction should run");
     assert!(!aborted.committed(), "abort expected");
     assert_eq!(
-        fs::read_to_string(wd_a.join("keep.txt")).unwrap(), "orig\n",
+        fs::read_to_string(wd_a.join("keep.txt")).unwrap(),
+        "orig\n",
         "aborted deletion must leave keep.txt intact in the workdir",
     );
 
@@ -952,7 +1233,11 @@ async fn test_txn_deletion_commit_applies_abort_preserves() {
 /// can look at the upper from outside the run.
 fn stage_policy_in(workdir: &Path, storage: &Path) -> Sandbox {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
         .fs_write(workdir)
         .workdir(workdir)
@@ -1010,12 +1295,22 @@ async fn test_txn_merge_failure_preserves_the_unmerged_change_set() {
         Stage::new(&policy, &["sh", "-c", "echo new > added.txt"]),
     ]);
     make_read_only(&workdir.join("sub"));
-    let err = txn.run(None).await.expect_err("a merge that cannot be applied must fail the commit");
+    let err = txn
+        .run(None)
+        .await
+        .expect_err("a merge that cannot be applied must fail the commit");
     make_writable(&workdir.join("sub"));
 
     match &err {
-        TxnError::Merge { workdir: wd, preserved_upper, .. } => {
-            assert_eq!(wd, &workdir, "the merge failure must name the workdir it was merging into");
+        TxnError::Merge {
+            workdir: wd,
+            preserved_upper,
+            ..
+        } => {
+            assert_eq!(
+                wd, &workdir,
+                "the merge failure must name the workdir it was merging into"
+            );
             assert!(
                 preserved_upper.starts_with(&storage),
                 "the merge failure must name the preserved upper, got {preserved_upper:?}",
@@ -1040,14 +1335,21 @@ async fn test_txn_merge_failure_preserves_the_unmerged_change_set() {
     // The whole change set survives — the upper for the addition, the marker for
     // the deletion the upper cannot represent.
     let preserved = sandlock_core::list_preserved(&storage);
-    assert_eq!(preserved.len(), 1, "the unmerged change set must be preserved, got {preserved:?}");
+    assert_eq!(
+        preserved.len(),
+        1,
+        "the unmerged change set must be preserved, got {preserved:?}"
+    );
     let p = &preserved[0];
     assert_eq!(
         p.reason,
         sandlock_core::PreserveReason::MergeInterrupted,
         "a merge that started and did not finish must say so: the workdir may be partial",
     );
-    assert_eq!(p.workdir, workdir, "the marker must name the workdir the changes belong to");
+    assert_eq!(
+        p.workdir, workdir,
+        "the marker must name the workdir the changes belong to"
+    );
     assert_eq!(
         p.deleted,
         vec![PathBuf::from("sub/f.txt")],
@@ -1086,11 +1388,18 @@ async fn test_txn_branch_failure_runs_nothing_and_orphans_no_storage() {
 
     match &err {
         TxnError::Branch { workdir: wd, .. } => {
-            assert_eq!(wd, &workdir, "the branch failure must name the workdir it could not branch");
+            assert_eq!(
+                wd, &workdir,
+                "the branch failure must name the workdir it could not branch"
+            );
         }
         other => panic!("expected a branch-creation failure, got: {other:?}"),
     }
-    assert_eq!(err.exit_code(), 74, "a branch that could not be created is a commit-channel failure");
+    assert_eq!(
+        err.exit_code(),
+        74,
+        "a branch that could not be created is a commit-channel failure"
+    );
     assert_eq!(
         branch_count(&storage),
         0,
@@ -1129,12 +1438,20 @@ async fn test_txn_undrivable_stage_errors_and_discards_the_shared_upper() {
         matches!(err, TxnError::Stage { index: 1, .. }),
         "the failure must name the stage that could not be run, got: {err:?}",
     );
-    assert_eq!(err.exit_code(), 70, "a stage that could not be driven reports EX_SOFTWARE");
+    assert_eq!(
+        err.exit_code(),
+        70,
+        "a stage that could not be driven reports EX_SOFTWARE"
+    );
     assert!(
         !workdir.join("a.txt").exists(),
         "the completed stage's write must be discarded, not committed, when a later stage cannot run",
     );
-    assert_eq!(branch_count(&storage), 0, "the shared upper must not be left behind");
+    assert_eq!(
+        branch_count(&storage),
+        0,
+        "the shared upper must not be left behind"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -1227,7 +1544,11 @@ async fn test_txn_stage_stderr_is_capped_and_tail_biased() {
         Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
         Stage::new(
             &policy,
-            &["sh", "-c", "yes X | head -c 131072 1>&2; printf ZZZEND 1>&2; exit 1"],
+            &[
+                "sh",
+                "-c",
+                "yes X | head -c 131072 1>&2; printf ZZZEND 1>&2; exit 1",
+            ],
         ),
     ])
     // Capture-only: the live tee would flood the test terminal with the X's
@@ -1255,7 +1576,9 @@ async fn test_txn_stage_stderr_is_capped_and_tail_biased() {
         stderr.len(),
     );
     assert!(
-        stderr.windows(b"[stderr truncated]".len()).any(|w| w == b"[stderr truncated]"),
+        stderr
+            .windows(b"[stderr truncated]".len())
+            .any(|w| w == b"[stderr truncated]"),
         "an over-cap capture must carry the truncation marker",
     );
     assert!(
@@ -1301,7 +1624,11 @@ async fn test_txn_stages_inherit_stdout_but_capture_stderr() {
     .run(None)
     .await
     .expect("transaction should run");
-    assert!(outcome.committed(), "disposition: {:?}", outcome.disposition);
+    assert!(
+        outcome.committed(),
+        "disposition: {:?}",
+        outcome.disposition
+    );
 
     for (stage, tag) in [(0usize, "s"), (1, "t")] {
         // fd 0 and fd 1 are the parent's own open files (inherited live).
@@ -1323,8 +1650,14 @@ async fn test_txn_stages_inherit_stdout_but_capture_stderr() {
     }
     // stdout stays uncaptured (inherited-live); stderr is captured.
     for (i, r) in outcome.stages.iter().enumerate() {
-        assert!(r.stdout.is_none(), "stage {i} stdout must stay inherited (None): {r:?}");
-        assert!(r.stderr.is_some(), "stage {i} stderr must be captured: {r:?}");
+        assert!(
+            r.stdout.is_none(),
+            "stage {i} stdout must stay inherited (None): {r:?}"
+        );
+        assert!(
+            r.stderr.is_some(),
+            "stage {i} stderr must be captured: {r:?}"
+        );
     }
     assert_eq!(
         outcome.stages[0].stderr.as_deref(),
@@ -1355,7 +1688,10 @@ async fn test_txn_signalled_stage_reports_the_signal_and_shell_exit_code() {
     .await
     .expect("transaction should run");
 
-    assert!(!outcome.committed(), "a signalled stage must abort the transaction");
+    assert!(
+        !outcome.committed(),
+        "a signalled stage must abort the transaction"
+    );
     assert_eq!(
         outcome.disposition,
         TxnDisposition::Aborted(AbortReason::StageFailed {
@@ -1369,7 +1705,10 @@ async fn test_txn_signalled_stage_reports_the_signal_and_shell_exit_code() {
         128 + libc::SIGTERM,
         "a signalled stage reports 128 + signal, as a shell does",
     );
-    assert!(!workdir.join("a.txt").exists(), "nothing may be committed after a signalled stage");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "nothing may be committed after a signalled stage"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -1408,8 +1747,15 @@ async fn test_txn_exit_code_separates_a_completed_dry_run_from_a_timeout() {
     .run(Some(Duration::from_millis(600)))
     .await
     .expect("transaction should run");
-    assert_eq!(timed_out.disposition, TxnDisposition::Aborted(AbortReason::TimedOut));
-    assert_eq!(timed_out.exit_code(), 124, "a timed-out transaction reports 124, as timeout(1) does");
+    assert_eq!(
+        timed_out.disposition,
+        TxnDisposition::Aborted(AbortReason::TimedOut)
+    );
+    assert_eq!(
+        timed_out.exit_code(),
+        124,
+        "a timed-out transaction reports 124, as timeout(1) does"
+    );
 
     let _ = fs::remove_dir_all(&wd_d);
     let _ = fs::remove_dir_all(&wd_t);
@@ -1452,11 +1798,15 @@ async fn test_txn_dry_run_neither_takes_the_commit_lock_nor_keeps_its_upper() {
     drop(held);
 
     assert_eq!(
-        outcome.disposition, TxnDisposition::DryRun,
+        outcome.disposition,
+        TxnDisposition::DryRun,
         "the dry run completed; the held lock is none of its business",
     );
     assert!(!outcome.committed(), "a dry run must never commit");
-    assert!(!workdir.join("a.txt").exists(), "a dry run must not publish anything");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "a dry run must not publish anything"
+    );
     assert_eq!(
         branch_count(&storage),
         0,
@@ -1501,8 +1851,15 @@ async fn test_txn_dry_run_reports_the_failure_that_stopped_it_not_dry_run() {
         }),
         "a dry run that stopped at a failing stage must say so, not claim it reported a diff",
     );
-    assert_eq!(failed.exit_code(), 3, "the failing stage's own code, not the dry run's 0");
-    assert!(!wd_f.join("a.txt").exists(), "a dry run publishes nothing either way");
+    assert_eq!(
+        failed.exit_code(),
+        3,
+        "the failing stage's own code, not the dry run's 0"
+    );
+    assert!(
+        !wd_f.join("a.txt").exists(),
+        "a dry run publishes nothing either way"
+    );
 
     let wd_t = temp_dir("dry-timeout");
     let p_t = stage_policy(&wd_t);
@@ -1518,7 +1875,11 @@ async fn test_txn_dry_run_reports_the_failure_that_stopped_it_not_dry_run() {
         TxnDisposition::Aborted(AbortReason::TimedOut),
         "a dry run cut short by its timeout never reported a full diff",
     );
-    assert_eq!(timed_out.exit_code(), 124, "a timed-out dry run reports 124, as timeout(1) does");
+    assert_eq!(
+        timed_out.exit_code(),
+        124,
+        "a timed-out dry run reports 124, as timeout(1) does"
+    );
 
     let _ = fs::remove_dir_all(&wd_f);
     let _ = fs::remove_dir_all(&wd_t);
@@ -1567,7 +1928,10 @@ async fn test_txn_timeout_bounds_the_stage_phase_not_the_commit() {
             early = &mut txn => panic!("the transaction finished while the lock was held: {early:?}"),
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
-        assert!(std::time::Instant::now() < deadline, "stages never reached the commit");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stages never reached the commit"
+        );
     }
     // Hold the lock well past the stage timeout. A transaction whose commit was
     // bounded by it would give up in here.
@@ -1582,13 +1946,18 @@ async fn test_txn_timeout_bounds_the_stage_phase_not_the_commit() {
     }
     drop(held);
 
-    let outcome = txn.await.expect("the commit is not bounded by the stage timeout");
+    let outcome = txn
+        .await
+        .expect("the commit is not bounded by the stage timeout");
     assert!(
         outcome.committed(),
         "every stage succeeded within the timeout, so the transaction must commit; disposition: {:?}",
         outcome.disposition,
     );
-    assert_eq!(fs::read_to_string(workdir.join("b.txt")).unwrap(), "built\n");
+    assert_eq!(
+        fs::read_to_string(workdir.join("b.txt")).unwrap(),
+        "built\n"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -1620,17 +1989,37 @@ async fn test_txn_a_deadline_that_expires_immediately_aborts_with_no_stage_resul
     .await
     .expect("an expired deadline is an outcome, not an error");
 
-    assert!(!outcome.committed(), "a transaction that never ran a stage must not commit");
-    assert_eq!(outcome.disposition, TxnDisposition::Aborted(AbortReason::TimedOut));
+    assert!(
+        !outcome.committed(),
+        "a transaction that never ran a stage must not commit"
+    );
+    assert_eq!(
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::TimedOut)
+    );
     assert!(
         outcome.stages.is_empty(),
         "no stage completed, so there is nothing to report; got {:?}",
         outcome.stages,
     );
-    assert_eq!(outcome.exit_code(), 124, "an expired deadline reports 124, as timeout(1) does");
-    assert!(!workdir.join("a.txt").exists(), "no stage ran, so nothing may be published");
-    assert_eq!(fs::read_to_string(workdir.join("existing.txt")).unwrap(), "before\n");
-    assert_eq!(branch_count(&storage), 0, "the untouched upper must still be reclaimed");
+    assert_eq!(
+        outcome.exit_code(),
+        124,
+        "an expired deadline reports 124, as timeout(1) does"
+    );
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "no stage ran, so nothing may be published"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("existing.txt")).unwrap(),
+        "before\n"
+    );
+    assert_eq!(
+        branch_count(&storage),
+        0,
+        "the untouched upper must still be reclaimed"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -1657,15 +2046,25 @@ async fn test_txn_a_rejected_transaction_creates_no_branch_and_starts_no_stage()
     // Stage 0 is valid and, if it ever ran, would leave `sentinel` on the real
     // filesystem: `outside` is not the workdir, so it is not COW-intercepted.
     let base = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .fs_write(&workdir).fs_write(&outside).workdir(&workdir).cwd(&workdir)
+        .fs_write(&workdir)
+        .fs_write(&outside)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .build()
         .unwrap();
     // Stage 1 is the violation: a per-stage branch action the transaction owns.
     let bad = Sandbox::builder()
-        .fs_read("/usr").fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_read("/usr")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
         .fs_storage(&storage)
         .on_error(BranchAction::Keep)
         .build()
@@ -1680,7 +2079,10 @@ async fn test_txn_a_rejected_transaction_creates_no_branch_and_starts_no_stage()
     .await
     .expect_err("a per-stage branch action must be rejected");
 
-    assert!(matches!(err, TxnError::Invalid(_)), "expected a configuration error, got: {err:?}");
+    assert!(
+        matches!(err, TxnError::Invalid(_)),
+        "expected a configuration error, got: {err:?}"
+    );
     assert!(
         !sentinel.exists(),
         "a rejected transaction must not have started stage 0: {} exists",
@@ -1726,7 +2128,11 @@ async fn test_txn_stage_results_are_in_execution_order_and_include_the_failed_st
 
     assert!(!outcome.committed());
     assert_eq!(
-        outcome.stages.iter().map(|r| r.exit_status.clone()).collect::<Vec<_>>(),
+        outcome
+            .stages
+            .iter()
+            .map(|r| r.exit_status.clone())
+            .collect::<Vec<_>>(),
         vec![
             sandlock_core::ExitStatus::Code(0),
             sandlock_core::ExitStatus::Code(0),
@@ -1772,8 +2178,15 @@ async fn test_txn_a_command_that_cannot_be_execed_is_a_stage_failure_not_a_drive
         "an exec failure surfaces as the stage's own 127, as a shell reports it",
     );
     assert_eq!(outcome.exit_code(), 127);
-    assert_eq!(outcome.stages.len(), 2, "the stage ran and produced a status, so it is reported");
-    assert!(!workdir.join("a.txt").exists(), "the earlier stage's write must be discarded");
+    assert_eq!(
+        outcome.stages.len(),
+        2,
+        "the stage ran and produced a status, so it is reported"
+    );
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "the earlier stage's write must be discarded"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -1817,7 +2230,10 @@ async fn test_txn_cancelled_during_the_stage_phase_reclaims_the_change_set() {
                 early = &mut txn => panic!("the transaction finished before it could be cancelled: {early:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
-            assert!(std::time::Instant::now() < deadline, "stage 0 never wrote into the shared upper");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stage 0 never wrote into the shared upper"
+            );
         }
     } // <-- the run future is dropped here, mid-stage: the cancellation.
 
@@ -1835,7 +2251,10 @@ async fn test_txn_cancelled_during_the_stage_phase_reclaims_the_change_set() {
         sandlock_core::list_preserved(&storage).is_empty(),
         "a partial change set must not be preserved: no recovery could safely publish it",
     );
-    assert!(!workdir.join("a.txt").exists(), "nothing was merged, so nothing may be in the workdir");
+    assert!(
+        !workdir.join("a.txt").exists(),
+        "nothing was merged, so nothing may be in the workdir"
+    );
     assert_eq!(
         fs::read_to_string(workdir.join("existing.txt")).unwrap(),
         "before\n",
@@ -1874,13 +2293,20 @@ async fn test_txn_stage_reads_an_earlier_stage_s_modification_not_the_workdir_co
     .await
     .expect("transaction should run");
 
-    assert!(outcome.committed(), "disposition: {:?}", outcome.disposition);
+    assert!(
+        outcome.committed(),
+        "disposition: {:?}",
+        outcome.disposition
+    );
     assert_eq!(
         fs::read_to_string(workdir.join("seen.txt")).unwrap(),
         "after\n",
         "stage 1 must read what stage 0 wrote, not the pre-transaction workdir copy",
     );
-    assert_eq!(fs::read_to_string(workdir.join("in.txt")).unwrap(), "after\n");
+    assert_eq!(
+        fs::read_to_string(workdir.join("in.txt")).unwrap(),
+        "after\n"
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -1910,13 +2336,29 @@ fn recovery_module_reexports_parse_a_preserved_branch_on_disk() {
 
     // list_preserved through recovery:: FINDS and PARSES it.
     let found = list_preserved(&base);
-    assert_eq!(found.len(), 1, "recovery::list_preserved must find the marked branch");
+    assert_eq!(
+        found.len(),
+        1,
+        "recovery::list_preserved must find the marked branch"
+    );
     let p = &found[0];
     assert_eq!(p.pid, 4242, "the marker's pid must be parsed");
-    assert_eq!(p.reason, PreserveReason::CommitDeferred, "the reason must be parsed");
+    assert_eq!(
+        p.reason,
+        PreserveReason::CommitDeferred,
+        "the reason must be parsed"
+    );
     assert_eq!(p.upper, upper, "the upper path must be parsed");
-    assert_eq!(p.workdir, PathBuf::from("/some/workdir"), "the workdir must be parsed");
-    assert_eq!(p.deleted, vec![PathBuf::from("gone.txt")], "the deletion must be parsed");
+    assert_eq!(
+        p.workdir,
+        PathBuf::from("/some/workdir"),
+        "the workdir must be parsed"
+    );
+    assert_eq!(
+        p.deleted,
+        vec![PathBuf::from("gone.txt")],
+        "the deletion must be parsed"
+    );
 
     // read_preserved through recovery:: returns the same record for the branch dir.
     let one = read_preserved(&branch_dir)

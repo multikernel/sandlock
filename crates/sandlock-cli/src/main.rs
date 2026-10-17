@@ -1,8 +1,8 @@
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use sandlock_core::Sandbox;
-use sandlock_core::sandbox::{parse_timestamp, BranchAction, ByteSize, SandboxBuilder};
 use sandlock_core::profile;
-use anyhow::{Result, anyhow};
+use sandlock_core::sandbox::{parse_timestamp, BranchAction, ByteSize, SandboxBuilder};
+use sandlock_core::Sandbox;
 use std::path::PathBuf;
 
 #[cfg(all(feature = "profiles", feature = "cow"))]
@@ -290,31 +290,37 @@ async fn main() -> Result<()> {
                     // is trusted only if main is still alive after reading it.
                     let pid = sandlock_core::control::sandbox_pids(name).map(|p| p.child);
                     let main_fd = pid.as_ref().ok().and_then(|&pid| pidfd_open(pid));
-                    let (status, ports, pid, uptime, cmd) = match (sandlock_core::control::sandbox_info(name), pid) {
-                        (Ok(info), Ok(pid)) if !info.main_exited => {
-                            let uptime = proc_uptime(pid);
-                            let cmd = proc_cmdline(pid);
-                            if main_fd.as_ref().is_some_and(|fd| !pidfd_exited(fd)) {
-                                (
-                                    info.mode.unwrap_or_else(|| "running".to_string()),
-                                    query_ports(name),
-                                    pid.to_string(),
-                                    uptime.unwrap_or_else(|| "?".to_string()),
-                                    cmd.unwrap_or_else(|| "?".to_string()),
-                                )
-                            } else {
-                                main_exited_row(name, info)
+                    let (status, ports, pid, uptime, cmd) =
+                        match (sandlock_core::control::sandbox_info(name), pid) {
+                            (Ok(info), Ok(pid)) if !info.main_exited => {
+                                let uptime = proc_uptime(pid);
+                                let cmd = proc_cmdline(pid);
+                                if main_fd.as_ref().is_some_and(|fd| !pidfd_exited(fd)) {
+                                    (
+                                        info.mode.unwrap_or_else(|| "running".to_string()),
+                                        query_ports(name),
+                                        pid.to_string(),
+                                        uptime.unwrap_or_else(|| "?".to_string()),
+                                        cmd.unwrap_or_else(|| "?".to_string()),
+                                    )
+                                } else {
+                                    main_exited_row(name, info)
+                                }
                             }
-                        }
-                        (Ok(info), _) if info.main_exited => main_exited_row(name, info),
-                        (info, pid) => (
-                            if info.is_ok() { "running" } else { "unresponsive" }.to_string(),
-                            "?".to_string(),
-                            pid.map_or_else(|_| "?".to_string(), |p| p.to_string()),
-                            "?".to_string(),
-                            "?".to_string(),
-                        ),
-                    };
+                            (Ok(info), _) if info.main_exited => main_exited_row(name, info),
+                            (info, pid) => (
+                                if info.is_ok() {
+                                    "running"
+                                } else {
+                                    "unresponsive"
+                                }
+                                .to_string(),
+                                "?".to_string(),
+                                pid.map_or_else(|_| "?".to_string(), |p| p.to_string()),
+                                "?".to_string(),
+                                "?".to_string(),
+                            ),
+                        };
                     println!(
                         "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
                         name, pid, uptime, status, ports, cmd
@@ -329,7 +335,9 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
             match sandlock_core::control::send_control_request(
-                &name, "config", serde_json::Value::Object(Default::default()),
+                &name,
+                "config",
+                serde_json::Value::Object(Default::default()),
             ) {
                 Ok(resp) if resp.ok => {
                     if let Some(data) = resp.data {
@@ -338,12 +346,12 @@ async fn main() -> Result<()> {
                             return Err(anyhow!("TOML output requires the profiles feature"));
                             #[cfg(feature = "profiles")]
                             {
-                            // Round-trip through ProfileInput -> TOML.
-                            let profile: sandlock_core::ProfileInput =
-                                serde_json::from_value(data)
-                                    .map_err(|e| anyhow!("parse config response: {}", e))?;
-                            let toml_str = toml::to_string_pretty(&profile)?;
-                            println!("{}", toml_str);
+                                // Round-trip through ProfileInput -> TOML.
+                                let profile: sandlock_core::ProfileInput =
+                                    serde_json::from_value(data)
+                                        .map_err(|e| anyhow!("parse config response: {}", e))?;
+                                let toml_str = toml::to_string_pretty(&profile)?;
+                                println!("{}", toml_str);
                             }
                         } else {
                             let json_str = serde_json::to_string_pretty(&data)?;
@@ -355,7 +363,10 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok(resp) => {
-                    eprintln!("sandlock: inspect error: {}", resp.err.as_deref().unwrap_or("unknown"));
+                    eprintln!(
+                        "sandlock: inspect error: {}",
+                        resp.err.as_deref().unwrap_or("unknown")
+                    );
                     std::process::exit(1);
                 }
                 Err(e) => {
@@ -382,25 +393,72 @@ async fn main() -> Result<()> {
             match sandlock_core::landlock_abi_version() {
                 Ok(v) => {
                     println!("  Landlock:       ABI v{}", v);
-                    println!("  Minimum required: ABI v{}", sandlock_core::MIN_LANDLOCK_ABI);
+                    println!(
+                        "  Minimum required: ABI v{}",
+                        sandlock_core::MIN_LANDLOCK_ABI
+                    );
                     if v < sandlock_core::MIN_LANDLOCK_ABI {
                         println!("  Status:         UNSUPPORTED (upgrade kernel)");
                     } else {
                         println!("  Status:         OK");
                     }
                     println!("  Filesystem:     supported (ABI v1+)");
-                    println!("  File truncate:  {}", if v >= 3 { "supported (ABI v3+)" } else { "not supported" });
-                    println!("  TCP ports:      {}", if v >= 4 { "supported (ABI v4+)" } else { "not supported" });
-                    println!("  Device ioctl:   {}", if v >= 5 { "supported (ABI v5+)" } else { "not supported" });
-                    println!("  IPC scoping:    {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
-                    println!("  Signal scoping: {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
+                    println!(
+                        "  File truncate:  {}",
+                        if v >= 3 {
+                            "supported (ABI v3+)"
+                        } else {
+                            "not supported"
+                        }
+                    );
+                    println!(
+                        "  TCP ports:      {}",
+                        if v >= 4 {
+                            "supported (ABI v4+)"
+                        } else {
+                            "not supported"
+                        }
+                    );
+                    println!(
+                        "  Device ioctl:   {}",
+                        if v >= 5 {
+                            "supported (ABI v5+)"
+                        } else {
+                            "not supported"
+                        }
+                    );
+                    println!(
+                        "  IPC scoping:    {}",
+                        if v >= 6 {
+                            "supported (ABI v6+)"
+                        } else {
+                            "not supported"
+                        }
+                    );
+                    println!(
+                        "  Signal scoping: {}",
+                        if v >= 6 {
+                            "supported (ABI v6+)"
+                        } else {
+                            "not supported"
+                        }
+                    );
 
                     println!();
                     println!("Per-protection availability (host Landlock ABI v{}):", v);
                     for p in sandlock_core::Protection::all() {
                         let available = v >= p.min_abi();
-                        let marker = if available { "available" } else { "unavailable" };
-                        println!("  {:<22} requires v{} — {}", format!("{:?}", p), p.min_abi(), marker);
+                        let marker = if available {
+                            "available"
+                        } else {
+                            "unavailable"
+                        };
+                        println!(
+                            "  {:<22} requires v{} — {}",
+                            format!("{:?}", p),
+                            p.min_abi(),
+                            marker
+                        );
                     }
                 }
                 Err(e) => {
@@ -415,31 +473,33 @@ async fn main() -> Result<()> {
             #[cfg(all(feature = "profiles", feature = "cow"))]
             learn::run(args).await?;
             #[cfg(not(all(feature = "profiles", feature = "cow")))]
-            return Err(anyhow!("learning profiles requires the profiles and cow features"));
+            return Err(anyhow!(
+                "learning profiles requires the profiles and cow features"
+            ));
         }
 
-        Command::Profile { action } => {
-            match action {
-                ProfileAction::List => {
-                    let profiles = profile::list_profiles()?;
-                    if profiles.is_empty() {
-                        println!("No profiles found in {}", profile::profile_dir()?.display());
-                    } else {
-                        for name in profiles { println!("  {}", name); }
+        Command::Profile { action } => match action {
+            ProfileAction::List => {
+                let profiles = profile::list_profiles()?;
+                if profiles.is_empty() {
+                    println!("No profiles found in {}", profile::profile_dir()?.display());
+                } else {
+                    for name in profiles {
+                        println!("  {}", name);
                     }
                 }
-                ProfileAction::Show { name } => {
-                    let path = profile::profile_dir()?.join(format!("{}.toml", name));
-                    let content = std::fs::read_to_string(&path)?;
-                    println!("{}", content);
-                }
-                ProfileAction::Delete { name } => {
-                    let path = profile::profile_dir()?.join(format!("{}.toml", name));
-                    std::fs::remove_file(&path)?;
-                    println!("Deleted profile '{}'", name);
-                }
             }
-        }
+            ProfileAction::Show { name } => {
+                let path = profile::profile_dir()?.join(format!("{}.toml", name));
+                let content = std::fs::read_to_string(&path)?;
+                println!("{}", content);
+            }
+            ProfileAction::Delete { name } => {
+                let path = profile::profile_dir()?.join(format!("{}.toml", name));
+                std::fs::remove_file(&path)?;
+                println!("Deleted profile '{}'", name);
+            }
+        },
     }
 
     Ok(())
@@ -486,7 +546,11 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         profile_program_spec.as_ref().and_then(|spec| {
             let exec = spec.exec.as_ref()?.display().to_string();
             let args_str = spec.args.join(" ");
-            Some(if args_str.is_empty() { exec } else { format!("{exec} {args_str}") })
+            Some(if args_str.is_empty() {
+                exec
+            } else {
+                format!("{exec} {args_str}")
+            })
         })
     };
 
@@ -494,9 +558,15 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     let mut builder = if let Some(base) = base_from_profile {
         // Rebuild builder from loaded profile as base
         let mut b = Sandbox::builder();
-        for p in &base.fs_readable { b = b.fs_read(p); }
-        for p in &base.fs_writable { b = b.fs_write(p); }
-        for p in &base.fs_denied { b = b.fs_deny(p); }
+        for p in &base.fs_readable {
+            b = b.fs_read(p);
+        }
+        for p in &base.fs_writable {
+            b = b.fs_write(p);
+        }
+        for p in &base.fs_denied {
+            b = b.fs_deny(p);
+        }
         for rule in &base.net_allow {
             b = b.net_allow(sandlock_core::format_net_rule(rule));
         }
@@ -506,10 +576,14 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         match &base.net_allow_bind {
             sandlock_core::BindPorts::All => b = b.net_allow_bind("*"),
             sandlock_core::BindPorts::Ports(ports) => {
-                for p in ports { b = b.net_allow_bind_port(*p); }
+                for p in ports {
+                    b = b.net_allow_bind_port(*p);
+                }
             }
         }
-        for p in &base.net_deny_bind { b = b.net_deny_bind_port(*p); }
+        for p in &base.net_deny_bind {
+            b = b.net_deny_bind_port(*p);
+        }
         for rule in &base.http_allow {
             let s = format!("{} {}{}", rule.method, rule.host, rule.path);
             b = b.http_allow(&s);
@@ -521,27 +595,63 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for port in &base.http_ports {
             b = b.http_port(*port);
         }
-        if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
-        if let Some(n) = base.max_processes { b = b.max_processes(n); }
-        if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
-        if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
-        if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
-        if let Some(n) = base.max_open_files { b = b.max_open_files(n); }
-        if let Some(disk) = base.max_disk { b = b.max_disk(disk); }
-        if !base.extra_deny_syscalls.is_empty() { b = b.extra_deny_syscalls(base.extra_deny_syscalls.clone()); }
-        if !base.extra_allow_syscalls.is_empty() { b = b.extra_allow_syscalls(base.extra_allow_syscalls.clone()); }
+        if let Some(mem) = base.max_memory {
+            b = b.max_memory(mem);
+        }
+        if let Some(n) = base.max_processes {
+            b = b.max_processes(n);
+        }
+        if let Some(cpu) = base.max_cpu {
+            b = b.max_cpu(cpu);
+        }
+        if let Some(seed) = base.random_seed {
+            b = b.random_seed(seed);
+        }
+        if let Some(n) = base.num_cpus {
+            b = b.num_cpus(n);
+        }
+        if let Some(n) = base.max_open_files {
+            b = b.max_open_files(n);
+        }
+        if let Some(disk) = base.max_disk {
+            b = b.max_disk(disk);
+        }
+        if !base.extra_deny_syscalls.is_empty() {
+            b = b.extra_deny_syscalls(base.extra_deny_syscalls.clone());
+        }
+        if !base.extra_allow_syscalls.is_empty() {
+            b = b.extra_allow_syscalls(base.extra_allow_syscalls.clone());
+        }
         b = b.clean_env(base.clean_env);
-        for (k, v) in &base.env { b = b.env_var(k, v); }
-        if let Some(ref w) = base.workdir { b = b.workdir(w); }
-        if let Some(ref c) = base.cwd { b = b.cwd(c); }
+        for (k, v) in &base.env {
+            b = b.env_var(k, v);
+        }
+        if let Some(ref w) = base.workdir {
+            b = b.workdir(w);
+        }
+        if let Some(ref c) = base.cwd {
+            b = b.cwd(c);
+        }
         // HTTP MITM material
-        if let Some(ref ca) = base.http_ca { b = b.http_ca(ca); }
-        if let Some(ref key) = base.http_key { b = b.http_key(key); }
-        for p in &base.http_inject_ca { b = b.http_inject_ca(p); }
-        if let Some(ref out) = base.http_ca_out { b = b.http_ca_out(out); }
+        if let Some(ref ca) = base.http_ca {
+            b = b.http_ca(ca);
+        }
+        if let Some(ref key) = base.http_key {
+            b = b.http_key(key);
+        }
+        for p in &base.http_inject_ca {
+            b = b.http_inject_ca(p);
+        }
+        if let Some(ref out) = base.http_ca_out {
+            b = b.http_ca_out(out);
+        }
         // Filesystem extras
-        if let Some(ref path) = base.chroot { b = b.chroot(path); }
-        if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
+        if let Some(ref path) = base.chroot {
+            b = b.chroot(path);
+        }
+        if let Some(ref path) = base.fs_storage {
+            b = b.fs_storage(path);
+        }
         for (virt, host) in &base.fs_mount {
             if base.fs_mount_ro.iter().any(|d| d == virt) {
                 b = b.fs_mount_ro(virt, host);
@@ -556,61 +666,141 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         b = b.no_randomize_memory(base.no_randomize_memory);
         b = b.no_huge_pages(base.no_huge_pages);
         b = b.no_coredump(base.no_coredump);
-        if let Some(t) = base.time_start { b = b.time_start(t); }
+        if let Some(t) = base.time_start {
+            b = b.time_start(t);
+        }
         // Network virtualization
         b = b.port_remap(base.port_remap);
         // Process identity
-        if let Some(user) = base.user { b = b.user(user.uid, user.gid); }
+        if let Some(user) = base.user {
+            b = b.user(user.uid, user.gid);
+        }
         // Hardware constraints
-        if let Some(ref devs) = base.gpu_devices { b = b.gpu_devices(devs.clone()); }
-        if let Some(ref cores) = base.cpu_cores { b = b.cpu_cores(cores.clone()); }
+        if let Some(ref devs) = base.gpu_devices {
+            b = b.gpu_devices(devs.clone());
+        }
+        if let Some(ref cores) = base.cpu_cores {
+            b = b.cpu_cores(cores.clone());
+        }
         b
     } else {
         Sandbox::builder()
     };
 
     // CLI overrides — fields from flattened SandboxBuilder
-    for p in &pb.fs_readable { builder = builder.fs_read(p); }
-    for p in &pb.fs_writable { builder = builder.fs_write(p); }
-    if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
-    for spec in &pb.net_allow { builder = builder.net_allow(spec); }
-    for spec in &pb.net_deny { builder = builder.net_deny(spec); }
-    for spec in &pb.net_allow_bind { builder = builder.net_allow_bind(spec); }
-    for spec in &pb.net_deny_bind { builder = builder.net_deny_bind(spec); }
-    if let Some(seed) = pb.random_seed { builder = builder.random_seed(seed); }
-    if pb.clean_env { builder = builder.clean_env(true); }
-    if let Some(n) = pb.num_cpus { builder = builder.num_cpus(n); }
-    if let Some(cpu) = pb.max_cpu { builder = builder.max_cpu(cpu); }
-    if let Some(n) = pb.max_open_files { builder = builder.max_open_files(n); }
-    for p in &pb.fs_denied { builder = builder.fs_deny(p); }
-    if let Some(ref path) = pb.chroot { builder = builder.chroot(path); }
-    if let Some(user) = pb.user { builder = builder.user(user.uid, user.gid); }
-    if let Some(ref path) = pb.workdir { builder = builder.workdir(path); }
-    if let Some(ref path) = pb.cwd { builder = builder.cwd(path); }
-    if let Some(ref path) = pb.fs_storage { builder = builder.fs_storage(path); }
-    if !pb.extra_allow_syscalls.is_empty() { builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone()); }
-    if !pb.extra_deny_syscalls.is_empty() { builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone()); }
-    for rule in &pb.http_allow { builder = builder.http_allow(rule); }
-    for rule in &pb.http_deny { builder = builder.http_deny(rule); }
-    for c in &pb.credentials { builder = builder.credential_spec(c); }
-    for rule in &pb.http_auth { builder = builder.http_auth(rule); }
-    for port in &pb.http_ports { builder = builder.http_port(*port); }
-    if let Some(ref ca) = pb.http_ca { builder = builder.http_ca(ca); }
-    if let Some(ref key) = pb.http_key { builder = builder.http_key(key); }
-    for p in &pb.http_inject_ca { builder = builder.http_inject_ca(p); }
-    if let Some(ref out) = pb.http_ca_out { builder = builder.http_ca_out(out); }
-    if pb.port_remap { builder = builder.port_remap(true); }
-    if pb.no_randomize_memory { builder = builder.no_randomize_memory(true); }
-    if pb.no_huge_pages { builder = builder.no_huge_pages(true); }
-    if pb.deterministic_dirs { builder = builder.deterministic_dirs(true); }
-    if pb.no_coredump { builder = builder.no_coredump(true); }
+    for p in &pb.fs_readable {
+        builder = builder.fs_read(p);
+    }
+    for p in &pb.fs_writable {
+        builder = builder.fs_write(p);
+    }
+    if let Some(n) = pb.max_processes {
+        builder = builder.max_processes(n);
+    }
+    for spec in &pb.net_allow {
+        builder = builder.net_allow(spec);
+    }
+    for spec in &pb.net_deny {
+        builder = builder.net_deny(spec);
+    }
+    for spec in &pb.net_allow_bind {
+        builder = builder.net_allow_bind(spec);
+    }
+    for spec in &pb.net_deny_bind {
+        builder = builder.net_deny_bind(spec);
+    }
+    if let Some(seed) = pb.random_seed {
+        builder = builder.random_seed(seed);
+    }
+    if pb.clean_env {
+        builder = builder.clean_env(true);
+    }
+    if let Some(n) = pb.num_cpus {
+        builder = builder.num_cpus(n);
+    }
+    if let Some(cpu) = pb.max_cpu {
+        builder = builder.max_cpu(cpu);
+    }
+    if let Some(n) = pb.max_open_files {
+        builder = builder.max_open_files(n);
+    }
+    for p in &pb.fs_denied {
+        builder = builder.fs_deny(p);
+    }
+    if let Some(ref path) = pb.chroot {
+        builder = builder.chroot(path);
+    }
+    if let Some(user) = pb.user {
+        builder = builder.user(user.uid, user.gid);
+    }
+    if let Some(ref path) = pb.workdir {
+        builder = builder.workdir(path);
+    }
+    if let Some(ref path) = pb.cwd {
+        builder = builder.cwd(path);
+    }
+    if let Some(ref path) = pb.fs_storage {
+        builder = builder.fs_storage(path);
+    }
+    if !pb.extra_allow_syscalls.is_empty() {
+        builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone());
+    }
+    if !pb.extra_deny_syscalls.is_empty() {
+        builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone());
+    }
+    for rule in &pb.http_allow {
+        builder = builder.http_allow(rule);
+    }
+    for rule in &pb.http_deny {
+        builder = builder.http_deny(rule);
+    }
+    for c in &pb.credentials {
+        builder = builder.credential_spec(c);
+    }
+    for rule in &pb.http_auth {
+        builder = builder.http_auth(rule);
+    }
+    for port in &pb.http_ports {
+        builder = builder.http_port(*port);
+    }
+    if let Some(ref ca) = pb.http_ca {
+        builder = builder.http_ca(ca);
+    }
+    if let Some(ref key) = pb.http_key {
+        builder = builder.http_key(key);
+    }
+    for p in &pb.http_inject_ca {
+        builder = builder.http_inject_ca(p);
+    }
+    if let Some(ref out) = pb.http_ca_out {
+        builder = builder.http_ca_out(out);
+    }
+    if pb.port_remap {
+        builder = builder.port_remap(true);
+    }
+    if pb.no_randomize_memory {
+        builder = builder.no_randomize_memory(true);
+    }
+    if pb.no_huge_pages {
+        builder = builder.no_huge_pages(true);
+    }
+    if pb.deterministic_dirs {
+        builder = builder.deterministic_dirs(true);
+    }
+    if pb.no_coredump {
+        builder = builder.no_coredump(true);
+    }
 
     // CLI overrides — non-clap-friendly fields (still parsed here)
-    if let Some(ref m) = args.max_memory { builder = builder.max_memory(ByteSize::parse(m)?); }
+    if let Some(ref m) = args.max_memory {
+        builder = builder.max_memory(ByteSize::parse(m)?);
+    }
     if let Some(ref ts) = args.time_start {
         builder = builder.time_start(parse_timestamp("--time-start", ts)?);
     }
-    if let Some(ref s) = args.max_disk { builder = builder.max_disk(ByteSize::parse(s)?); }
+    if let Some(ref s) = args.max_disk {
+        builder = builder.max_disk(ByteSize::parse(s)?);
+    }
     if let Some(ref s) = args.on_exit {
         builder = builder.on_exit(parse_branch_action("--on-exit", s)?);
     }
@@ -625,7 +815,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
             builder.fs_mount(virt, host)
         };
     }
-    if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
+    if !args.cpu_cores.is_empty() {
+        builder = builder.cpu_cores(args.cpu_cores.clone());
+    }
     match &args.gpu {
         // `all` maps to an empty device list, which the core expands to every
         // present GPU; explicit indices pass through unchanged.
@@ -648,12 +840,14 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     let image_cmd: Option<Vec<String>>;
     if let Some(ref img) = args.image {
         #[cfg(not(feature = "image"))]
-        return Err(anyhow!("image support is disabled; enable the image feature"));
+        return Err(anyhow!(
+            "image support is disabled; enable the image feature"
+        ));
         #[cfg(feature = "image")]
         {
-        let image = sandlock_core::image::pull(img, None).await?;
-        builder = builder.image(&image);
-        image_cmd = args.cmd.is_empty().then(|| image.config.default_cmd());
+            let image = sandlock_core::image::pull(img, None).await?;
+            builder = builder.image(&image);
+            image_cmd = args.cmd.is_empty().then(|| image.config.default_cmd());
         }
     } else {
         image_cmd = None;
@@ -661,26 +855,35 @@ async fn run_command(args: RunArgs) -> Result<i32> {
 
     // Derive the effective command: profile's [program] section supplies a
     // default; a trailing positional command on the CLI overrides it.
-    let profile_cmd: Option<Vec<String>> = if args.cmd.is_empty() && args.exec_shell.is_none() && image_cmd.is_none() {
-        if let Some(spec) = profile_program_spec {
-            if let Some(exec) = spec.exec {
-                let exec_str = exec.into_os_string().into_string()
-                    .map_err(|_| anyhow!("non-UTF-8 exec path in profile"))?;
-                let mut v = vec![exec_str];
-                v.extend(spec.args);
-                Some(v)
+    let profile_cmd: Option<Vec<String>> =
+        if args.cmd.is_empty() && args.exec_shell.is_none() && image_cmd.is_none() {
+            if let Some(spec) = profile_program_spec {
+                if let Some(exec) = spec.exec {
+                    let exec_str = exec
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| anyhow!("non-UTF-8 exec path in profile"))?;
+                    let mut v = vec![exec_str];
+                    v.extend(spec.args);
+                    Some(v)
+                } else {
+                    None
+                }
             } else {
                 None
             }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    if args.exec_shell.is_none() && args.cmd.is_empty() && image_cmd.is_none() && profile_cmd.is_none() {
-        return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
+    if args.exec_shell.is_none()
+        && args.cmd.is_empty()
+        && image_cmd.is_none()
+        && profile_cmd.is_none()
+    {
+        return Err(anyhow!(
+            "no command specified (no trailing command and no [program].exec in profile)"
+        ));
     }
 
     if args.no_supervisor {
@@ -729,7 +932,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         match tokio::time::timeout(
             std::time::Duration::from_secs(secs),
             policy.run_interactive(&cmd_strs),
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r?,
             Err(_) => {
                 eprintln!("sandlock: timeout after {}s", secs);
@@ -752,16 +957,19 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     }
 
     if let Some(fd) = args.status_fd {
+        use sandlock_core::ExitStatus as SandlockExitStatus;
         use std::io::Write as _;
         use std::os::unix::io::FromRawFd;
-        use sandlock_core::ExitStatus as SandlockExitStatus;
         let (code, signal) = match &result.exit_status {
             SandlockExitStatus::Code(c) => (*c, None),
             SandlockExitStatus::Signal(s) => (-1, Some(*s)),
             SandlockExitStatus::Killed => (-1, None),
             SandlockExitStatus::Timeout => (-1, None),
         };
-        let status = SandboxStatus { exit_code: code, signal };
+        let status = SandboxStatus {
+            exit_code: code,
+            signal,
+        };
         if let Ok(json) = serde_json::to_string(&status) {
             let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
             let _ = writeln!(file, "{}", json);
@@ -793,38 +1001,102 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     let pb = &args.sandbox_builder;
     let mut bad = Vec::new();
 
-    if args.max_memory.is_some() { bad.push("--max-memory"); }
-    if pb.max_processes.is_some() { bad.push("--max-processes"); }
-    if pb.max_cpu.is_some() { bad.push("--max-cpu"); }
-    if pb.max_open_files.is_some() { bad.push("--max-open-files"); }
-    if args.timeout.is_some() { bad.push("--timeout"); }
-    if !pb.net_allow.is_empty() { bad.push("--net-allow"); }
-    if !pb.net_deny.is_empty() { bad.push("--net-deny"); }
-    if !pb.net_allow_bind.is_empty() { bad.push("--net-allow-bind"); }
-    if !pb.net_deny_bind.is_empty() { bad.push("--net-deny-bind"); }
-    if !pb.http_allow.is_empty() { bad.push("--http-allow"); }
-    if !pb.http_deny.is_empty() { bad.push("--http-deny"); }
-    if !pb.http_ports.is_empty() { bad.push("--http-port"); }
-    if pb.num_cpus.is_some() { bad.push("--num-cpus"); }
-    if pb.random_seed.is_some() { bad.push("--random-seed"); }
-    if args.time_start.is_some() { bad.push("--time-start"); }
-    if pb.no_randomize_memory { bad.push("--no-randomize-memory"); }
-    if pb.no_huge_pages { bad.push("--no-huge-pages"); }
-    if pb.deterministic_dirs { bad.push("--deterministic-dirs"); }
-    if pb.chroot.is_some() { bad.push("--chroot"); }
-    if args.image.is_some() { bad.push("--image"); }
-    if pb.user.is_some() { bad.push("--user"); }
-    if pb.workdir.is_some() { bad.push("--workdir"); }
-    if pb.cwd.is_some() { bad.push("--cwd"); }
-    if pb.fs_storage.is_some() { bad.push("--fs-storage"); }
-    if args.max_disk.is_some() { bad.push("--max-disk"); }
-    if pb.port_remap { bad.push("--port-remap"); }
-    if !args.cpu_cores.is_empty() { bad.push("--cpu-cores"); }
-    if args.gpu.is_some() { bad.push("--gpu"); }
-    if args.dry_run { bad.push("--dry-run"); }
-    if args.status_fd.is_some() { bad.push("--status-fd"); }
-    if !pb.fs_denied.is_empty() { bad.push("--fs-deny"); }
-    if !args.fs_mount.is_empty() { bad.push("--fs-mount"); }
+    if args.max_memory.is_some() {
+        bad.push("--max-memory");
+    }
+    if pb.max_processes.is_some() {
+        bad.push("--max-processes");
+    }
+    if pb.max_cpu.is_some() {
+        bad.push("--max-cpu");
+    }
+    if pb.max_open_files.is_some() {
+        bad.push("--max-open-files");
+    }
+    if args.timeout.is_some() {
+        bad.push("--timeout");
+    }
+    if !pb.net_allow.is_empty() {
+        bad.push("--net-allow");
+    }
+    if !pb.net_deny.is_empty() {
+        bad.push("--net-deny");
+    }
+    if !pb.net_allow_bind.is_empty() {
+        bad.push("--net-allow-bind");
+    }
+    if !pb.net_deny_bind.is_empty() {
+        bad.push("--net-deny-bind");
+    }
+    if !pb.http_allow.is_empty() {
+        bad.push("--http-allow");
+    }
+    if !pb.http_deny.is_empty() {
+        bad.push("--http-deny");
+    }
+    if !pb.http_ports.is_empty() {
+        bad.push("--http-port");
+    }
+    if pb.num_cpus.is_some() {
+        bad.push("--num-cpus");
+    }
+    if pb.random_seed.is_some() {
+        bad.push("--random-seed");
+    }
+    if args.time_start.is_some() {
+        bad.push("--time-start");
+    }
+    if pb.no_randomize_memory {
+        bad.push("--no-randomize-memory");
+    }
+    if pb.no_huge_pages {
+        bad.push("--no-huge-pages");
+    }
+    if pb.deterministic_dirs {
+        bad.push("--deterministic-dirs");
+    }
+    if pb.chroot.is_some() {
+        bad.push("--chroot");
+    }
+    if args.image.is_some() {
+        bad.push("--image");
+    }
+    if pb.user.is_some() {
+        bad.push("--user");
+    }
+    if pb.workdir.is_some() {
+        bad.push("--workdir");
+    }
+    if pb.cwd.is_some() {
+        bad.push("--cwd");
+    }
+    if pb.fs_storage.is_some() {
+        bad.push("--fs-storage");
+    }
+    if args.max_disk.is_some() {
+        bad.push("--max-disk");
+    }
+    if pb.port_remap {
+        bad.push("--port-remap");
+    }
+    if !args.cpu_cores.is_empty() {
+        bad.push("--cpu-cores");
+    }
+    if args.gpu.is_some() {
+        bad.push("--gpu");
+    }
+    if args.dry_run {
+        bad.push("--dry-run");
+    }
+    if args.status_fd.is_some() {
+        bad.push("--status-fd");
+    }
+    if !pb.fs_denied.is_empty() {
+        bad.push("--fs-deny");
+    }
+    if !args.fs_mount.is_empty() {
+        bad.push("--fs-mount");
+    }
 
     if !bad.is_empty() {
         return Err(anyhow!(
@@ -837,10 +1109,12 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
 }
 
 fn profile_source(args: &RunArgs) -> String {
-    args.profile.as_deref()
+    args.profile
+        .as_deref()
         .map(|n| format!("profile {n}"))
         .unwrap_or_else(|| {
-            let path = args.profile_file
+            let path = args
+                .profile_file
                 .as_ref()
                 .expect("profile_source called without a loaded profile");
             format!("profile file {}", path.display())
@@ -856,39 +1130,105 @@ fn profile_source(args: &RunArgs) -> String {
 fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()> {
     let mut bad = Vec::new();
 
-    if !profile.fs_denied.is_empty() { bad.push("[filesystem].deny"); }
-    if !profile.net_allow.is_empty() { bad.push("[network].allow"); }
-    if !profile.net_deny.is_empty() { bad.push("[network].deny"); }
-    if !profile.net_allow_bind.is_default() { bad.push("[network].allow_bind"); }
-    if !profile.net_deny_bind.is_empty() { bad.push("[network].deny_bind"); }
-    if profile.port_remap { bad.push("[network].port_remap"); }
-    if !profile.http_allow.is_empty() { bad.push("[http].allow"); }
-    if !profile.http_deny.is_empty() { bad.push("[http].deny"); }
-    if !profile.http_ports.is_empty() { bad.push("[http].ports"); }
-    if profile.http_ca.is_some() { bad.push("[config].http_ca"); }
-    if profile.http_key.is_some() { bad.push("[config].http_key"); }
-    if profile.max_memory.is_some() { bad.push("[limits].memory"); }
-    if profile.max_processes.is_some() { bad.push("[limits].processes"); }
-    if profile.max_open_files.is_some() { bad.push("[limits].open_files"); }
-    if profile.max_cpu.is_some() { bad.push("[limits].cpu"); }
-    if profile.max_disk.is_some() { bad.push("[limits].disk"); }
-    if profile.gpu_devices.is_some() { bad.push("[limits].gpu_devices"); }
-    if profile.cpu_cores.is_some() { bad.push("[limits].cpu_cores"); }
-    if profile.num_cpus.is_some() { bad.push("[limits].num_cpus"); }
-    if profile.random_seed.is_some() { bad.push("[determinism].random_seed"); }
-    if profile.time_start.is_some() { bad.push("[determinism].time_start"); }
-    if profile.deterministic_dirs { bad.push("[determinism].deterministic_dirs"); }
-    if profile.no_randomize_memory { bad.push("[determinism].no_randomize_memory"); }
-    if profile.no_huge_pages { bad.push("[program].no_huge_pages"); }
-    if profile.no_coredump { bad.push("[program].no_coredump"); }
-    if profile.workdir.is_some() { bad.push("[config].workdir"); }
-    if profile.fs_storage.is_some() { bad.push("[config].fs_storage"); }
-    if profile.cwd.is_some() { bad.push("[program].cwd"); }
-    if profile.user.is_some() { bad.push("[program].uid"); }
-    if profile.chroot.is_some() { bad.push("[filesystem].chroot"); }
-    if !profile.fs_mount.is_empty() { bad.push("[filesystem].mount"); }
-    if profile.on_exit != BranchAction::Commit { bad.push("[filesystem].on_exit"); }
-    if profile.on_error != BranchAction::Abort { bad.push("[filesystem].on_error"); }
+    if !profile.fs_denied.is_empty() {
+        bad.push("[filesystem].deny");
+    }
+    if !profile.net_allow.is_empty() {
+        bad.push("[network].allow");
+    }
+    if !profile.net_deny.is_empty() {
+        bad.push("[network].deny");
+    }
+    if !profile.net_allow_bind.is_default() {
+        bad.push("[network].allow_bind");
+    }
+    if !profile.net_deny_bind.is_empty() {
+        bad.push("[network].deny_bind");
+    }
+    if profile.port_remap {
+        bad.push("[network].port_remap");
+    }
+    if !profile.http_allow.is_empty() {
+        bad.push("[http].allow");
+    }
+    if !profile.http_deny.is_empty() {
+        bad.push("[http].deny");
+    }
+    if !profile.http_ports.is_empty() {
+        bad.push("[http].ports");
+    }
+    if profile.http_ca.is_some() {
+        bad.push("[config].http_ca");
+    }
+    if profile.http_key.is_some() {
+        bad.push("[config].http_key");
+    }
+    if profile.max_memory.is_some() {
+        bad.push("[limits].memory");
+    }
+    if profile.max_processes.is_some() {
+        bad.push("[limits].processes");
+    }
+    if profile.max_open_files.is_some() {
+        bad.push("[limits].open_files");
+    }
+    if profile.max_cpu.is_some() {
+        bad.push("[limits].cpu");
+    }
+    if profile.max_disk.is_some() {
+        bad.push("[limits].disk");
+    }
+    if profile.gpu_devices.is_some() {
+        bad.push("[limits].gpu_devices");
+    }
+    if profile.cpu_cores.is_some() {
+        bad.push("[limits].cpu_cores");
+    }
+    if profile.num_cpus.is_some() {
+        bad.push("[limits].num_cpus");
+    }
+    if profile.random_seed.is_some() {
+        bad.push("[determinism].random_seed");
+    }
+    if profile.time_start.is_some() {
+        bad.push("[determinism].time_start");
+    }
+    if profile.deterministic_dirs {
+        bad.push("[determinism].deterministic_dirs");
+    }
+    if profile.no_randomize_memory {
+        bad.push("[determinism].no_randomize_memory");
+    }
+    if profile.no_huge_pages {
+        bad.push("[program].no_huge_pages");
+    }
+    if profile.no_coredump {
+        bad.push("[program].no_coredump");
+    }
+    if profile.workdir.is_some() {
+        bad.push("[config].workdir");
+    }
+    if profile.fs_storage.is_some() {
+        bad.push("[config].fs_storage");
+    }
+    if profile.cwd.is_some() {
+        bad.push("[program].cwd");
+    }
+    if profile.user.is_some() {
+        bad.push("[program].uid");
+    }
+    if profile.chroot.is_some() {
+        bad.push("[filesystem].chroot");
+    }
+    if !profile.fs_mount.is_empty() {
+        bad.push("[filesystem].mount");
+    }
+    if profile.on_exit != BranchAction::Commit {
+        bad.push("[filesystem].on_exit");
+    }
+    if profile.on_error != BranchAction::Abort {
+        bad.push("[filesystem].on_error");
+    }
 
     if !bad.is_empty() {
         return Err(anyhow!(
@@ -911,9 +1251,13 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
 fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
     match s {
         "commit" => Ok(BranchAction::Commit),
-        "abort"  => Ok(BranchAction::Abort),
-        "keep"   => Ok(BranchAction::Keep),
-        other    => Err(anyhow!("invalid {} value '{}': expected commit | abort | keep", flag, other)),
+        "abort" => Ok(BranchAction::Abort),
+        "keep" => Ok(BranchAction::Keep),
+        other => Err(anyhow!(
+            "invalid {} value '{}': expected commit | abort | keep",
+            flag,
+            other
+        )),
     }
 }
 
@@ -975,7 +1319,11 @@ fn pidfd_open(pid: i32) -> Option<std::os::fd::OwnedFd> {
 
 fn pidfd_exited(fd: &std::os::fd::OwnedFd) -> bool {
     use std::os::fd::AsRawFd;
-    let mut poll = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
     unsafe { libc::poll(&mut poll, 1, 0) != 0 }
 }
 
@@ -984,18 +1332,15 @@ fn query_ports(name: &str) -> String {
     match send_control_request(name, "ports", serde_json::Value::Object(Default::default())) {
         Ok(resp) if resp.ok => {
             if let Some(data) = resp.data {
-                let map: std::collections::HashMap<u16, u16> =
-                    match serde_json::from_value(data) {
-                        Ok(m) => m,
-                        Err(_) => return "-".to_string(),
-                    };
+                let map: std::collections::HashMap<u16, u16> = match serde_json::from_value(data) {
+                    Ok(m) => m,
+                    Err(_) => return "-".to_string(),
+                };
                 if map.is_empty() {
                     return "-".to_string();
                 }
-                let mut entries: Vec<String> = map
-                    .iter()
-                    .map(|(v, r)| format!("{}→{}", v, r))
-                    .collect();
+                let mut entries: Vec<String> =
+                    map.iter().map(|(v, r)| format!("{}→{}", v, r)).collect();
                 entries.sort();
                 entries.join(", ")
             } else {
@@ -1029,9 +1374,17 @@ fn proc_uptime(pid: i32) -> Option<String> {
     } else if uptime_secs < 3600 {
         Some(format!("{}m", uptime_secs / 60))
     } else if uptime_secs < 86400 {
-        Some(format!("{}h{}m", uptime_secs / 3600, (uptime_secs % 3600) / 60))
+        Some(format!(
+            "{}h{}m",
+            uptime_secs / 3600,
+            (uptime_secs % 3600) / 60
+        ))
     } else {
-        Some(format!("{}d{}h", uptime_secs / 86400, (uptime_secs % 86400) / 3600))
+        Some(format!(
+            "{}d{}h",
+            uptime_secs / 86400,
+            (uptime_secs % 86400) / 3600
+        ))
     }
 }
 
@@ -1091,32 +1444,65 @@ mod render_tests {
     #[test]
     fn render_allow_host_ports() {
         let rules = NetRule::parse_allow("example.com:443").unwrap();
-        assert_eq!(sandlock_core::format_net_rule(&rules[0]), "tcp://example.com:443");
-        assert_eq!(sandlock_core::format_net_rule(&rules[1]), "udp://example.com:443");
+        assert_eq!(
+            sandlock_core::format_net_rule(&rules[0]),
+            "tcp://example.com:443"
+        );
+        assert_eq!(
+            sandlock_core::format_net_rule(&rules[1]),
+            "udp://example.com:443"
+        );
     }
 
     #[test]
     fn render_cidr_and_ipv6_round_trip() {
         // CIDR and IPv6-literal targets render identically for allow/deny.
-        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()[0]), "tcp://10.0.0.0/8:80");
-        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()[0]), "tcp://10.0.0.0/8");
-        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()[0]), "tcp://[::1]:443");
-        assert_eq!(sandlock_core::format_net_rule(&NetRule::parse_allow("::1").unwrap()[0]), "tcp://::1");
+        assert_eq!(
+            sandlock_core::format_net_rule(&NetRule::parse_allow("10.0.0.0/8:80").unwrap()[0]),
+            "tcp://10.0.0.0/8:80"
+        );
+        assert_eq!(
+            sandlock_core::format_net_rule(&NetRule::parse_deny("10.0.0.0/8").unwrap()[0]),
+            "tcp://10.0.0.0/8"
+        );
+        assert_eq!(
+            sandlock_core::format_net_rule(&NetRule::parse_allow("[::1]:443").unwrap()[0]),
+            "tcp://[::1]:443"
+        );
+        assert_eq!(
+            sandlock_core::format_net_rule(&NetRule::parse_allow("::1").unwrap()[0]),
+            "tcp://::1"
+        );
     }
 
     #[test]
     fn render_roundtrips_through_parse() {
         for spec in [
-            "example.com:443", "udp://1.1.1.1:53", "icmp://github.com", "*", "udp://*",
-            "tcp://*", "10.0.0.0/8:80", "[fc00::/7]:443", "::1", "1.2.3.4",
+            "example.com:443",
+            "udp://1.1.1.1:53",
+            "icmp://github.com",
+            "*",
+            "udp://*",
+            "tcp://*",
+            "10.0.0.0/8:80",
+            "[fc00::/7]:443",
+            "::1",
+            "1.2.3.4",
         ] {
             for r in &NetRule::parse_allow(spec).unwrap() {
                 let rendered = sandlock_core::format_net_rule(r);
                 // A rendered rule always carries its scheme, so it must
                 // reparse to exactly one rule equal to the original.
                 let reparsed = NetRule::parse_allow(&rendered).unwrap();
-                assert_eq!(reparsed.len(), 1, "rendered `{rendered}` from {spec} not single");
-                assert_eq!(*r, reparsed[0], "round-trip mismatch for {spec} via `{rendered}`");
+                assert_eq!(
+                    reparsed.len(),
+                    1,
+                    "rendered `{rendered}` from {spec} not single"
+                );
+                assert_eq!(
+                    *r, reparsed[0],
+                    "round-trip mismatch for {spec} via `{rendered}`"
+                );
             }
         }
     }

@@ -1,68 +1,68 @@
-pub mod error;
-pub mod http;
+pub(crate) mod arch;
+pub(crate) mod ca_inject;
+#[cfg(feature = "checkpoint")]
+pub(crate) mod checkpoint;
+pub(crate) mod chroot;
+pub mod context;
+pub mod control;
+pub mod controller;
+#[cfg(feature = "cow")]
+pub(crate) mod cow;
 #[cfg(feature = "http")]
 pub(crate) mod credential;
 #[cfg(not(feature = "http"))]
 #[path = "credential_disabled.rs"]
 pub(crate) mod credential;
-pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
-pub mod profile;
+pub mod error;
 pub mod expand;
-pub mod result;
-pub(crate) mod arch;
-pub(crate) mod sys;
-pub mod landlock;
-pub mod protection;
-pub mod seccomp;
-pub(crate) mod resource;
-pub(crate) mod pgroup;
-pub(crate) mod reaper;
-pub(crate) mod network;
-pub mod context;
-pub(crate) mod resolved;
-pub(crate) mod seccomp_plan;
-pub(crate) mod vdso;
-pub(crate) mod random;
-pub(crate) mod time;
-#[cfg(feature = "cow")]
-pub(crate) mod cow;
-#[cfg(feature = "cow")]
-pub mod recovery;
-#[cfg(feature = "checkpoint")]
-pub(crate) mod checkpoint;
+pub mod fork;
 pub(crate) mod freeze;
-pub mod netlink;
-pub(crate) mod procfs;
-pub(crate) mod port_remap;
-pub mod pipeline;
-#[cfg(feature = "cow")]
-pub mod transaction;
-pub mod policy_fn;
+pub mod http;
 #[cfg(feature = "image")]
 pub mod image;
-pub mod fork;
-pub(crate) mod ca_inject;
-pub(crate) mod chroot;
-pub mod control;
-pub mod controller;
+pub mod landlock;
+pub mod netlink;
+pub(crate) mod network;
+pub(crate) mod pgroup;
+pub mod pipeline;
+pub mod policy_fn;
+pub(crate) mod port_remap;
+pub(crate) mod procfs;
+pub mod profile;
+pub mod protection;
+pub(crate) mod random;
+pub(crate) mod reaper;
+#[cfg(feature = "cow")]
+pub mod recovery;
+pub(crate) mod resolved;
+pub(crate) mod resource;
+pub mod result;
+pub mod sandbox; // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
+pub mod seccomp;
+pub(crate) mod seccomp_plan;
+pub(crate) mod sys;
+pub(crate) mod time;
+#[cfg(feature = "cow")]
+pub mod transaction;
 #[cfg(feature = "http")]
 mod transparent_proxy;
 #[cfg(not(feature = "http"))]
 #[path = "transparent_proxy/disabled.rs"]
 mod transparent_proxy;
+pub(crate) mod vdso;
 
-pub use controller::Controller;
-pub use error::SandlockError;
-pub use policy_fn::PolicyFn;
-pub use sys::structs::{SeccompData, SeccompNotif};
 #[cfg(feature = "checkpoint")]
 pub use checkpoint::{Checkpoint, SkippedFd};
-pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
+pub use controller::Controller;
+pub use error::SandlockError;
+pub use pipeline::{Gather, Pipeline, Stage};
+pub use policy_fn::PolicyFn;
+pub use protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
+pub use result::{renames, Change, ChangeKind, Entry, EntryKind, ExitStatus, RunResult};
 pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
 };
-pub use result::{renames, Change, ChangeKind, Entry, EntryKind, ExitStatus, RunResult};
-pub use pipeline::{Stage, Pipeline, Gather};
+pub use sys::structs::{SeccompData, SeccompNotif};
 #[cfg(feature = "cow")]
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The
@@ -75,7 +75,7 @@ pub use recovery::{list_preserved, read_preserved, PreserveReason, PreservedBran
 // format_net_rule renders a NetRule back into the --net-allow/--net-deny
 // grammar (the CLI round-trips profiles through it); the other reverse
 // serializers live unre-exported in `profile`.
-pub use crate::profile::{ProfileInput, ProgramSpec, format_net_rule};
+pub use crate::profile::{format_net_rule, ProfileInput, ProgramSpec};
 
 // Public extension API — see docs/extension-handlers.md.
 pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};
@@ -100,12 +100,10 @@ pub fn confine(confinement: &Confinement) -> Result<(), SandlockError> {
     // Set NO_NEW_PRIVS (required for Landlock)
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(SandlockError::Runtime(
-            error::SandboxRuntimeError::Confinement(
-                error::ConfinementError::Landlock(format!(
-                    "prctl(PR_SET_NO_NEW_PRIVS): {}",
-                    std::io::Error::last_os_error()
-                ))
-            )
+            error::SandboxRuntimeError::Confinement(error::ConfinementError::Landlock(format!(
+                "prctl(PR_SET_NO_NEW_PRIVS): {}",
+                std::io::Error::last_os_error()
+            ))),
         ));
     }
 

@@ -59,7 +59,13 @@ mod tests {
     use crate::result::{Entry, EntryKind};
 
     fn file(digest: u8) -> Entry {
-        Entry { kind: EntryKind::File, mode: 0o644, size: 1, digest: Some([digest; 32]), target: None }
+        Entry {
+            kind: EntryKind::File,
+            mode: 0o644,
+            size: 1,
+            digest: Some([digest; 32]),
+            target: None,
+        }
     }
 
     #[test]
@@ -91,7 +97,10 @@ mod tests {
         o.set_digest("keep", [9; 32]);
         o.set_digest("gone", [9; 32]);
         assert_eq!(o.get("f").unwrap().as_ref().unwrap().digest, Some([9; 32]));
-        assert_eq!(o.get("keep").unwrap().as_ref().unwrap().digest, Some([1; 32]));
+        assert_eq!(
+            o.get("keep").unwrap().as_ref().unwrap().digest,
+            Some([1; 32])
+        );
         assert_eq!(o.get("gone"), Some(&None));
     }
 

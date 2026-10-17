@@ -19,9 +19,7 @@ use tokio::sync::Mutex;
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{spawn_pid_watcher, NotifAction, NotifPolicy};
 use crate::seccomp::state::{read_tgid_of_tid, PerProcessState, PidKey, ResourceState};
-use crate::sys::structs::{
-    SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
-};
+use crate::sys::structs::{SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM};
 
 /// CLONE_THREAD flag — threads don't count toward process limit.
 const CLONE_THREAD: u64 = 0x0001_0000;
@@ -272,7 +270,12 @@ pub(crate) async fn prepare_process_creation_tracking(
     });
 
     match attached_rx.await {
-        Ok(Ok(())) => Ok(ProcessCreationTrace { cmd_tx, join: Some(join), caller_tid, signaled: false }),
+        Ok(Ok(())) => Ok(ProcessCreationTrace {
+            cmd_tx,
+            join: Some(join),
+            caller_tid,
+            signaled: false,
+        }),
         Ok(Err(errno)) => {
             let _ = join.await;
             Err(io::Error::from_raw_os_error(errno))
@@ -306,7 +309,9 @@ fn process_creation_worker(
         | libc::PTRACE_O_TRACESYSGOOD) as libc::c_ulong;
     let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE, caller_tid, 0, opts) };
     if ret < 0 {
-        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
+        let errno = io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EPERM);
         let _ = attached_tx.send(Err(errno));
         return Err(io::Error::from_raw_os_error(errno));
     }
@@ -356,11 +361,9 @@ fn wait_for_ptrace_stop(tid: i32) -> io::Result<libc::c_int> {
     Ok(status)
 }
 
-
 #[cfg(test)]
-static CHILD_REGISTERED_HOOK: std::sync::Mutex<
-    Option<Box<dyn Fn(i32) + Send + 'static>>,
-> = std::sync::Mutex::new(None);
+static CHILD_REGISTERED_HOOK: std::sync::Mutex<Option<Box<dyn Fn(i32) + Send + 'static>>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn child_registered_for_test(child_pid: i32) {
@@ -429,7 +432,11 @@ fn run_creation_event_loop(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Res
 
         // Some other signal-delivery-stop in the window: forward the pending
         // signal and keep waiting for the fork event.
-        let inject = if stopsig == libc::SIGTRAP { 0 } else { stopsig as libc::c_ulong };
+        let inject = if stopsig == libc::SIGTRAP {
+            0
+        } else {
+            stopsig as libc::c_ulong
+        };
         ptrace_cont(caller_tid, inject)?;
     }
 }
@@ -448,14 +455,7 @@ fn ptrace_cont(tid: i32, sig: libc::c_ulong) -> io::Result<()> {
 /// detach the child so it can run. Runs on the worker thread.
 fn handle_fork_event(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bool> {
     let mut child_pid: libc::c_ulong = 0;
-    let ret = unsafe {
-        libc::ptrace(
-            libc::PTRACE_GETEVENTMSG,
-            caller_tid,
-            0,
-            &mut child_pid,
-        )
-    };
+    let ret = unsafe { libc::ptrace(libc::PTRACE_GETEVENTMSG, caller_tid, 0, &mut child_pid) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -499,10 +499,12 @@ pub(crate) async fn finish_process_creation_tracking(
     // Send is non-blocking (capacity-1 channel, single sender) — the worker is
     // parked waiting to receive, then blocks in `waitpid` for the fork event.
     let _ = trace.cmd_tx.send(TraceCmd::Proceed);
-    let mut join = trace.join.take().expect("join handle present until finish/abort");
+    let mut join = trace
+        .join
+        .take()
+        .expect("join handle present until finish/abort");
 
-    let join_err =
-        |e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}"));
+    let join_err = |e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}"));
 
     // Race the worker against a watchdog. The worker's `waitpid` is blocking, so
     // a *failed* fork (no ptrace event) would hang it forever; on the deadline
@@ -637,8 +639,12 @@ fn newly_writable_bytes(pid: i32, addr: u64, len: u64) -> Option<u64> {
     let mut total = 0u64;
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
-        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else { continue };
-        let Some((lo, hi)) = range.split_once('-') else { continue };
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some((lo, hi)) = range.split_once('-') else {
+            continue;
+        };
         let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else {
             continue;
         };
@@ -662,7 +668,9 @@ fn newly_writable_bytes(pid: i32, addr: u64, len: u64) -> Option<u64> {
 /// be allowed to sit higher.
 fn reconcile_floor(st: &mut ResourceState, per: Option<&mut PerProcessState>, pid: i32) {
     let Some(per) = per else { return };
-    let Some(measured) = read_private_anon_bytes(pid) else { return };
+    let Some(measured) = read_private_anon_bytes(pid) else {
+        return;
+    };
     if measured > per.mem_charged {
         let correction = measured - per.mem_charged;
         per.mem_charged = measured;
@@ -715,7 +723,10 @@ pub(crate) async fn handle_memory(
     // Kill the task that asked for the memory, not the whole sandbox: the
     // budget is sandbox-wide, so ending the one process that would exceed
     // it frees its charge and lets the rest run on, as an OOM killer does.
-    let kill = NotifAction::KillTask { sig: libc::SIGKILL, pid: notif.pid as i32 };
+    let kill = NotifAction::KillTask {
+        sig: libc::SIGKILL,
+        pid: notif.pid as i32,
+    };
     let would_exceed = |st: &ResourceState, bytes: u64| st.mem_used.saturating_add(bytes) > limit;
 
     // Allocations are judged against the ledger, so correct it first; a
@@ -1047,17 +1058,29 @@ mod tests {
         let rw = (libc::PROT_READ | libc::PROT_WRITE) as u64;
 
         let shared = file_mmap_notif(1 << 30, rw, libc::MAP_SHARED as u64);
-        assert!(matches!(handle_memory(&shared, &ctx, &policy).await, NotifAction::Continue));
+        assert!(matches!(
+            handle_memory(&shared, &ctx, &policy).await,
+            NotifAction::Continue
+        ));
         let readonly = file_mmap_notif(1 << 30, libc::PROT_READ as u64, libc::MAP_PRIVATE as u64);
-        assert!(matches!(handle_memory(&readonly, &ctx, &policy).await, NotifAction::Continue));
+        assert!(matches!(
+            handle_memory(&readonly, &ctx, &policy).await,
+            NotifAction::Continue
+        ));
         assert_eq!(ctx.resource.lock().await.mem_used, 0);
 
         let small = file_mmap_notif(1 << 19, rw, libc::MAP_PRIVATE as u64);
-        assert!(matches!(handle_memory(&small, &ctx, &policy).await, NotifAction::Continue));
+        assert!(matches!(
+            handle_memory(&small, &ctx, &policy).await,
+            NotifAction::Continue
+        ));
         assert_eq!(ctx.resource.lock().await.mem_used, 1 << 19);
 
         let big = file_mmap_notif(1 << 30, rw, libc::MAP_PRIVATE as u64);
-        assert!(matches!(handle_memory(&big, &ctx, &policy).await, NotifAction::KillTask { .. }));
+        assert!(matches!(
+            handle_memory(&big, &ctx, &policy).await,
+            NotifAction::KillTask { .. }
+        ));
     }
 
     /// A PROT_NONE reservation backs nothing, so it must not count: the
@@ -1072,18 +1095,31 @@ mod tests {
 
         let reserve = mmap_notif(1 << 30, libc::PROT_NONE as u64);
         let action = handle_memory(&reserve, &ctx, &policy).await;
-        assert!(matches!(action, NotifAction::Continue), "reservation killed");
+        assert!(
+            matches!(action, NotifAction::Continue),
+            "reservation killed"
+        );
         assert_eq!(ctx.resource.lock().await.mem_used, 0);
 
         let commit = mmap_notif(1 << 30, (libc::PROT_READ | libc::PROT_WRITE) as u64);
         let action = handle_memory(&commit, &ctx, &policy).await;
-        assert!(matches!(action, NotifAction::KillTask { .. }), "commit not judged");
+        assert!(
+            matches!(action, NotifAction::KillTask { .. }),
+            "commit not judged"
+        );
     }
 
     fn mprotect_notif(addr: u64, len: u64) -> SeccompNotif {
         let mut n = fake_notif(libc::SYS_mprotect, 0);
         n.pid = std::process::id();
-        n.data.args = [addr, len, (libc::PROT_READ | libc::PROT_WRITE) as u64, 0, 0, 0];
+        n.data.args = [
+            addr,
+            len,
+            (libc::PROT_READ | libc::PROT_WRITE) as u64,
+            0,
+            0,
+            0,
+        ];
         n
     }
 
@@ -1114,11 +1150,21 @@ mod tests {
         let reserved = map_anon(1 << 30, libc::PROT_NONE);
 
         let over = handle_memory(&mprotect_notif(reserved, 1 << 30), &ctx, &policy).await;
-        assert!(matches!(over, NotifAction::KillTask { .. }), "1 GiB commit under 1 MiB");
+        assert!(
+            matches!(over, NotifAction::KillTask { .. }),
+            "1 GiB commit under 1 MiB"
+        );
 
         let under = handle_memory(&mprotect_notif(reserved, 1 << 19), &ctx, &policy).await;
-        assert!(matches!(under, NotifAction::Continue), "512 KiB commit under 1 MiB");
-        assert_eq!(ctx.resource.lock().await.mem_used, 0, "mprotect must not charge");
+        assert!(
+            matches!(under, NotifAction::Continue),
+            "512 KiB commit under 1 MiB"
+        );
+        assert_eq!(
+            ctx.resource.lock().await.mem_used,
+            0,
+            "mprotect must not charge"
+        );
         unsafe { libc::munmap(reserved as *mut _, 1 << 30) };
     }
 
@@ -1135,7 +1181,10 @@ mod tests {
         let writable = map_anon(16 << 20, libc::PROT_READ | libc::PROT_WRITE);
 
         let action = handle_memory(&mprotect_notif(writable, 16 << 20), &ctx, &policy).await;
-        assert!(matches!(action, NotifAction::Continue), "already-writable range killed");
+        assert!(
+            matches!(action, NotifAction::Continue),
+            "already-writable range killed"
+        );
         unsafe { libc::munmap(writable as *mut _, 16 << 20) };
     }
 
@@ -1151,9 +1200,18 @@ mod tests {
         assert!(!fork_counted_on_continue(&clone_thread));
         assert!(!fork_counted_on_continue(&openat));
 
-        assert!(!requires_process_creation_tracking(&clone_proc, &no_argv_safety));
-        assert!(requires_process_creation_tracking(&clone_proc, &argv_safety));
-        assert!(!requires_process_creation_tracking(&clone_thread, &argv_safety));
+        assert!(!requires_process_creation_tracking(
+            &clone_proc,
+            &no_argv_safety
+        ));
+        assert!(requires_process_creation_tracking(
+            &clone_proc,
+            &argv_safety
+        ));
+        assert!(!requires_process_creation_tracking(
+            &clone_thread,
+            &argv_safety
+        ));
         assert!(!requires_process_creation_tracking(&openat, &argv_safety));
 
         if let Some(fork_nr) = crate::arch::sys_fork() {
@@ -1255,7 +1313,11 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     unsafe fn caller_wait_then_fork(flags: *mut i32) -> ! {
         while ptr::read_volatile(flags.offset(GO)) == 0 {
             core::hint::spin_loop();
@@ -1285,7 +1347,11 @@ mod tests {
         libc::_exit(1);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     #[test]
     fn process_creation_tracking_registers_child_before_user_code_runs() {
         let flags = SharedFlags::new();
@@ -1334,7 +1400,10 @@ mod tests {
         let created = rt
             .block_on(finish_process_creation_tracking(trace))
             .expect("finish process-creation tracking");
-        assert!(created, "fork/clone should produce a ptrace process-creation event");
+        assert!(
+            created,
+            "fork/clone should produce a ptrace process-creation event"
+        );
 
         let registered_pid = flags.read(REGISTERED_PID);
         assert!(registered_pid > 0, "child pid should be captured by hook");

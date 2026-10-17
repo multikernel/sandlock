@@ -1,4 +1,4 @@
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -67,7 +67,9 @@ fn handle_http_conn(stream: &mut TcpStream) {
             break;
         }
         if line.to_lowercase().starts_with("content-length:") {
-            content_length = line.split(':').nth(1)
+            content_length = line
+                .split(':')
+                .nth(1)
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(0);
         }
@@ -137,12 +139,18 @@ async fn test_http_allow_get() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
@@ -162,12 +170,18 @@ async fn test_http_deny_non_matching() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/denied", port), &out);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("HTTP:403"), "expected HTTP:403, got: {}", content);
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected HTTP:403, got: {}",
+        content
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -188,21 +202,33 @@ async fn test_http_deny_precedence() {
 
     // GET /public — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/public", port), &out_allowed);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_allowed).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200 for /public, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 for /public, got: {}",
+        content
+    );
 
     // GET /secret — should be denied
     let script = http_script(&format!("http://127.0.0.1:{}/secret", port), &out_denied);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_denied).unwrap_or_default();
-    assert!(content.starts_with("HTTP:403"), "expected HTTP:403 for /secret, got: {}", content);
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected HTTP:403 for /secret, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out_allowed);
@@ -222,12 +248,18 @@ async fn test_http_no_acl_unrestricted() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200 (unrestricted), got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 (unrestricted), got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
@@ -248,21 +280,33 @@ async fn test_http_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_get);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_get).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200 for GET, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 for GET, got: {}",
+        content
+    );
 
     // POST should be denied
     let script = post_script(&format!("http://127.0.0.1:{}/anything", port), &out_post);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_post).unwrap_or_default();
-    assert!(content.starts_with("HTTP:403"), "expected HTTP:403 for POST, got: {}", content);
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected HTTP:403 for POST, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out_get);
@@ -285,21 +329,33 @@ async fn test_http_multiple_allow_rules() {
 
     // GET /get — should succeed (matches first rule)
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_get).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200 for /get, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 for /get, got: {}",
+        content
+    );
 
     // GET /anything — should be denied (not in allow list)
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_other);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_other).unwrap_or_default();
-    assert!(content.starts_with("HTTP:403"), "expected HTTP:403 for /anything, got: {}", content);
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected HTTP:403 for /anything, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out_get);
@@ -322,21 +378,36 @@ async fn test_http_wildcard_host() {
 
     // GET /get — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_get).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200 for /get, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 for /get, got: {}",
+        content
+    );
 
     // GET /admin/settings — should be denied
-    let script = http_script(&format!("http://127.0.0.1:{}/admin/settings", port), &out_denied);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let script = http_script(
+        &format!("http://127.0.0.1:{}/admin/settings", port),
+        &out_denied,
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_denied).unwrap_or_default();
-    assert!(content.starts_with("HTTP:403"), "expected HTTP:403 for /admin/settings, got: {}", content);
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected HTTP:403 for /admin/settings, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out_get);
@@ -384,13 +455,19 @@ async fn test_http_non_intercepted_port() {
         port = port,
     );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     srv.join().unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("OK:HELLO"), "expected OK:HELLO, got: {}", content);
+    assert!(
+        content.starts_with("OK:HELLO"),
+        "expected OK:HELLO, got: {}",
+        content
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -412,12 +489,18 @@ async fn test_http_acl_ipv6_allow() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/get", port), &out);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200 for IPv6 allow, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 for IPv6 allow, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
@@ -436,12 +519,18 @@ async fn test_http_acl_ipv6_deny() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/denied", port), &out);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("HTTP:403"), "expected HTTP:403 for IPv6 deny, got: {}", content);
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected HTTP:403 for IPv6 deny, got: {}",
+        content
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -483,13 +572,19 @@ async fn test_http_ipv6_non_intercepted_port() {
         port = port,
     );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     srv.join().unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("OK:HELLO6"), "expected OK:HELLO6, got: {}", content);
+    assert!(
+        content.starts_with("OK:HELLO6"),
+        "expected OK:HELLO6, got: {}",
+        content
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -509,21 +604,33 @@ async fn test_http_acl_ipv6_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://[::1]:{}/anything", port), &out_get);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_get).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "expected OK:200 for IPv6 GET, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "expected OK:200 for IPv6 GET, got: {}",
+        content
+    );
 
     // POST should be denied
     let script = post_script(&format!("http://[::1]:{}/anything", port), &out_post);
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
     let content = std::fs::read_to_string(&out_post).unwrap_or_default();
-    assert!(content.starts_with("HTTP:403"), "expected HTTP:403 for IPv6 POST, got: {}", content);
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected HTTP:403 for IPv6 POST, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out_get);
@@ -550,8 +657,7 @@ fn spawn_capturing_http_server() -> (
                     break;
                 }
                 if line.to_lowercase().starts_with("authorization:") {
-                    *cap.lock().unwrap() =
-                        Some(line.split_once(':').unwrap().1.trim().to_string());
+                    *cap.lock().unwrap() = Some(line.split_once(':').unwrap().1.trim().to_string());
                 }
                 if line == "\r\n" || line == "\n" {
                     break;
@@ -584,12 +690,18 @@ async fn test_credential_injected_into_upstream() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/data", port), &out);
-    let result = policy.run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.starts_with("OK:200"), "child request should succeed, got: {}", content);
+    assert!(
+        content.starts_with("OK:200"),
+        "child request should succeed, got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let got = captured.lock().unwrap().clone();
@@ -599,7 +711,8 @@ async fn test_credential_injected_into_upstream() {
     // The child sent no Authorization header; the proxy injected the credential
     // by value while the child only ever knew its name.
     assert_eq!(
-        got.as_deref(), Some("Bearer sk-phase1-secret"),
+        got.as_deref(),
+        Some("Bearer sk-phase1-secret"),
         "upstream must receive the injected credential (got {got:?})"
     );
 }
@@ -626,8 +739,10 @@ async fn test_denied_request_does_not_inject_credential() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/secret", port), &out);
-    let result = policy.run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -637,8 +752,15 @@ async fn test_denied_request_does_not_inject_credential() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&secret_file);
 
-    assert!(content.starts_with("HTTP:403"), "denied request should be 403, got: {}", content);
-    assert_eq!(got, None, "credential must not reach the upstream on a denied request");
+    assert!(
+        content.starts_with("HTTP:403"),
+        "denied request should be 403, got: {}",
+        content
+    );
+    assert_eq!(
+        got, None,
+        "credential must not reach the upstream on a denied request"
+    );
 }
 
 /// An `env:`-sourced credential must be scrubbed from the child's environment,
@@ -662,8 +784,10 @@ async fn test_env_sourced_credential_stripped_from_child() {
         "import os; open('{}', 'w').write(os.environ.get('SANDLOCK_TEST_SECRET_ENV', 'ABSENT'))",
         out.display()
     );
-    let result = policy.run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();

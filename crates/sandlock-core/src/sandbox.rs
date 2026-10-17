@@ -113,8 +113,14 @@ impl std::str::FromStr for RunAs {
         let (u, g) = s
             .split_once(':')
             .ok_or_else(|| format!("expected UID:GID, got {:?}", s))?;
-        let uid = u.trim().parse::<u32>().map_err(|_| format!("invalid uid {:?}", u))?;
-        let gid = g.trim().parse::<u32>().map_err(|_| format!("invalid gid {:?}", g))?;
+        let uid = u
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid uid {:?}", u))?;
+        let gid = g
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid gid {:?}", g))?;
         Ok(RunAs { uid, gid })
     }
 }
@@ -162,47 +168,129 @@ impl TryFrom<&Sandbox> for Confinement {
 
     fn try_from(sandbox: &Sandbox) -> Result<Self, Self::Error> {
         let mut unsupported = Vec::new();
-        if !sandbox.fs_denied.is_empty() { unsupported.push("fs_denied"); }
-        if !sandbox.extra_deny_syscalls.is_empty() { unsupported.push("extra_deny_syscalls"); }
-        if !sandbox.net_allow.is_empty() { unsupported.push("net_allow"); }
-        if !sandbox.net_deny.is_empty() { unsupported.push("net_deny"); }
-        if !sandbox.net_allow_bind.is_default() { unsupported.push("net_allow_bind"); }
-        if !sandbox.net_deny_bind.is_empty() { unsupported.push("net_deny_bind"); }
-        if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
-        if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
-        if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
-        if !sandbox.inject.is_empty() { unsupported.push("http_auth"); }
-        if !sandbox.http_ports.is_empty() { unsupported.push("http_ports"); }
-        if sandbox.http_ca.is_some() { unsupported.push("http_ca"); }
-        if sandbox.http_key.is_some() { unsupported.push("http_key"); }
-        if !sandbox.http_inject_ca.is_empty() { unsupported.push("http_inject_ca"); }
-        if sandbox.http_ca_out.is_some() { unsupported.push("http_ca_out"); }
-        if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
-        if sandbox.max_processes.is_some() { unsupported.push("max_processes"); }
-        if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
-        if sandbox.max_cpu.is_some() { unsupported.push("max_cpu"); }
-        if sandbox.random_seed.is_some() { unsupported.push("random_seed"); }
-        if sandbox.time_start.is_some() { unsupported.push("time_start"); }
-        if sandbox.no_randomize_memory { unsupported.push("no_randomize_memory"); }
-        if sandbox.no_huge_pages { unsupported.push("no_huge_pages"); }
-        if sandbox.no_coredump { unsupported.push("no_coredump"); }
-        if sandbox.deterministic_dirs { unsupported.push("deterministic_dirs"); }
-        if sandbox.workdir.is_some() { unsupported.push("workdir"); }
-        if sandbox.cwd.is_some() { unsupported.push("cwd"); }
-        if sandbox.fs_storage.is_some() { unsupported.push("fs_storage"); }
-        if sandbox.max_disk.is_some() { unsupported.push("max_disk"); }
-        if sandbox.on_exit != BranchAction::Commit { unsupported.push("on_exit"); }
-        if sandbox.on_error != BranchAction::Abort { unsupported.push("on_error"); }
-        if !sandbox.fs_mount.is_empty() { unsupported.push("fs_mount"); }
-        if sandbox.chroot.is_some() { unsupported.push("chroot"); }
-        if sandbox.clean_env { unsupported.push("clean_env"); }
-        if !sandbox.env.is_empty() { unsupported.push("env"); }
-        if sandbox.gpu_devices.is_some() { unsupported.push("gpu_devices"); }
-        if sandbox.cpu_cores.is_some() { unsupported.push("cpu_cores"); }
-        if sandbox.num_cpus.is_some() { unsupported.push("num_cpus"); }
-        if sandbox.port_remap { unsupported.push("port_remap"); }
-        if sandbox.user.is_some() { unsupported.push("user"); }
-        if sandbox.policy_fn.is_some() { unsupported.push("policy_fn"); }
+        if !sandbox.fs_denied.is_empty() {
+            unsupported.push("fs_denied");
+        }
+        if !sandbox.extra_deny_syscalls.is_empty() {
+            unsupported.push("extra_deny_syscalls");
+        }
+        if !sandbox.net_allow.is_empty() {
+            unsupported.push("net_allow");
+        }
+        if !sandbox.net_deny.is_empty() {
+            unsupported.push("net_deny");
+        }
+        if !sandbox.net_allow_bind.is_default() {
+            unsupported.push("net_allow_bind");
+        }
+        if !sandbox.net_deny_bind.is_empty() {
+            unsupported.push("net_deny_bind");
+        }
+        if sandbox.allows_sysv_ipc() {
+            unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]");
+        }
+        if !sandbox.http_allow.is_empty() {
+            unsupported.push("http_allow");
+        }
+        if !sandbox.http_deny.is_empty() {
+            unsupported.push("http_deny");
+        }
+        if !sandbox.inject.is_empty() {
+            unsupported.push("http_auth");
+        }
+        if !sandbox.http_ports.is_empty() {
+            unsupported.push("http_ports");
+        }
+        if sandbox.http_ca.is_some() {
+            unsupported.push("http_ca");
+        }
+        if sandbox.http_key.is_some() {
+            unsupported.push("http_key");
+        }
+        if !sandbox.http_inject_ca.is_empty() {
+            unsupported.push("http_inject_ca");
+        }
+        if sandbox.http_ca_out.is_some() {
+            unsupported.push("http_ca_out");
+        }
+        if sandbox.max_memory.is_some() {
+            unsupported.push("max_memory");
+        }
+        if sandbox.max_processes.is_some() {
+            unsupported.push("max_processes");
+        }
+        if sandbox.max_open_files.is_some() {
+            unsupported.push("max_open_files");
+        }
+        if sandbox.max_cpu.is_some() {
+            unsupported.push("max_cpu");
+        }
+        if sandbox.random_seed.is_some() {
+            unsupported.push("random_seed");
+        }
+        if sandbox.time_start.is_some() {
+            unsupported.push("time_start");
+        }
+        if sandbox.no_randomize_memory {
+            unsupported.push("no_randomize_memory");
+        }
+        if sandbox.no_huge_pages {
+            unsupported.push("no_huge_pages");
+        }
+        if sandbox.no_coredump {
+            unsupported.push("no_coredump");
+        }
+        if sandbox.deterministic_dirs {
+            unsupported.push("deterministic_dirs");
+        }
+        if sandbox.workdir.is_some() {
+            unsupported.push("workdir");
+        }
+        if sandbox.cwd.is_some() {
+            unsupported.push("cwd");
+        }
+        if sandbox.fs_storage.is_some() {
+            unsupported.push("fs_storage");
+        }
+        if sandbox.max_disk.is_some() {
+            unsupported.push("max_disk");
+        }
+        if sandbox.on_exit != BranchAction::Commit {
+            unsupported.push("on_exit");
+        }
+        if sandbox.on_error != BranchAction::Abort {
+            unsupported.push("on_error");
+        }
+        if !sandbox.fs_mount.is_empty() {
+            unsupported.push("fs_mount");
+        }
+        if sandbox.chroot.is_some() {
+            unsupported.push("chroot");
+        }
+        if sandbox.clean_env {
+            unsupported.push("clean_env");
+        }
+        if !sandbox.env.is_empty() {
+            unsupported.push("env");
+        }
+        if sandbox.gpu_devices.is_some() {
+            unsupported.push("gpu_devices");
+        }
+        if sandbox.cpu_cores.is_some() {
+            unsupported.push("cpu_cores");
+        }
+        if sandbox.num_cpus.is_some() {
+            unsupported.push("num_cpus");
+        }
+        if sandbox.port_remap {
+            unsupported.push("port_remap");
+        }
+        if sandbox.user.is_some() {
+            unsupported.push("user");
+        }
+        if sandbox.policy_fn.is_some() {
+            unsupported.push("policy_fn");
+        }
 
         if !unsupported.is_empty() {
             return Err(SandboxError::UnsupportedForConfine(unsupported.join(", ")));
@@ -264,12 +352,20 @@ impl StdioSpec {
     /// Capture mode used by `run`/`spawn`: stdin inherited, stdout/stderr piped
     /// and drained into the `RunResult` by `wait`.
     fn capture() -> Self {
-        StdioSpec { stdin: StdioMode::Inherit, stdout: StdioMode::Piped, stderr: StdioMode::Piped }
+        StdioSpec {
+            stdin: StdioMode::Inherit,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+        }
     }
 
     /// Interactive mode: every stream inherits the supervisor's fd.
     fn inherit() -> Self {
-        StdioSpec { stdin: StdioMode::Inherit, stdout: StdioMode::Inherit, stderr: StdioMode::Inherit }
+        StdioSpec {
+            stdin: StdioMode::Inherit,
+            stdout: StdioMode::Inherit,
+            stderr: StdioMode::Inherit,
+        }
     }
 
     /// True when every stream inherits, i.e. the run is interactive and the
@@ -793,12 +889,19 @@ impl Sandbox {
     /// Resolve the per-protection state against the host's current
     /// Landlock ABI. Returns one entry per `Protection`. Useful for
     /// post-`build()` posture inspection.
-    pub fn active_protections(&self) -> Result<Vec<(Protection, ProtectionStatus)>, crate::error::SandlockError> {
+    pub fn active_protections(
+        &self,
+    ) -> Result<Vec<(Protection, ProtectionStatus)>, crate::error::SandlockError> {
         let host_abi = crate::landlock::abi_version().map_err(|e| {
             crate::error::SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
         Ok(Protection::all()
-            .map(|p| (p, ProtectionStatus::resolve(p, host_abi, &self.protection_policy)))
+            .map(|p| {
+                (
+                    p,
+                    ProtectionStatus::resolve(p, host_abi, &self.protection_policy),
+                )
+            })
             .collect())
     }
 
@@ -860,22 +963,31 @@ impl Sandbox {
 
     /// Return the sandbox name if set, or `None` if not yet started.
     pub fn instance_name(&self) -> Option<&str> {
-        self.runtime.as_ref().map(|r| r.name.as_str())
+        self.runtime
+            .as_ref()
+            .map(|r| r.name.as_str())
             .or_else(|| self.name.as_deref())
     }
 
     /// Main's pid until it exits; afterwards the number may name another process.
     pub fn pid(&self) -> Option<i32> {
-        self.runtime.as_ref()
+        self.runtime
+            .as_ref()
             .filter(|rt| rt.main_exit.get().is_none())
             .and_then(|rt| rt.child_pid)
     }
 
     /// Return whether the child is currently running or paused.
     pub fn is_running(&self) -> bool {
-        self.runtime.as_ref().map(|r| {
-            matches!(r.state, RuntimeState::Running | RuntimeState::Paused | RuntimeState::MainExited(_))
-        }).unwrap_or(false)
+        self.runtime
+            .as_ref()
+            .map(|r| {
+                matches!(
+                    r.state,
+                    RuntimeState::Running | RuntimeState::Paused | RuntimeState::MainExited(_)
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// Signal every process group of the sandbox, returning how many had
@@ -888,7 +1000,9 @@ impl Sandbox {
     /// A handle that acts on this session from another task or thread,
     /// including while `wait()` holds the `Sandbox`.
     pub fn controller(&self) -> Result<crate::Controller, crate::error::SandlockError> {
-        let rt = self.runtime.as_ref()
+        let rt = self
+            .runtime
+            .as_ref()
             .filter(|rt| rt.child_pid.is_some())
             .ok_or(crate::error::SandboxRuntimeError::NotRunning)?;
         Ok(crate::Controller {
@@ -944,7 +1058,11 @@ impl Sandbox {
     /// Return observed resource peaks from the supervisor state.
     /// Returns `(peak_mem_used_bytes, peak_proc_count)`.
     pub async fn resource_peaks(&self) -> (u64, u32) {
-        if let Some(res) = self.runtime.as_ref().and_then(|rt| rt.supervisor_resource.as_ref()) {
+        if let Some(res) = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.supervisor_resource.as_ref())
+        {
             let rs = res.lock().await;
             (rs.peak_mem_used, rs.peak_proc_count)
         } else {
@@ -990,12 +1108,14 @@ impl Sandbox {
         // `Process::take_stdout`/`take_stderr` is `None` here and stays theirs.
         if self.rt().stdout_drain.is_none() {
             if let Some(fd) = self.rt_mut()._stdout_read.take() {
-                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
+                self.rt_mut().stdout_drain =
+                    sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
             }
         }
         if self.rt().stderr_drain.is_none() {
             if let Some(fd) = self.rt_mut()._stderr_read.take() {
-                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
+                self.rt_mut().stderr_drain =
+                    sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
             }
         }
 
@@ -1027,7 +1147,9 @@ impl Sandbox {
 
     /// Kill every remaining job, wait until the session has no process left,
     /// then settle COW and collect the captured output. Safe to call again.
-    pub async fn shutdown(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+    pub async fn shutdown(
+        &mut self,
+    ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         use crate::result::RunResult;
 
@@ -1039,7 +1161,9 @@ impl Sandbox {
             if let Some(mut reaper) = self.rt_mut().reaper.take() {
                 // Untracked jobs (no supervisor, or a group out of reach)
                 // would keep it alive; release them instead.
-                if no_supervisor || swept.is_err() { reaper.finish(); }
+                if no_supervisor || swept.is_err() {
+                    reaper.finish();
+                }
                 reaper.join().await;
                 self.rt().drain_cut.cancel();
             }
@@ -1052,10 +1176,16 @@ impl Sandbox {
 
             let rt = self.rt_mut();
             rt.control_claim = None;
-            if let Some(h) = rt.notif_handle.take() { h.abort(); }
+            if let Some(h) = rt.notif_handle.take() {
+                h.abort();
+            }
             rt.policy_fn_worker = None;
-            if let Some(h) = rt.throttle_handle.take() { h.abort(); }
-            if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            if let Some(h) = rt.throttle_handle.take() {
+                h.abort();
+            }
+            if let Some(h) = rt.loadavg_handle.take() {
+                h.abort();
+            }
             // Finish shutting down the old endpoint before releasing the name.
             if let Some(h) = rt.control_handle.take() {
                 h.abort();
@@ -1064,11 +1194,18 @@ impl Sandbox {
             swept?;
         }
 
-        let RuntimeState::Stopped(ref exit_status) = self.rt().state else { unreachable!() };
+        let RuntimeState::Stopped(ref exit_status) = self.rt().state else {
+            unreachable!()
+        };
         let exit_status = exit_status.clone();
         let changes = self.settle_branch().await;
         let (stdout, stderr) = self.collect_pipe_drains().await;
-        Ok(RunResult { exit_status, stdout, stderr, changes })
+        Ok(RunResult {
+            exit_status,
+            stdout,
+            stderr,
+            changes,
+        })
     }
 
     /// Take the finished run's branch from the supervisor, read its change
@@ -1096,7 +1233,9 @@ impl Sandbox {
         match self.branch_action() {
             BranchAction::Defer => self.rt_mut().seccomp_cow = Some(branch),
             BranchAction::Keep => branch.keep(),
-            BranchAction::Abort => { let _ = branch.abort(); }
+            BranchAction::Abort => {
+                let _ = branch.abort();
+            }
             // commit() blocks up to DROP_COMMIT_LOCK_WAIT on a contended
             // workdir, which must not stall the async worker.
             BranchAction::Commit => {
@@ -1112,7 +1251,11 @@ impl Sandbox {
         let failed = self.runtime.as_ref().is_some_and(|rt| {
             matches!(rt.state, RuntimeState::MainExited(ref s) | RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0)))
         });
-        if failed { self.on_error.clone() } else { self.on_exit.clone() }
+        if failed {
+            self.on_error.clone()
+        } else {
+            self.on_exit.clone()
+        }
     }
 
     /// Whether a [`BranchAction::Defer`] run has exited and is waiting for
@@ -1128,7 +1271,9 @@ impl Sandbox {
     /// holding the new bytes of every added or modified file.
     #[cfg(feature = "cow")]
     pub fn upper_dir(&self) -> Option<&std::path::Path> {
-        if !self.pending() { return None; }
+        if !self.pending() {
+            return None;
+        }
         self.rt().seccomp_cow.as_ref().map(|b| b.upper_dir())
     }
 
@@ -1147,30 +1292,48 @@ impl Sandbox {
         self.take_pending()?.abort()
     }
     #[cfg(feature = "cow")]
-    fn take_pending(&mut self) -> Result<crate::cow::seccomp::SeccompCowBranch, crate::error::BranchError> {
+    fn take_pending(
+        &mut self,
+    ) -> Result<crate::cow::seccomp::SeccompCowBranch, crate::error::BranchError> {
         if !self.pending() {
-            return Err(crate::error::BranchError::Operation("no deferred branch to dispose".into()));
+            return Err(crate::error::BranchError::Operation(
+                "no deferred branch to dispose".into(),
+            ));
         }
-        Ok(self.rt_mut().seccomp_cow.take().expect("pending() checked seccomp_cow"))
+        Ok(self
+            .rt_mut()
+            .seccomp_cow
+            .take()
+            .expect("pending() checked seccomp_cow"))
     }
 
     #[cfg(not(feature = "cow"))]
-    async fn settle_branch(&mut self) -> Vec<crate::result::Change> { Vec::new() }
+    async fn settle_branch(&mut self) -> Vec<crate::result::Change> {
+        Vec::new()
+    }
 
     #[cfg(not(feature = "cow"))]
-    pub fn pending(&self) -> bool { false }
+    pub fn pending(&self) -> bool {
+        false
+    }
 
     #[cfg(not(feature = "cow"))]
-    pub fn upper_dir(&self) -> Option<&std::path::Path> { None }
+    pub fn upper_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
 
     #[cfg(not(feature = "cow"))]
     pub fn commit(&mut self) -> Result<(), crate::error::BranchError> {
-        Err(crate::error::BranchError::Operation("COW support is disabled; enable the cow feature".into()))
+        Err(crate::error::BranchError::Operation(
+            "COW support is disabled; enable the cow feature".into(),
+        ))
     }
 
     #[cfg(not(feature = "cow"))]
     pub fn abort(&mut self) -> Result<(), crate::error::BranchError> {
-        Err(crate::error::BranchError::Operation("COW support is disabled; enable the cow feature".into()))
+        Err(crate::error::BranchError::Operation(
+            "COW support is disabled; enable the cow feature".into(),
+        ))
     }
 
     /// Join the capture-pipe drains, if this runtime still holds them.
@@ -1207,7 +1370,10 @@ impl Sandbox {
     }
 
     /// Like `create` but inherits stdio (no capture).
-    pub async fn create_interactive(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+    pub async fn create_interactive(
+        &mut self,
+        cmd: &[&str],
+    ) -> Result<(), crate::error::SandlockError> {
         self.do_create(cmd, false).await
     }
 
@@ -1230,7 +1396,10 @@ impl Sandbox {
     }
 
     /// Like `spawn` but inherits stdio (no capture).
-    pub async fn spawn_interactive(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
+    pub async fn spawn_interactive(
+        &mut self,
+        cmd: &[&str],
+    ) -> Result<(), crate::error::SandlockError> {
         self.create_interactive(cmd).await?;
         self.start()?;
         self.wait_until_exec().await
@@ -1260,7 +1429,15 @@ impl Sandbox {
         stdout: StdioMode,
         stderr: StdioMode,
     ) -> Result<Process<'_>, crate::error::SandlockError> {
-        self.do_create_stdio(cmd, StdioSpec { stdin, stdout, stderr }).await?;
+        self.do_create_stdio(
+            cmd,
+            StdioSpec {
+                stdin,
+                stdout,
+                stderr,
+            },
+        )
+        .await?;
         // No wait_until_exec here: a streaming caller does not need the child to
         // have reached user code (a reader naturally blocks until bytes arrive),
         // and the exec poll would spuriously time out on a process that exits
@@ -1376,12 +1553,18 @@ impl Sandbox {
     async fn wait_until_exec(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         use tokio::io::AsyncReadExt;
-        let exec_r = self.rt_mut().exec_r.take().ok_or(SandboxRuntimeError::NotRunning)?;
+        let exec_r = self
+            .rt_mut()
+            .exec_r
+            .take()
+            .ok_or(SandboxRuntimeError::NotRunning)?;
         let mut exec_r = tokio::net::unix::pipe::Receiver::from_owned_fd(exec_r)
             .map_err(SandboxRuntimeError::Io)?;
         let startup_allowance = Duration::from_secs(5);
         let timeout = if let Some(policy_fn) = &self.policy_fn {
-            policy_fn.verdict_timeout.map(|timeout| timeout.saturating_add(startup_allowance))
+            policy_fn
+                .verdict_timeout
+                .map(|timeout| timeout.saturating_add(startup_allowance))
         } else {
             Some(startup_allowance)
         };
@@ -1395,7 +1578,9 @@ impl Sandbox {
         }
         .map_err(SandboxRuntimeError::Io)?;
         if marks != [context::EXEC_REACHED] {
-            return Err(SandboxRuntimeError::Child("child exited before exec() completed".into()).into());
+            return Err(
+                SandboxRuntimeError::Child("child exited before exec() completed".into()).into(),
+            );
         }
         Ok(())
     }
@@ -1456,8 +1641,12 @@ impl Sandbox {
     /// Freeze the sandbox: hold fork notifications + SIGSTOP the process groups.
     pub(crate) async fn freeze(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
-        let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let rt = self
+            .runtime
+            .as_ref()
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        rt.child_pid
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = true;
@@ -1469,8 +1658,12 @@ impl Sandbox {
     /// Thaw the sandbox: release held fork notifications + SIGCONT.
     pub(crate) async fn thaw(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
-        let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let rt = self
+            .runtime
+            .as_ref()
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        rt.child_pid
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = false;
@@ -1482,9 +1675,13 @@ impl Sandbox {
 
     /// Capture a checkpoint of the running sandbox.
     #[cfg(feature = "checkpoint")]
-    pub async fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
+    pub async fn checkpoint(
+        &self,
+    ) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
-        let pid = self.pid().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let pid = self
+            .pid()
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         self.checkpoint_pid(pid).await
     }
 
@@ -1493,7 +1690,10 @@ impl Sandbox {
     /// policy (e.g. the workload spawned by sandlock-init). `target_pid` must
     /// be positive.
     #[cfg(feature = "checkpoint")]
-    pub async fn checkpoint_pid(&self, target_pid: i32) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
+    pub async fn checkpoint_pid(
+        &self,
+        target_pid: i32,
+    ) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         if target_pid <= 0 {
             return Err(SandlockError::Runtime(SandboxRuntimeError::NotRunning));
@@ -1657,7 +1857,9 @@ impl Sandbox {
 
         unsafe { libc::close(ctrl_child_fd) };
         for wfd in &pipe_write_fds {
-            if *wfd >= 0 { unsafe { libc::close(*wfd) }; }
+            if *wfd >= 0 {
+                unsafe { libc::close(*wfd) };
+            }
         }
         self.rt_mut().child_pid = Some(pid);
         self.rt_mut().state = RuntimeState::Running;
@@ -1669,7 +1871,8 @@ impl Sandbox {
         let mut pid_buf = vec![0u8; n as usize * 4];
         sandbox_read_exact(ctrl_fd, &mut pid_buf);
 
-        let clone_pids: Vec<i32> = pid_buf.chunks(4)
+        let clone_pids: Vec<i32> = pid_buf
+            .chunks(4)
             .map(|c| u32::from_be_bytes(c.try_into().unwrap_or([0; 4])) as i32)
             .collect();
         let live_count = clone_pids.iter().filter(|&&p| p > 0).count();
@@ -1688,10 +1891,14 @@ impl Sandbox {
         let rt_name = self.rt().name.clone();
         for &clone_pid in &clone_pids {
             let pipe = pipe_iter.next();
-            if clone_pid <= 0 { continue; }
+            if clone_pid <= 0 {
+                continue;
+            }
 
             let code = i32::from_be_bytes(
-                code_buf[code_idx * 4..(code_idx + 1) * 4].try_into().unwrap_or([0; 4])
+                code_buf[code_idx * 4..(code_idx + 1) * 4]
+                    .try_into()
+                    .unwrap_or([0; 4]),
             );
             code_idx += 1;
 
@@ -1772,16 +1979,12 @@ impl Sandbox {
         }
 
         let write_fd = stdin_fds[1];
-        let write_handle = tokio::task::spawn_blocking(move || {
-            unsafe {
-                libc::write(write_fd, combined.as_ptr() as *const _, combined.len());
-                libc::close(write_fd);
-            }
+        let write_handle = tokio::task::spawn_blocking(move || unsafe {
+            libc::write(write_fd, combined.as_ptr() as *const _, combined.len());
+            libc::close(write_fd);
         });
 
-        let base_name = self.instance_name()
-            .unwrap_or("sandbox")
-            .to_owned();
+        let base_name = self.instance_name().unwrap_or("sandbox").to_owned();
         let reducer_name = base_name + "-reduce";
         let mut reducer = self.clone().with_name(reducer_name);
         reducer.ensure_runtime()?;
@@ -1862,7 +2065,10 @@ impl Sandbox {
     /// commit/abort to the transaction coordinator. Internal — used only by
     /// [`Transaction`](crate::transaction::Transaction).
     #[cfg(feature = "cow")]
-    pub(crate) fn set_shared_cow(&mut self, shared: SharedCow) -> Result<(), crate::error::SandlockError> {
+    pub(crate) fn set_shared_cow(
+        &mut self,
+        shared: SharedCow,
+    ) -> Result<(), crate::error::SandlockError> {
         self.ensure_runtime()?;
         self.rt_mut().shared_cow = Some(shared);
         Ok(())
@@ -1879,30 +2085,50 @@ impl Sandbox {
 
     /// Thin compatibility wrapper: `capture` selects between the capture stdio
     /// spec (stdin inherited, stdout/stderr piped-and-drained) and full inherit.
-    async fn do_create(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
-        let stdio = if capture { StdioSpec::capture() } else { StdioSpec::inherit() };
+    async fn do_create(
+        &mut self,
+        cmd: &[&str],
+        capture: bool,
+    ) -> Result<(), crate::error::SandlockError> {
+        let stdio = if capture {
+            StdioSpec::capture()
+        } else {
+            StdioSpec::inherit()
+        };
         self.do_create_stdio(cmd, stdio).await
     }
 
-    async fn do_create_stdio(&mut self, cmd: &[&str], stdio: StdioSpec) -> Result<(), crate::error::SandlockError> {
-        use std::ffi::CString;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    async fn do_create_stdio(
+        &mut self,
+        cmd: &[&str],
+        stdio: StdioSpec,
+    ) -> Result<(), crate::error::SandlockError> {
+        use crate::context::{read_u32_fd, PipePair};
         use crate::error::SandboxRuntimeError;
-        use crate::context::{PipePair, read_u32_fd};
         use crate::network;
         use crate::seccomp::ctx::SupervisorCtx;
         use crate::seccomp::notif::{self, NotifPolicy};
-        use crate::seccomp::state::{ChrootState, CowState, NetworkState, PolicyFnState, ProcfsState, ResourceState, TimeRandomState};
+        use crate::seccomp::state::{
+            ChrootState, CowState, NetworkState, PolicyFnState, ProcfsState, ResourceState,
+            TimeRandomState,
+        };
         use crate::sys::syscall;
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::time::Duration;
 
         #[cfg(not(feature = "cow"))]
-        if self.workdir.is_some() || self.fs_storage.is_some() || self.max_disk.is_some()
-            || self.on_exit != BranchAction::Commit || self.on_error != BranchAction::Commit
+        if self.workdir.is_some()
+            || self.fs_storage.is_some()
+            || self.max_disk.is_some()
+            || self.on_exit != BranchAction::Commit
+            || self.on_error != BranchAction::Commit
         {
             return Err(crate::error::SandboxError::FeatureDisabled {
-                what: "copy-on-write filesystem".into(), feature: "cow",
-            }.into());
+                what: "copy-on-write filesystem".into(),
+                feature: "cow",
+            }
+            .into());
         }
         self.ensure_runtime()?;
 
@@ -1942,7 +2168,10 @@ impl Sandbox {
 
         let c_cmd: Vec<CString> = cmd
             .iter()
-            .map(|s| CString::new(*s).map_err(|_| SandboxRuntimeError::Child("invalid command string".into())))
+            .map(|s| {
+                CString::new(*s)
+                    .map_err(|_| SandboxRuntimeError::Child("invalid command string".into()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let no_supervisor = self.no_supervisor;
@@ -2024,7 +2253,11 @@ impl Sandbox {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
-            match crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk) {
+            match crate::cow::seccomp::SeccompCowBranch::create(
+                &workdir,
+                storage.as_deref(),
+                max_disk,
+            ) {
                 Ok(mut branch) => {
                     // `Keep` must survive a sandbox that is never `wait()`ed:
                     // the branch only reaches `Sandbox`'s own disposition after
@@ -2098,7 +2331,12 @@ impl Sandbox {
                 ))
                 .into());
             }
-            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES | libc::ENOSYS)) => {
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
+                ) =>
+            {
                 // Nested policies may deny AF_UNIX or SysV IPC; execution can
                 // still proceed without introspection.
                 eprintln!(
@@ -2110,7 +2348,10 @@ impl Sandbox {
             }
             Err(e) => return Err(SandboxRuntimeError::Io(e).into()),
         };
-        let child_publisher = control_socket.as_ref().and_then(|s| s.claim.as_ref()).map(|c| c.child_publisher());
+        let child_publisher = control_socket
+            .as_ref()
+            .and_then(|s| s.claim.as_ref())
+            .map(|c| c.child_publisher());
 
         let (pid, reaper) = crate::reaper::fork().map_err(SandboxRuntimeError::Fork)?;
 
@@ -2118,13 +2359,23 @@ impl Sandbox {
             // ===== CHILD PROCESS =====
             // Publish before confinement denies IPC.
             if let Some(publisher) = child_publisher {
-                if !publisher.publish() { unsafe { libc::_exit(127); } }
+                if !publisher.publish() {
+                    unsafe {
+                        libc::_exit(127);
+                    }
+                }
             }
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
-                if let Some(fd) = stdin_fd { unsafe { libc::dup2(fd, 0) }; }
-                if let Some(fd) = stdout_fd { unsafe { libc::dup2(fd, 1) }; }
-                if let Some(fd) = stderr_fd { unsafe { libc::dup2(fd, 2) }; }
+                if let Some(fd) = stdin_fd {
+                    unsafe { libc::dup2(fd, 0) };
+                }
+                if let Some(fd) = stdout_fd {
+                    unsafe { libc::dup2(fd, 1) };
+                }
+                if let Some(fd) = stderr_fd {
+                    unsafe { libc::dup2(fd, 2) };
+                }
             }
 
             let extra_fds_copy = self.rt().extra_fds.clone();
@@ -2145,17 +2396,23 @@ impl Sandbox {
             // at execve; `mem::forget` them so their Drop cannot close a fd number
             // we have since reassigned to 0/1/2.
             let safe_in = if stdio.stdin == StdioMode::Piped {
-                stdin_p.as_ref().map(|(r, _)| unsafe { relocate_high(r.as_raw_fd()) })
+                stdin_p
+                    .as_ref()
+                    .map(|(r, _)| unsafe { relocate_high(r.as_raw_fd()) })
             } else {
                 None
             };
             let safe_out = if stdio.stdout == StdioMode::Piped {
-                stdout_p.as_ref().map(|(_, w)| unsafe { relocate_high(w.as_raw_fd()) })
+                stdout_p
+                    .as_ref()
+                    .map(|(_, w)| unsafe { relocate_high(w.as_raw_fd()) })
             } else {
                 None
             };
             let safe_err = if stdio.stderr == StdioMode::Piped {
-                stderr_p.as_ref().map(|(_, w)| unsafe { relocate_high(w.as_raw_fd()) })
+                stderr_p
+                    .as_ref()
+                    .map(|(_, w)| unsafe { relocate_high(w.as_raw_fd()) })
             } else {
                 None
             };
@@ -2168,17 +2425,18 @@ impl Sandbox {
                 wire_child_stdio(stdio.stderr, 2, safe_err, libc::O_WRONLY);
             }
 
-            let gather_keep_fds: Vec<i32> = extra_fds_copy.iter().map(|&(target, _)| target).collect();
+            let gather_keep_fds: Vec<i32> =
+                extra_fds_copy.iter().map(|&(target, _)| target).collect();
 
-            let extra_syscalls: Vec<u32> = self.rt().handlers
-                .iter()
-                .map(|h| h.0 as u32)
-                .collect();
+            let extra_syscalls: Vec<u32> = self.rt().handlers.iter().map(|h| h.0 as u32).collect();
 
             // In-process entrypoint (OCI PID-1) names the process from cmd[0];
             // otherwise execve the command.
             let entry = match (self.in_child_main, self.rt().exec_fd) {
-                (Some(run), _) => context::ChildEntry::InProcess { name: c_cmd[0].as_c_str(), run },
+                (Some(run), _) => context::ChildEntry::InProcess {
+                    name: c_cmd[0].as_c_str(),
+                    run,
+                },
                 (None, Some(fd)) => context::ChildEntry::ExecFd { fd, argv: &c_cmd },
                 (None, None) => context::ChildEntry::Exec(&c_cmd),
             };
@@ -2217,8 +2475,9 @@ impl Sandbox {
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
-        let exec_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
-            .map_err(|e| SandboxRuntimeError::Child(format!("read exec pipe fd from child: {}", e)))?;
+        let exec_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd()).map_err(|e| {
+            SandboxRuntimeError::Child(format!("read exec pipe fd from child: {}", e))
+        })?;
         let take_child_fd = |num: u32, flags: i32| -> Result<OwnedFd, SandboxRuntimeError> {
             if let Some(ref pfd) = pidfd {
                 return syscall::pidfd_getfd(pfd, num as i32, 0)
@@ -2227,13 +2486,20 @@ impl Sandbox {
             let cpath = CString::new(format!("/proc/{}/fd/{}", pid, num)).unwrap();
             let raw = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC) };
             if raw < 0 {
-                return Err(SandboxRuntimeError::Child(format!("failed to open child fd {} from /proc", num)));
+                return Err(SandboxRuntimeError::Child(format!(
+                    "failed to open child fd {} from /proc",
+                    num
+                )));
             }
             Ok(unsafe { OwnedFd::from_raw_fd(raw) })
         };
         let exec_r = take_child_fd(exec_fd_num, libc::O_RDONLY)?;
 
-        let control_info = crate::control::SandboxInfo { mode: self.mode.clone(), main_exited: false, live_groups: 0 };
+        let control_info = crate::control::SandboxInfo {
+            mode: self.mode.clone(),
+            main_exited: false,
+            live_groups: 0,
+        };
 
         let is_nested_mode = notif_fd_num == 0;
 
@@ -2245,13 +2511,19 @@ impl Sandbox {
 
         if let Some(notif_fd) = notif_fd {
             if self.time_start.is_some() || self.random_seed.is_some() {
-                let time_offset = self.time_start.map(|t| crate::time::calculate_time_offset(t));
+                let time_offset = self
+                    .time_start
+                    .map(|t| crate::time::calculate_time_offset(t));
                 if let Err(e) = crate::vdso::patch(pid, time_offset, self.random_seed.is_some()) {
-                    eprintln!("sandlock: pre-exec vDSO patching failed (will retry after exec): {}", e);
+                    eprintln!(
+                        "sandlock: pre-exec vDSO patching failed (will retry after exec): {}",
+                        e
+                    );
                 }
             }
 
-            let time_offset_val = self.time_start
+            let time_offset_val = self
+                .time_start
                 .map(|t| crate::time::calculate_time_offset(t))
                 .unwrap_or(0);
 
@@ -2288,7 +2560,9 @@ impl Sandbox {
             use rand_chacha::ChaCha8Rng;
 
             let random_state = self.random_seed.map(|seed| ChaCha8Rng::seed_from_u64(seed));
-            let time_offset = self.time_start.map(|t| crate::time::calculate_time_offset(t));
+            let time_offset = self
+                .time_start
+                .map(|t| crate::time::calculate_time_offset(t));
 
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
@@ -2329,8 +2603,13 @@ impl Sandbox {
             }
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
-            net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
-            let net_tcp_active = self.active_protections()?
+            net_state.http_acl_orig_dest = self
+                .rt()
+                .http_acl_handle
+                .as_ref()
+                .map(|h| h.orig_dest.clone());
+            let net_tcp_active = self
+                .active_protections()?
                 .into_iter()
                 .any(|(p, s)| p == Protection::NetTcp && s == ProtectionStatus::Active);
             net_state.bind_allow_ports = self.bind_allow_layer(net_tcp_active);
@@ -2341,15 +2620,15 @@ impl Sandbox {
 
             let procfs_state = ProcfsState::new();
 
-            let mut res_state = ResourceState::new(
-                notif_policy.max_memory_bytes,
-                notif_policy.max_processes,
-            );
+            let mut res_state =
+                ResourceState::new(notif_policy.max_memory_bytes, notif_policy.max_processes);
             res_state.proc_count = 1;
 
             let mut cow_state = CowState::new();
             #[cfg(feature = "cow")]
-            { cow_state.branch = seccomp_cow_branch; }
+            {
+                cow_state.branch = seccomp_cow_branch;
+            }
             // A shared transactional-pipeline branch overrides the per-stage one:
             // reuse the coordinator's single COW state so every stage writes into
             // (and reads through) the same upper.
@@ -2367,8 +2646,15 @@ impl Sandbox {
             if let Some(ref policy_fn) = self.policy_fn {
                 let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
                     std::collections::HashSet::new();
-                for p in [&net_state.tcp_policy, &net_state.udp_policy, &net_state.icmp_policy] {
-                    if let crate::seccomp::notif::NetworkPolicy::AllowList { per_ip, cidrs, .. } = p {
+                for p in [
+                    &net_state.tcp_policy,
+                    &net_state.udp_policy,
+                    &net_state.icmp_policy,
+                ] {
+                    if let crate::seccomp::notif::NetworkPolicy::AllowList {
+                        per_ip, cidrs, ..
+                    } = p
+                    {
                         allowed_ips.extend(per_ip.keys().copied());
                         // IP literals resolve to single-host CIDRs (/32 or
                         // /128); surface them as concrete allowed IPs too.
@@ -2390,13 +2676,20 @@ impl Sandbox {
                 let pid_overrides = net_state.pid_ip_overrides.clone();
                 policy_fn_state.live_policy = Some(live.clone());
                 let worker = crate::policy_fn::spawn_policy_fn(
-                    policy_fn.callback.clone(), live, ceiling, pid_overrides, denied,
+                    policy_fn.callback.clone(),
+                    live,
+                    ceiling,
+                    pid_overrides,
+                    denied,
                 );
                 policy_fn_state.verdict_timeout = policy_fn.verdict_timeout;
                 policy_fn_state.cancellation = worker.cancellation();
                 policy_fn_state.event_tx = Some(worker.sender());
                 let (stop, worker_cancel) = (self.rt().stop.clone(), worker.cancellation());
-                tokio::spawn(async move { stop.cancelled().await; worker_cancel.cancel() });
+                tokio::spawn(async move {
+                    stop.cancelled().await;
+                    worker_cancel.cancel()
+                });
                 self.rt_mut().policy_fn_worker = Some(worker);
             }
 
@@ -2452,9 +2745,9 @@ impl Sandbox {
 
             let control_ctx = Arc::clone(&ctx);
 
-            self.rt_mut().notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, ctx, handlers, startup_tx),
-            ));
+            self.rt_mut().notif_handle = Some(tokio::spawn(notif::supervisor(
+                notif_fd, ctx, handlers, startup_tx,
+            )));
             // Wait for the supervisor to register the notif fd with the IO
             // driver before we release the child to execve. Otherwise an
             // early traced syscall would queue a notification on a fd no
@@ -2467,7 +2760,8 @@ impl Sandbox {
                 Err(_) => {
                     return Err(SandboxRuntimeError::Child(
                         "seccomp supervisor exited during startup".into(),
-                    ).into());
+                    )
+                    .into());
                 }
             }
 
@@ -2513,7 +2807,8 @@ impl Sandbox {
         if let Some(cpu_pct) = self.max_cpu {
             if cpu_pct < 100 {
                 let groups = Arc::clone(&self.rt_mut().groups);
-                self.rt_mut().throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(groups, cpu_pct)));
+                self.rt_mut().throttle_handle =
+                    Some(tokio::spawn(sandbox_throttle_cpu(groups, cpu_pct)));
             }
         }
 
@@ -2529,15 +2824,18 @@ impl Sandbox {
     // ================================================================
 
     fn do_start(&mut self) -> Result<(), crate::error::SandlockError> {
-        use std::os::fd::AsRawFd;
         use crate::context::write_u32_fd;
         use crate::error::SandboxRuntimeError;
+        use std::os::fd::AsRawFd;
 
         if !matches!(self.rt().state, RuntimeState::Created) {
-            return Err(SandboxRuntimeError::Child("start() requires a created sandbox".into()).into());
+            return Err(
+                SandboxRuntimeError::Child("start() requires a created sandbox".into()).into(),
+            );
         }
-        let ready_w = self.rt_mut().ready_w.take()
-            .ok_or_else(|| SandboxRuntimeError::Child("start() called without a prior create()".into()))?;
+        let ready_w = self.rt_mut().ready_w.take().ok_or_else(|| {
+            SandboxRuntimeError::Child("start() called without a prior create()".into())
+        })?;
         write_u32_fd(ready_w.as_raw_fd(), 1)
             .map_err(|e| SandboxRuntimeError::Child(format!("write ready signal: {}", e)))?;
         drop(ready_w);
@@ -2652,12 +2950,22 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         let no_supervisor = self.no_supervisor;
         if let Some(ref mut rt) = self.runtime {
-            if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
+            if let Some(worker) = &rt.policy_fn_worker {
+                worker.cancel();
+            }
             if let Some(pid) = rt.child_pid {
-                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused | RuntimeState::MainExited(_)) {
+                if matches!(
+                    rt.state,
+                    RuntimeState::Created
+                        | RuntimeState::Running
+                        | RuntimeState::Paused
+                        | RuntimeState::MainExited(_)
+                ) {
                     let swept = rt.groups.signal(libc::SIGKILL);
                     if let Some(mut reaper) = rt.reaper.take() {
-                        if no_supervisor || swept.is_err() { reaper.finish(); }
+                        if no_supervisor || swept.is_err() {
+                            reaper.finish();
+                        }
                         reaper.join_blocking();
                     } else {
                         // Unreaped, a clone's pid is still ours.
@@ -2671,20 +2979,29 @@ impl Drop for Sandbox {
                 }
             }
 
-            if let Some(h) = rt.notif_handle.take() { h.abort(); }
+            if let Some(h) = rt.notif_handle.take() {
+                h.abort();
+            }
             rt.policy_fn_worker = None;
-            if let Some(h) = rt.throttle_handle.take() { h.abort(); }
-            if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            if let Some(h) = rt.throttle_handle.take() {
+                h.abort();
+            }
+            if let Some(h) = rt.loadavg_handle.take() {
+                h.abort();
+            }
             rt.control_claim = None;
-            if let Some(h) = rt.control_handle.take() { h.abort(); }
+            if let Some(h) = rt.control_handle.take() {
+                h.abort();
+            }
 
             // Nobody is left to collect these; aborting closes the read ends.
             // A drain that already finished holds only bytes, dropped with the
             // runtime.
             for slot in [rt.stdout_drain.take(), rt.stderr_drain.take()] {
-                if let Some(ParkedDrain::Running(h)) = slot { h.abort(); }
+                if let Some(ParkedDrain::Running(h)) = slot {
+                    h.abort();
+                }
             }
-
         }
 
         // wait() settles the branch, so this only sees one it left behind: a
@@ -2698,8 +3015,12 @@ impl Drop for Sandbox {
                 // DROP_COMMIT_LOCK_WAIT (5s) on a contended workdir before
                 // deferring (bounded, no CPU spin). Do not drop a committing
                 // Sandbox on an async runtime worker.
-                BranchAction::Commit => { let _ = cow.commit(); }
-                BranchAction::Abort => { let _ = cow.abort(); }
+                BranchAction::Commit => {
+                    let _ = cow.commit();
+                }
+                BranchAction::Abort => {
+                    let _ = cow.abort();
+                }
                 // The caller asked for the branch and never decided: preserve
                 // it so nothing is published and nothing is lost.
                 BranchAction::Keep | BranchAction::Defer => cow.keep(),
@@ -2719,9 +3040,13 @@ async fn sandbox_throttle_cpu(groups: Arc<crate::pgroup::ProcessGroups>, cpu_pct
     let stop_time = period - run_time;
     loop {
         tokio::time::sleep(run_time).await;
-        if !matches!(groups.signal(libc::SIGSTOP), Ok(n) if n > 0) { break; }
+        if !matches!(groups.signal(libc::SIGSTOP), Ok(n) if n > 0) {
+            break;
+        }
         tokio::time::sleep(stop_time).await;
-        if !matches!(groups.signal(libc::SIGCONT), Ok(n) if n > 0) { break; }
+        if !matches!(groups.signal(libc::SIGCONT), Ok(n) if n > 0) {
+            break;
+        }
     }
 }
 
@@ -2756,23 +3081,30 @@ fn sandbox_validate_name(name: String) -> Result<String, crate::error::SandlockE
         return Err(SandboxRuntimeError::Child("sandbox name must not be empty".into()).into());
     }
     if name.len() > 64 {
-        return Err(SandboxRuntimeError::Child("sandbox name must be at most 64 bytes".into()).into());
+        return Err(
+            SandboxRuntimeError::Child("sandbox name must be at most 64 bytes".into()).into(),
+        );
     }
     if name.as_bytes().contains(&0) {
-        return Err(SandboxRuntimeError::Child("sandbox name must not contain NUL bytes".into()).into());
+        return Err(
+            SandboxRuntimeError::Child("sandbox name must not contain NUL bytes".into()).into(),
+        );
     }
     // The name is listed back through /proc/net/unix, which is
     // whitespace-delimited, and it is shown in ps output.
     if name.bytes().any(|b| b <= 0x20 || b == 0x7f) {
         return Err(SandboxRuntimeError::Child(
             "sandbox name must not contain whitespace or control characters".into(),
-        ).into());
+        )
+        .into());
     }
     if name.contains('/') {
         return Err(SandboxRuntimeError::Child("sandbox name must not contain '/'".into()).into());
     }
     if name == "." || name == ".." {
-        return Err(SandboxRuntimeError::Child("sandbox name must not be '.' or '..'".into()).into());
+        return Err(
+            SandboxRuntimeError::Child("sandbox name must not be '.' or '..'".into()).into(),
+        );
     }
     Ok(name)
 }
@@ -2785,14 +3117,17 @@ fn sandbox_read_exact(fd: i32, buf: &mut [u8]) {
     let mut off = 0;
     while off < buf.len() {
         let r = unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut _, buf.len() - off) };
-        if r <= 0 { break; }
+        if r <= 0 {
+            break;
+        }
         off += r as usize;
     }
 }
 
 /// Create a `O_CLOEXEC` pipe, returning `(read_end, write_end)` as owned fds.
 /// `pipe2` yields `fds[0]` = read, `fds[1]` = write.
-pub(crate) fn make_cloexec_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), std::io::Error> {
+pub(crate) fn make_cloexec_pipe(
+) -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), std::io::Error> {
     use std::os::fd::{FromRawFd, OwnedFd};
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
@@ -2830,7 +3165,12 @@ unsafe fn relocate_high(src: i32) -> i32 {
 /// # Safety
 /// Must run in the forked child before execve; `pipe_src` (if any) must be a
 /// valid fd. `devnull_flags` is `O_RDONLY` for stdin, `O_WRONLY` for stdout/err.
-unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, devnull_flags: i32) {
+unsafe fn wire_child_stdio(
+    mode: StdioMode,
+    target: i32,
+    pipe_src: Option<i32>,
+    devnull_flags: i32,
+) {
     match mode {
         StdioMode::Inherit => {}
         StdioMode::Piped => {
@@ -2854,7 +3194,10 @@ unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, 
         }
         StdioMode::Null => {
             // Opened without O_CLOEXEC so it survives execve.
-            let fd = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, devnull_flags);
+            let fd = libc::open(
+                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                devnull_flags,
+            );
             if fd < 0 {
                 // Fail closed: workload gets EBADF, never the supervisor's fd.
                 libc::close(target);
@@ -3003,13 +3346,11 @@ async fn wait_child_exit_via_pidfd(
 ) -> crate::result::ExitStatus {
     use crate::result::ExitStatus;
 
-    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-        pidfd,
-        tokio::io::Interest::READABLE,
-    ) {
-        Ok(fd) => fd,
-        Err(_) => return wait_child_exit_blocking(pid).await,
-    };
+    let async_fd =
+        match tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE) {
+            Ok(fd) => fd,
+            Err(_) => return wait_child_exit_blocking(pid).await,
+        };
 
     loop {
         // pidfd becomes readable when the process exits; no data is read.

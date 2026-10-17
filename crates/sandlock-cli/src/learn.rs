@@ -13,7 +13,6 @@ use sandlock_core::profile::{FilesystemSection, ProfileInput};
 use sandlock_core::sandbox::BranchAction;
 use sandlock_core::Sandbox;
 
-
 /// Protected: no legitimate sandboxed workload needs a recursive grant here.
 /// Write grants on these are skipped + error. Read collapse never fires here.
 const PROTECTED_PATHS: &[&[u8]] = &[b"/"];
@@ -21,10 +20,22 @@ const PROTECTED_CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.g
 
 /// Guarded: write grants are sometimes necessary but warrant operator awareness.
 /// Write grants emit + warning + diff. Read collapse never fires here.
-const GUARDED_PATHS: &[&[u8]] = &[b"/etc", b"/proc", b"/sys", b"/dev", b"/boot", b"/run/secrets", b"/root"];
+const GUARDED_PATHS: &[&[u8]] = &[
+    b"/etc",
+    b"/proc",
+    b"/sys",
+    b"/dev",
+    b"/boot",
+    b"/run/secrets",
+    b"/root",
+];
 
 #[derive(PartialEq)]
-enum PathTier { Protected, Guarded, Normal }
+enum PathTier {
+    Protected,
+    Guarded,
+    Normal,
+}
 
 fn classify_path(p: &std::path::Path) -> PathTier {
     let b = p.as_os_str().as_encoded_bytes();
@@ -47,14 +58,18 @@ fn classify_path(p: &std::path::Path) -> PathTier {
 
 /// Print immediate children of `dir` that the workload did NOT observe writing.
 fn print_observed_vs_granted_diff(dir: &std::path::Path, observed: &BTreeSet<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut unobserved: Vec<String> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| !observed.contains(p))
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
-    if unobserved.is_empty() { return }
+    if unobserved.is_empty() {
+        return;
+    }
     unobserved.sort();
     eprintln!(
         "  unobserved siblings now writable under {}: {}",
@@ -71,9 +86,13 @@ fn print_observed_vs_granted_diff(dir: &std::path::Path, observed: &BTreeSet<Pat
 fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for p in writes {
-        if is_junk_path(p) { continue; }
+        if is_junk_path(p) {
+            continue;
+        }
         let p = &fold_session_path(p.clone());
-        let Some(grant) = p.ancestors().find(|a| a.exists()) else { continue };
+        let Some(grant) = p.ancestors().find(|a| a.exists()) else {
+            continue;
+        };
         if is_fs_root(grant) {
             eprintln!(
                 "sandlock learn: WARNING: write to '{}' needs a grant on the filesystem root, skipping",
@@ -92,7 +111,8 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
             PathTier::Guarded => {
                 eprintln!(
                     "sandlock learn: WARNING: write to '{}' grants '{}' (guarded directory)",
-                    p.display(), grant.display()
+                    p.display(),
+                    grant.display()
                 );
                 print_observed_vs_granted_diff(grant, writes);
             }
@@ -108,7 +128,8 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
 /// /usr/lib/x86_64/libfoo.so is redundant and can be dropped.
 fn dedup_subsumed(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let set: std::collections::HashSet<PathBuf> = paths.iter().cloned().collect();
-    paths.into_iter()
+    paths
+        .into_iter()
         .filter(|p| {
             // Keep p unless one of its strict ancestors is already in the set.
             !p.ancestors().skip(1).any(|a| set.contains(a))
@@ -137,7 +158,8 @@ fn collapse_by_threshold(
 
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for p in paths {
-        let forced = force_prefixes.iter()
+        let forced = force_prefixes
+            .iter()
             .filter(|prefix| p.starts_with(prefix))
             .max_by_key(|prefix| prefix.as_os_str().len());
 
@@ -162,10 +184,15 @@ fn collapse_by_threshold(
             tier => {
                 if forced.is_some() {
                     // Explicit --collapse-prefix + --force-sensitive-collapse: emit with warning + diff.
-                    let label = if tier == PathTier::Protected { "protected" } else { "guarded" };
+                    let label = if tier == PathTier::Protected {
+                        "protected"
+                    } else {
+                        "guarded"
+                    };
                     eprintln!(
                         "sandlock learn: WARNING: collapse '{}' to '{}' ({label} directory)",
-                        p.display(), target.display()
+                        p.display(),
+                        target.display()
                     );
                     print_observed_vs_granted_diff(&target, observed);
                     out.insert(target);
@@ -187,8 +214,7 @@ fn is_fs_root(p: &Path) -> bool {
 fn is_junk_path(p: &std::path::Path) -> bool {
     let b = p.as_os_str().as_encoded_bytes();
     // /proc/<pid>/... are pid-specific across runs.
-    let proc_numeric_pid = b.starts_with(b"/proc/")
-        && b.get(6).map_or(false, u8::is_ascii_digit);
+    let proc_numeric_pid = b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit);
     // Under /proc/self, only sub-trees with volatile numeric components are
     // junk. Stable entries like /proc/self/maps are legitimately needed
     // across runs (e.g. V8 reads maps on every startup).
@@ -207,7 +233,11 @@ fn is_junk_path(p: &std::path::Path) -> bool {
 /// what lets the next run reopen whichever slave it gets. /dev/tty needs
 /// no folding: the path is stable even though the device behind it is not.
 fn fold_session_path(p: PathBuf) -> PathBuf {
-    if p.starts_with("/dev/pts") { PathBuf::from("/dev/pts") } else { p }
+    if p.starts_with("/dev/pts") {
+        PathBuf::from("/dev/pts")
+    } else {
+        p
+    }
 }
 
 use crate::LearnArgs;
@@ -222,10 +252,12 @@ fn require_clean_exit(status: &sandlock_core::ExitStatus) -> Result<()> {
         sandlock_core::ExitStatus::Code(n) => {
             Err(anyhow!("process exited with code {n}, not writing profile"))
         }
-        sandlock_core::ExitStatus::Signal(sig) => {
-            Err(anyhow!("process killed by signal {sig}, not writing profile"))
-        }
-        _ => Err(anyhow!("process terminated abnormally, not writing profile")),
+        sandlock_core::ExitStatus::Signal(sig) => Err(anyhow!(
+            "process killed by signal {sig}, not writing profile"
+        )),
+        _ => Err(anyhow!(
+            "process terminated abnormally, not writing profile"
+        )),
     }
 }
 
@@ -261,10 +293,12 @@ fn tgid_of(tid: u32) -> u32 {
 
 /// Read all file-backed r-xp (executable) mappings from `/proc/<pid>/maps`.
 /// This captures the dynamic linker, all shared libraries, and the main binary
-/// as actually mapped by the kernel. 
+/// as actually mapped by the kernel.
 fn read_rx_mapped_files(pid: u32) -> Vec<PathBuf> {
     use std::io::BufRead;
-    let Ok(file) = std::fs::File::open(format!("/proc/{pid}/maps")) else { return vec![] };
+    let Ok(file) = std::fs::File::open(format!("/proc/{pid}/maps")) else {
+        return vec![];
+    };
     let mut out = Vec::new();
     for line in std::io::BufReader::new(file).lines() {
         let Ok(line) = line else { break };
@@ -278,7 +312,6 @@ fn read_rx_mapped_files(pid: u32) -> Vec<PathBuf> {
     }
     out
 }
-
 
 /// Accumulated observations from the policy_fn callback during learn.
 #[derive(Clone)]
@@ -409,7 +442,10 @@ impl LearnObserver {
             // dst operates on the link itself, so only the parent is canonicalized.
             "linkat" => {
                 if let Some(src) = event.path {
-                    self.reads.lock().unwrap().insert(canonicalize_or_keep(src, event.pid));
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .insert(canonicalize_or_keep(src, event.pid));
                 }
                 if let Some(dst) = event.path2 {
                     let dst = canonicalize_parent_or_keep(dst, event.pid);
@@ -421,7 +457,10 @@ impl LearnObserver {
             // truncate: LANDLOCK_ACCESS_FS_TRUNCATE applies to the file itself.
             "truncate" => {
                 if let Some(p) = event.path {
-                    self.writes.lock().unwrap().insert(canonicalize_or_keep(p, event.pid));
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .insert(canonicalize_or_keep(p, event.pid));
                 }
             }
             "bind" => {
@@ -449,16 +488,22 @@ impl LearnObserver {
                 {
                     if let Some(fd) = event.fd {
                         let key = (tgid_of(event.pid), fd);
-                        if let Some(pending) = self.pending_udp_connects
-                            .lock().unwrap().remove(&key)
+                        if let Some(pending) =
+                            self.pending_udp_connects.lock().unwrap().remove(&key)
                         {
                             self.connects.lock().unwrap().insert(pending);
                         }
                     }
                 }
-                if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
+                if let (Some(ip), Some(port), Some(proto)) =
+                    (event.host, event.port, event.protocol)
+                {
                     if proto != "icmp" {
-                        let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
+                        let host = if ip.is_ipv6() {
+                            format!("[{ip}]")
+                        } else {
+                            ip.to_string()
+                        };
                         let entry = format!("{proto}://{host}:{port}");
                         if proto == "udp" && event.syscall == "connect" {
                             // Park UDP connect() in pending: if a send() follows on the
@@ -467,8 +512,7 @@ impl LearnObserver {
                             // discarded when the workload exits.
                             if let Some(fd) = event.fd {
                                 let key = (tgid_of(event.pid), fd);
-                                self.pending_udp_connects.lock().unwrap()
-                                    .insert(key, entry);
+                                self.pending_udp_connects.lock().unwrap().insert(key, entry);
                             }
                         } else {
                             // For UDP send*, promote any pending connect() on the
@@ -476,8 +520,8 @@ impl LearnObserver {
                             if proto == "udp" {
                                 if let Some(fd) = event.fd {
                                     let key = (tgid_of(event.pid), fd);
-                                    if let Some(pending) = self.pending_udp_connects
-                                        .lock().unwrap().remove(&key)
+                                    if let Some(pending) =
+                                        self.pending_udp_connects.lock().unwrap().remove(&key)
                                     {
                                         self.connects.lock().unwrap().insert(pending);
                                     }
@@ -493,7 +537,6 @@ impl LearnObserver {
         Verdict::Allow
     }
 }
-
 
 /// Resolve symlinks to get the canonical path. Falls back to the original
 /// if the path doesn't exist yet (e.g. COW-intercepted creates).
@@ -518,7 +561,11 @@ fn canonicalize_or_keep(p: PathBuf, pid: u32) -> PathBuf {
 /// PathBuf::join appends a separator even for an empty component, which
 /// would turn the bare directory into "dir/".
 fn join_rest(base: &Path, rest: &Path) -> PathBuf {
-    if rest.as_os_str().is_empty() { base.to_path_buf() } else { base.join(rest) }
+    if rest.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(rest)
+    }
 }
 
 /// Canonicalize only the parent directory and rejoin the final component.
@@ -583,14 +630,19 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         // may refuse one before it is recorded.
         .net_allow_bind("*")
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
-        .policy_fn(PolicyFn::new(move |event, _ctx| observer_cb.on_event(event)));
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
+            observer_cb.on_event(event)
+        }));
 
     #[cfg(feature = "http")]
     {
         let http_requests_cb = Arc::clone(&observer.http_requests);
         let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
             Arc::new(move |method, host, path| {
-                http_requests_cb.lock().unwrap().insert(format!("{method} {host}{path}"));
+                http_requests_cb
+                    .lock()
+                    .unwrap()
+                    .insert(format!("{method} {host}{path}"));
             });
         builder = builder.http_log_fn(http_log);
     }
@@ -618,10 +670,11 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     eprintln!("sandlock learn: observing {cmd_str} ...");
 
     let mut sandbox = policy;
-    sandbox.create_interactive(&cmd_refs).await
+    sandbox
+        .create_interactive(&cmd_refs)
+        .await
         .map_err(|e| anyhow!("sandbox error: {e}"))?;
-    sandbox.start()
-        .map_err(|e| anyhow!("sandbox error: {e}"))?;
+    sandbox.start().map_err(|e| anyhow!("sandbox error: {e}"))?;
 
     // Wait for the process, optionally with a timeout.
     let timed_out = if let Some(secs) = args.timeout {
@@ -639,13 +692,18 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             }
         }
     } else {
-        let result = sandbox.wait().await
+        let result = sandbox
+            .wait()
+            .await
             .map_err(|e| anyhow!("sandbox error: {e}"))?;
         require_clean_exit(&result)?;
         false
     };
 
-    sandbox.shutdown().await.map_err(|e| anyhow!("sandbox error: {e}"))?;
+    sandbox
+        .shutdown()
+        .await
+        .map_err(|e| anyhow!("sandbox error: {e}"))?;
 
     if timed_out {
         eprintln!("sandlock learn: writing partial profile from observations before timeout");
@@ -668,7 +726,11 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         }
     }
 
-    let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
+    let reads_raw: Vec<PathBuf> = observer
+        .reads
+        .lock()
+        .unwrap()
+        .iter()
         .filter(|p| p.exists() && !is_junk_path(p))
         .map(|p| fold_session_path(p.clone()))
         .filter(|p| {
@@ -686,24 +748,42 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         })
         .collect();
     let writes_raw = observer.writes.lock().unwrap();
-    let observed_all: BTreeSet<PathBuf> = reads_raw.iter()
-        .chain(writes_raw.iter())
-        .cloned()
-        .collect();
+    let observed_all: BTreeSet<PathBuf> =
+        reads_raw.iter().chain(writes_raw.iter()).cloned().collect();
 
     let reads = if let Some(n) = args.collapse {
-        dedup_subsumed(collapse_by_threshold(reads_raw, n, &args.collapse_prefix, &observed_all))
+        dedup_subsumed(collapse_by_threshold(
+            reads_raw,
+            n,
+            &args.collapse_prefix,
+            &observed_all,
+        ))
     } else if !args.collapse_prefix.is_empty() {
-        dedup_subsumed(collapse_by_threshold(reads_raw, usize::MAX, &args.collapse_prefix, &observed_all))
+        dedup_subsumed(collapse_by_threshold(
+            reads_raw,
+            usize::MAX,
+            &args.collapse_prefix,
+            &observed_all,
+        ))
     } else {
         dedup_subsumed(reads_raw)
     };
 
     let writes_collapsed = collapse_write_paths(&writes_raw);
     let writes = if let Some(n) = args.collapse {
-        dedup_subsumed(collapse_by_threshold(writes_collapsed, n, &args.collapse_prefix, &observed_all))
+        dedup_subsumed(collapse_by_threshold(
+            writes_collapsed,
+            n,
+            &args.collapse_prefix,
+            &observed_all,
+        ))
     } else if !args.collapse_prefix.is_empty() {
-        dedup_subsumed(collapse_by_threshold(writes_collapsed, usize::MAX, &args.collapse_prefix, &observed_all))
+        dedup_subsumed(collapse_by_threshold(
+            writes_collapsed,
+            usize::MAX,
+            &args.collapse_prefix,
+            &observed_all,
+        ))
     } else {
         dedup_subsumed(writes_collapsed)
     };
@@ -714,11 +794,21 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         ..Default::default()
     };
     profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();
-    profile_out.network.allow_bind = observer.binds.lock().unwrap().iter()
+    profile_out.network.allow_bind = observer
+        .binds
+        .lock()
+        .unwrap()
+        .iter()
         .map(|&p| sandlock_core::profile::PortSpec::Port(p))
         .collect();
 
-    let http_reqs: Vec<String> = observer.http_requests.lock().unwrap().iter().cloned().collect();
+    let http_reqs: Vec<String> = observer
+        .http_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
     if !http_reqs.is_empty() {
         profile_out.http.ports = sandbox.http_ports.clone();
         profile_out.http.allow = http_reqs;
@@ -772,18 +862,19 @@ pub async fn run(args: LearnArgs) -> Result<()> {
                 Err(_) => Ok(p.clone()),
             }
         };
-        let mut merge_paths = |observed: &[PathBuf], existing: &[PathBuf]| -> Result<Vec<PathBuf>> {
-            let mut by_expanded: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
-            for p in observed {
-                by_expanded.insert(expand_key(p)?, p.clone());
-            }
-            // Existing entries land second so their raw spelling wins.
-            for p in existing {
-                by_expanded.insert(expand_key(p)?, p.clone());
-            }
-            let kept = dedup_subsumed(by_expanded.keys().cloned().collect());
-            Ok(kept.into_iter().map(|k| by_expanded[&k].clone()).collect())
-        };
+        let mut merge_paths =
+            |observed: &[PathBuf], existing: &[PathBuf]| -> Result<Vec<PathBuf>> {
+                let mut by_expanded: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+                for p in observed {
+                    by_expanded.insert(expand_key(p)?, p.clone());
+                }
+                // Existing entries land second so their raw spelling wins.
+                for p in existing {
+                    by_expanded.insert(expand_key(p)?, p.clone());
+                }
+                let kept = dedup_subsumed(by_expanded.keys().cloned().collect());
+                Ok(kept.into_iter().map(|k| by_expanded[&k].clone()).collect())
+            };
         profile_out.filesystem.read =
             merge_paths(&observed.filesystem.read, &existing.filesystem.read)?;
         profile_out.filesystem.write =
@@ -805,7 +896,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         };
         let mut seen = std::collections::HashSet::new();
         let mut merged_bind: Vec<sandlock_core::profile::PortSpec> = Vec::new();
-        for p in observed.network.allow_bind.iter().chain(existing.network.allow_bind.iter()) {
+        for p in observed
+            .network
+            .allow_bind
+            .iter()
+            .chain(existing.network.allow_bind.iter())
+        {
             if seen.insert(port_key(p)) {
                 merged_bind.push(p.clone());
             }
@@ -813,9 +909,14 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         profile_out.network.allow_bind = merged_bind;
 
         // Limits: take the max of old vs observed.
-        profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), observed.limits.memory.as_deref());
-        profile_out.limits.processes = max_opt(existing.limits.processes, observed.limits.processes);
-        profile_out.limits.open_files = max_opt(existing.limits.open_files, observed.limits.open_files);
+        profile_out.limits.memory = max_bytesize(
+            existing.limits.memory.as_deref(),
+            observed.limits.memory.as_deref(),
+        );
+        profile_out.limits.processes =
+            max_opt(existing.limits.processes, observed.limits.processes);
+        profile_out.limits.open_files =
+            max_opt(existing.limits.open_files, observed.limits.open_files);
 
         // Union http.allow, http.ports, and config.http_inject_ca.
         let mut http_allow_set: std::collections::BTreeSet<String> =
@@ -861,7 +962,8 @@ pub async fn run(args: LearnArgs) -> Result<()> {
          # timestamp: {timestamp}\n\n",
         cmd_str.replace('\n', " ")
     );
-    let body = profile_out.to_toml()
+    let body = profile_out
+        .to_toml()
         .map_err(|e| anyhow!("failed to serialize profile: {e}"))?;
     let toml_out = format!("{header}{body}");
 
@@ -878,7 +980,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     Ok(())
 }
-
 
 /// Parse a bytesize string like "128M", "1G", "512K" into bytes.
 fn parse_bytesize_bytes(s: &str) -> Option<u64> {
@@ -903,7 +1004,11 @@ fn max_bytesize(a: Option<&str>, b: Option<&str>) -> Option<String> {
         (Some(sa), Some(sb)) => {
             let va = parse_bytesize_bytes(sa).unwrap_or(0);
             let vb = parse_bytesize_bytes(sb).unwrap_or(0);
-            Some(if va >= vb { sa.to_string() } else { sb.to_string() })
+            Some(if va >= vb {
+                sa.to_string()
+            } else {
+                sb.to_string()
+            })
         }
     }
 }
@@ -925,8 +1030,13 @@ mod tests {
     fn open_pts() -> (libc::c_int, libc::c_int, PathBuf) {
         let (mut master, mut slave) = (-1, -1);
         let rc = unsafe {
-            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
-                          std::ptr::null_mut(), std::ptr::null_mut())
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
         };
         assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
         let name = unsafe { std::ffi::CStr::from_ptr(libc::ttyname(slave)) };
@@ -939,11 +1049,20 @@ mod tests {
         // profile that omits it denies ncurses apps their screen. The pts
         // number is what changes between sessions.
         let (master, slave, pts) = open_pts();
-        assert!(pts.starts_with("/dev/pts/"), "unexpected pts name {}", pts.display());
-        let writes: BTreeSet<PathBuf> =
-            [PathBuf::from("/dev/tty"), pts].into_iter().collect();
+        assert!(
+            pts.starts_with("/dev/pts/"),
+            "unexpected pts name {}",
+            pts.display()
+        );
+        let writes: BTreeSet<PathBuf> = [PathBuf::from("/dev/tty"), pts].into_iter().collect();
         let out = collapse_write_paths(&writes);
-        unsafe { libc::close(slave); libc::close(master); }
-        assert_eq!(out, vec![PathBuf::from("/dev/pts"), PathBuf::from("/dev/tty")]);
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        assert_eq!(
+            out,
+            vec![PathBuf::from("/dev/pts"), PathBuf::from("/dev/tty")]
+        );
     }
 }

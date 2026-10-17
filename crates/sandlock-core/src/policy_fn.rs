@@ -136,7 +136,9 @@ impl SyscallEvent {
     /// Returns true if any argv element contains the given substring.
     /// Only meaningful for execve/execveat events (where argv is populated).
     pub fn argv_contains(&self, s: &str) -> bool {
-        self.argv.as_ref().map_or(false, |args| args.iter().any(|a| a.contains(s)))
+        self.argv
+            .as_ref()
+            .map_or(false, |args| args.iter().any(|a| a.contains(s)))
     }
 }
 
@@ -334,7 +336,9 @@ pub enum Verdict {
 }
 
 impl Default for Verdict {
-    fn default() -> Self { Verdict::Allow }
+    fn default() -> Self {
+        Verdict::Allow
+    }
 }
 
 /// A callback function invoked for each intercepted syscall.
@@ -351,7 +355,8 @@ impl Default for Verdict {
 /// their verdicts are ignored. Use `fs_deny` to block paths.
 ///
 /// Wrapped in `Arc` so that `Policy` remains `Clone`.
-pub type PolicyCallback = Arc<dyn Fn(SyscallEvent, &mut PolicyContext) -> Verdict + Send + Sync + 'static>;
+pub type PolicyCallback =
+    Arc<dyn Fn(SyscallEvent, &mut PolicyContext) -> Verdict + Send + Sync + 'static>;
 
 /// A dynamic policy callback and the settings for its held verdicts.
 #[derive(Clone)]

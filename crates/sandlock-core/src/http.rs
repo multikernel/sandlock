@@ -347,24 +347,60 @@ mod tests {
     #[test]
     fn acl_allow_only_permits_matching() {
         let allow = vec![HttpRule::parse("GET api.example.com/v1/*").unwrap()];
-        assert!(http_acl_check(&allow, &[], "GET", "api.example.com", "/v1/foo"));
-        assert!(!http_acl_check(&allow, &[], "POST", "api.example.com", "/v1/foo"));
+        assert!(http_acl_check(
+            &allow,
+            &[],
+            "GET",
+            "api.example.com",
+            "/v1/foo"
+        ));
+        assert!(!http_acl_check(
+            &allow,
+            &[],
+            "POST",
+            "api.example.com",
+            "/v1/foo"
+        ));
         assert!(!http_acl_check(&allow, &[], "GET", "other.com", "/v1/foo"));
     }
 
     #[test]
     fn acl_deny_only_blocks_matching() {
         let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin/settings"));
-        assert!(http_acl_check(&[], &deny, "GET", "example.com", "/public/page"));
+        assert!(!http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "/admin/settings"
+        ));
+        assert!(http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "/public/page"
+        ));
     }
 
     #[test]
     fn acl_deny_takes_precedence_over_allow() {
         let allow = vec![HttpRule::parse("* example.com/*").unwrap()];
         let deny = vec![HttpRule::parse("* example.com/admin/*").unwrap()];
-        assert!(http_acl_check(&allow, &deny, "GET", "example.com", "/public"));
-        assert!(!http_acl_check(&allow, &deny, "GET", "example.com", "/admin/settings"));
+        assert!(http_acl_check(
+            &allow,
+            &deny,
+            "GET",
+            "example.com",
+            "/public"
+        ));
+        assert!(!http_acl_check(
+            &allow,
+            &deny,
+            "GET",
+            "example.com",
+            "/admin/settings"
+        ));
     }
 
     #[test]
@@ -423,34 +459,100 @@ mod tests {
     fn acl_deny_prevents_double_slash_bypass() {
         let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
         // These should all be caught by the deny rule
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin/settings"));
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "//admin/settings"));
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/admin//settings"));
+        assert!(!http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "/admin/settings"
+        ));
+        assert!(!http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "//admin/settings"
+        ));
+        assert!(!http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "/admin//settings"
+        ));
     }
 
     #[test]
     fn acl_deny_prevents_dot_segment_bypass() {
         let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/./admin/settings"));
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/public/../admin/settings"));
+        assert!(!http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "/./admin/settings"
+        ));
+        assert!(!http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "/public/../admin/settings"
+        ));
     }
 
     #[test]
     fn acl_deny_prevents_percent_encoding_bypass() {
         let deny = vec![HttpRule::parse("* */admin/*").unwrap()];
         // %61dmin = admin
-        assert!(!http_acl_check(&[], &deny, "GET", "example.com", "/%61dmin/settings"));
+        assert!(!http_acl_check(
+            &[],
+            &deny,
+            "GET",
+            "example.com",
+            "/%61dmin/settings"
+        ));
     }
 
     #[test]
     fn acl_allow_normalized_path_still_works() {
         let allow = vec![HttpRule::parse("GET example.com/v1/models").unwrap()];
-        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1/models"));
-        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1/./models"));
-        assert!(http_acl_check(&allow, &[], "GET", "example.com", "/v1//models"));
+        assert!(http_acl_check(
+            &allow,
+            &[],
+            "GET",
+            "example.com",
+            "/v1/models"
+        ));
+        assert!(http_acl_check(
+            &allow,
+            &[],
+            "GET",
+            "example.com",
+            "/v1/./models"
+        ));
+        assert!(http_acl_check(
+            &allow,
+            &[],
+            "GET",
+            "example.com",
+            "/v1//models"
+        ));
         // These resolve to different paths and should be denied
-        assert!(!http_acl_check(&allow, &[], "GET", "example.com", "/v1/models/extra"));
-        assert!(!http_acl_check(&allow, &[], "GET", "example.com", "/v2/models"));
+        assert!(!http_acl_check(
+            &allow,
+            &[],
+            "GET",
+            "example.com",
+            "/v1/models/extra"
+        ));
+        assert!(!http_acl_check(
+            &allow,
+            &[],
+            "GET",
+            "example.com",
+            "/v2/models"
+        ));
     }
 
     #[test]

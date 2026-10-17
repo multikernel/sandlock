@@ -84,7 +84,8 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
                 libc::_exit(127);
             }
             if main == 0 {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != me {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != me
+                {
                     libc::_exit(127);
                 }
                 libc::sigaction(libc::SIGCHLD, &previous_chld, std::ptr::null_mut());
@@ -99,11 +100,23 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
                 libc::kill(main, libc::SIGKILL);
                 libc::_exit(127);
             }
-            close_all_but([status_w.as_raw_fd(), finish_r.as_raw_fd(), signal_fd, owner_fd]);
+            close_all_but([
+                status_w.as_raw_fd(),
+                finish_r.as_raw_fd(),
+                signal_fd,
+                owner_fd,
+            ]);
             if !send(status_w.as_raw_fd(), &main.to_le_bytes()) {
                 libc::kill(main, libc::SIGKILL);
             }
-            supervise(main, me, status_w.as_raw_fd(), finish_r.as_raw_fd(), signal_fd, owner_fd);
+            supervise(
+                main,
+                me,
+                status_w.as_raw_fd(),
+                finish_r.as_raw_fd(),
+                signal_fd,
+                owner_fd,
+            );
         }
     }
     drop(status_w);
@@ -118,28 +131,61 @@ pub(crate) fn fork() -> io::Result<(i32, Option<Reaper>)> {
     match (main, pidfd) {
         (Ok(main), Ok(pidfd)) if main > 0 => Ok((
             main as i32,
-            Some(Reaper { pid: reaper, pidfd, status: Some(status_r), finish: Some(finish_w) }),
+            Some(Reaper {
+                pid: reaper,
+                pidfd,
+                status: Some(status_r),
+                finish: Some(finish_w),
+            }),
         )),
         (main, pidfd) => {
             unsafe { libc::kill(reaper, libc::SIGKILL) };
             reap(reaper);
-            Err(main.err().or(pidfd.err()).unwrap_or_else(|| io::Error::other("session reaper failed to start")))
+            Err(main
+                .err()
+                .or(pidfd.err())
+                .unwrap_or_else(|| io::Error::other("session reaper failed to start")))
         }
     }
 }
 
-unsafe fn supervise(main: i32, group: i32, status_fd: i32, finish_fd: i32, signal_fd: i32, owner_fd: i32) -> ! {
+unsafe fn supervise(
+    main: i32,
+    group: i32,
+    status_fd: i32,
+    finish_fd: i32,
+    signal_fd: i32,
+    owner_fd: i32,
+) -> ! {
     let mut poll = [
-        libc::pollfd { fd: finish_fd, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: signal_fd, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: owner_fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: finish_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: signal_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: owner_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     loop {
         loop {
             // WNOWAIT: main's status is sent before its pid is freed, so no
             // reader can see main alive once that number is reusable.
             let mut info: libc::siginfo_t = std::mem::zeroed();
-            if libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL) < 0 {
+            if libc::waitid(
+                libc::P_ALL,
+                0,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+            ) < 0
+            {
                 if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
@@ -170,7 +216,11 @@ unsafe fn supervise(main: i32, group: i32, status_fd: i32, finish_fd: i32, signa
         }
         if poll[1].revents != 0 {
             let mut info: libc::signalfd_siginfo = std::mem::zeroed();
-            libc::read(signal_fd, (&mut info as *mut libc::signalfd_siginfo).cast(), std::mem::size_of_val(&info));
+            libc::read(
+                signal_fd,
+                (&mut info as *mut libc::signalfd_siginfo).cast(),
+                std::mem::size_of_val(&info),
+            );
         }
     }
 }
@@ -240,7 +290,10 @@ mod tests {
 
     fn read_status(fd: &OwnedFd) -> i32 {
         let mut raw = [0u8; 4];
-        assert_eq!(unsafe { libc::read(fd.as_raw_fd(), raw.as_mut_ptr().cast(), 4) }, 4);
+        assert_eq!(
+            unsafe { libc::read(fd.as_raw_fd(), raw.as_mut_ptr().cast(), 4) },
+            4
+        );
         i32::from_le_bytes(raw)
     }
 
@@ -248,12 +301,22 @@ mod tests {
     async fn relays_main_status_and_names_its_group() {
         let (main, reaper) = fork().unwrap();
         if main == 0 {
-            unsafe { libc::_exit(if libc::getpgrp() == libc::getppid() { 42 } else { 1 }) }
+            unsafe {
+                libc::_exit(if libc::getpgrp() == libc::getppid() {
+                    42
+                } else {
+                    1
+                })
+            }
         }
         let mut reaper = reaper.unwrap();
         let status = read_status(&reaper.take_status().unwrap());
         assert_eq!(libc::WEXITSTATUS(status), 42);
-        assert_ne!(unsafe { libc::getpgid(reaper.pid) }, reaper.pid, "reaper left group R");
+        assert_ne!(
+            unsafe { libc::getpgid(reaper.pid) },
+            reaper.pid,
+            "reaper left group R"
+        );
         reaper.join().await;
     }
 
@@ -270,7 +333,10 @@ mod tests {
             }
         }
         let mut reaper = reaper.unwrap();
-        assert_eq!(libc::WEXITSTATUS(read_status(&reaper.take_status().unwrap())), 7);
+        assert_eq!(
+            libc::WEXITSTATUS(read_status(&reaper.take_status().unwrap())),
+            7
+        );
         assert!(!reaper.exited());
         reaper.join().await;
     }
@@ -314,7 +380,10 @@ mod tests {
             }
         }
         let mut job = 0i32;
-        assert_eq!(unsafe { libc::read(pipe[0], (&mut job as *mut i32).cast(), 4) }, 4);
+        assert_eq!(
+            unsafe { libc::read(pipe[0], (&mut job as *mut i32).cast(), 4) },
+            4
+        );
         unsafe {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
@@ -349,7 +418,11 @@ mod tests {
             unsafe { libc::_exit(0) }
         }
         let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["reaper::tests::owner_death_kills_group_r", "--exact", "--nocapture"])
+            .args([
+                "reaper::tests::owner_death_kills_group_r",
+                "--exact",
+                "--nocapture",
+            ])
             .env(OWNER, "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -357,13 +430,17 @@ mod tests {
             .unwrap();
         // Read only up to the report: concurrent forks in this test binary
         // may hold the pipe's write end, so EOF can come late.
-        let group: i32 = std::io::BufRead::lines(std::io::BufReader::new(owner.stdout.take().unwrap()))
-            .find_map(|l| l.ok()?.strip_prefix("group=")?.parse().ok())
-            .expect("owner reported group R");
+        let group: i32 =
+            std::io::BufRead::lines(std::io::BufReader::new(owner.stdout.take().unwrap()))
+                .find_map(|l| l.ok()?.strip_prefix("group=")?.parse().ok())
+                .expect("owner reported group R");
         owner.wait().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while unsafe { libc::kill(-group, 0) } == 0 {
-            assert!(std::time::Instant::now() < deadline, "group R outlived its owner");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group R outlived its owner"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }

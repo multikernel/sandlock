@@ -76,7 +76,9 @@ pub(crate) fn fork_ready_loop_fn(
                 }
                 // Close all write fds (belong to other clones)
                 for &wfd in stdout_write_fds {
-                    if wfd >= 0 { unsafe { libc::close(wfd) }; }
+                    if wfd >= 0 {
+                        unsafe { libc::close(wfd) };
+                    }
                 }
                 unsafe { libc::setpgid(0, 0) };
                 std::env::set_var("CLONE_ID", i.to_string());
@@ -96,7 +98,9 @@ pub(crate) fn fork_ready_loop_fn(
 
     // Close all write ends in template (parent has the read ends)
     for &wfd in stdout_write_fds {
-        if wfd >= 0 { unsafe { libc::close(wfd) }; }
+        if wfd >= 0 {
+            unsafe { libc::close(wfd) };
+        }
     }
 
     // Send PIDs
@@ -109,7 +113,11 @@ pub(crate) fn fork_ready_loop_fn(
         if pid > 0 {
             let mut status: i32 = 0;
             unsafe { libc::waitpid(pid as i32, &mut status, 0) };
-            let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            };
             exit_codes.push(code as i32);
         } else {
             exit_codes.push(-1);

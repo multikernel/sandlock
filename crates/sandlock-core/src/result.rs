@@ -25,9 +25,11 @@ impl RunResult {
     }
 
     pub fn stdout_str(&self) -> Option<&str> {
-        self.stdout
-            .as_ref()
-            .and_then(|b| std::str::from_utf8(b).ok().map(|s| s.trim_end_matches('\n')))
+        self.stdout.as_ref().and_then(|b| {
+            std::str::from_utf8(b)
+                .ok()
+                .map(|s| s.trim_end_matches('\n'))
+        })
     }
 
     pub fn timeout() -> Self {
@@ -40,9 +42,11 @@ impl RunResult {
     }
 
     pub fn stderr_str(&self) -> Option<&str> {
-        self.stderr
-            .as_ref()
-            .and_then(|b| std::str::from_utf8(b).ok().map(|s| s.trim_end_matches('\n')))
+        self.stderr.as_ref().and_then(|b| {
+            std::str::from_utf8(b)
+                .ok()
+                .map(|s| s.trim_end_matches('\n'))
+        })
     }
 }
 
@@ -153,7 +157,10 @@ pub fn renames(changes: &[Change]) -> Vec<(&Path, &Path)> {
         let mut by_digest: HashMap<[u8; 32], Option<&Path>> = HashMap::new();
         for (path, entry) in entries {
             if let Some(d) = entry.digest {
-                by_digest.entry(d).and_modify(|slot| *slot = None).or_insert(Some(path));
+                by_digest
+                    .entry(d)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(path));
             }
         }
         by_digest
@@ -179,30 +186,61 @@ mod change_tests {
     use super::*;
 
     fn file(mode: u32, size: u64, digest: u8) -> Entry {
-        Entry { kind: EntryKind::File, mode, size, digest: Some([digest; 32]), target: None }
+        Entry {
+            kind: EntryKind::File,
+            mode,
+            size,
+            digest: Some([digest; 32]),
+            target: None,
+        }
     }
 
     fn link(target: &str) -> Entry {
-        Entry { kind: EntryKind::Symlink, mode: 0o777, size: 0, digest: None, target: Some(target.into()) }
+        Entry {
+            kind: EntryKind::Symlink,
+            mode: 0o777,
+            size: 0,
+            digest: None,
+            target: Some(target.into()),
+        }
     }
 
     fn change(path: &str, before: Option<Entry>, after: Option<Entry>) -> Change {
-        Change { path: PathBuf::from(path), before, after }
+        Change {
+            path: PathBuf::from(path),
+            before,
+            after,
+        }
     }
 
     #[test]
     fn kind_is_derived_from_which_sides_are_present() {
-        assert_eq!(change("a", None, Some(file(0o644, 1, 1))).kind(), ChangeKind::Added);
-        assert_eq!(change("m", Some(file(0o644, 1, 1)), Some(file(0o644, 2, 2))).kind(), ChangeKind::Modified);
-        assert_eq!(change("d", Some(file(0o644, 1, 1)), None).kind(), ChangeKind::Deleted);
+        assert_eq!(
+            change("a", None, Some(file(0o644, 1, 1))).kind(),
+            ChangeKind::Added
+        );
+        assert_eq!(
+            change("m", Some(file(0o644, 1, 1)), Some(file(0o644, 2, 2))).kind(),
+            ChangeKind::Modified
+        );
+        assert_eq!(
+            change("d", Some(file(0o644, 1, 1)), None).kind(),
+            ChangeKind::Deleted
+        );
         assert_eq!(change("unseen", None, None).kind(), ChangeKind::Deleted);
     }
 
     #[test]
     fn content_unchanged_means_same_kind_and_same_digest_or_target() {
-        assert!(change("touch", Some(file(0o644, 1, 1)), Some(file(0o644, 1, 1))).content_unchanged());
-        assert!(change("chmod", Some(file(0o644, 1, 1)), Some(file(0o755, 1, 1))).content_unchanged());
-        assert!(!change("edit", Some(file(0o644, 1, 1)), Some(file(0o644, 1, 2))).content_unchanged());
+        assert!(
+            change("touch", Some(file(0o644, 1, 1)), Some(file(0o644, 1, 1))).content_unchanged()
+        );
+        assert!(
+            change("chmod", Some(file(0o644, 1, 1)), Some(file(0o755, 1, 1))).content_unchanged()
+        );
+        assert!(
+            !change("edit", Some(file(0o644, 1, 1)), Some(file(0o644, 1, 2))).content_unchanged()
+        );
         assert!(change("same-link", Some(link("t")), Some(link("t"))).content_unchanged());
         assert!(!change("retarget", Some(link("t")), Some(link("u"))).content_unchanged());
         assert!(!change("added", None, Some(file(0o644, 1, 1))).content_unchanged());

@@ -211,7 +211,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_image(
     }
     let builder = *Box::from_raw(b);
     let image = (!image_json.is_null())
-        .then(|| serde_json::from_slice::<sandlock_core::image::Image>(CStr::from_ptr(image_json).to_bytes()).ok())
+        .then(|| {
+            serde_json::from_slice::<sandlock_core::image::Image>(
+                CStr::from_ptr(image_json).to_bytes(),
+            )
+            .ok()
+        })
         .flatten();
     match image {
         Some(image) => Box::into_raw(Box::new(builder.image(&image))),
@@ -1461,7 +1466,9 @@ pub unsafe extern "C" fn sandlock_handle_resume(h: *mut sandlock_handle_t) -> c_
 /// # Safety
 /// `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handle_process_groups(h: *const sandlock_handle_t) -> *mut c_char {
+pub unsafe extern "C" fn sandlock_handle_process_groups(
+    h: *const sandlock_handle_t,
+) -> *mut c_char {
     match handle_controller(h).map(|c| c.process_groups()) {
         Some(Ok(groups)) => CString::new(serde_json::to_string(&groups).unwrap_or_default())
             .map(CString::into_raw)
@@ -1470,8 +1477,14 @@ pub unsafe extern "C" fn sandlock_handle_process_groups(h: *const sandlock_handl
     }
 }
 
-unsafe fn handle_controller<'a>(h: *const sandlock_handle_t) -> Option<&'a sandlock_core::Controller> {
-    if h.is_null() { None } else { (*h).controller.as_ref() }
+unsafe fn handle_controller<'a>(
+    h: *const sandlock_handle_t,
+) -> Option<&'a sandlock_core::Controller> {
+    if h.is_null() {
+        None
+    } else {
+        (*h).controller.as_ref()
+    }
 }
 
 /// Wait for the main process; background jobs stay supervised. Returns 0 and
@@ -1509,7 +1522,12 @@ pub unsafe extern "C" fn sandlock_handle_wait(
     match outcome {
         Some(Ok(Some(exit_status))) => {
             *status = Box::into_raw(Box::new(sandlock_result_t {
-                _private: RunResult { exit_status, stdout: None, stderr: None, changes: Vec::new() },
+                _private: RunResult {
+                    exit_status,
+                    stdout: None,
+                    stderr: None,
+                    changes: Vec::new(),
+                },
             }));
             0
         }
@@ -1525,7 +1543,9 @@ pub unsafe extern "C" fn sandlock_handle_wait(
 /// # Safety
 /// `h` must be a valid handle, and no other call on `h` may run concurrently.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handle_shutdown(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
+pub unsafe extern "C" fn sandlock_handle_shutdown(
+    h: *mut sandlock_handle_t,
+) -> *mut sandlock_result_t {
     if h.is_null() {
         return ptr::null_mut();
     }
@@ -1598,7 +1618,9 @@ pub unsafe extern "C" fn sandlock_handle_upper_dir(h: *const sandlock_handle_t) 
         return ptr::null_mut();
     }
     match (*h).sandbox.upper_dir() {
-        Some(p) => CString::new(p.to_string_lossy().as_bytes()).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
+        Some(p) => CString::new(p.to_string_lossy().as_bytes())
+            .map(|s| s.into_raw())
+            .unwrap_or(ptr::null_mut()),
         None => ptr::null_mut(),
     }
 }
@@ -1869,13 +1891,18 @@ pub unsafe extern "C" fn sandlock_result_changes_len(r: *const sandlock_result_t
 /// # Safety
 /// `r` must be a valid result pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_result_change_path(r: *const sandlock_result_t, i: usize) -> *mut c_char {
+pub unsafe extern "C" fn sandlock_result_change_path(
+    r: *const sandlock_result_t,
+    i: usize,
+) -> *mut c_char {
     if r.is_null() {
         return ptr::null_mut();
     }
     let changes = &(*r)._private.changes;
     match changes.get(i) {
-        Some(c) => CString::new(c.path.to_string_lossy().as_bytes()).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
+        Some(c) => CString::new(c.path.to_string_lossy().as_bytes())
+            .map(|s| s.into_raw())
+            .unwrap_or(ptr::null_mut()),
         None => ptr::null_mut(),
     }
 }
@@ -1912,7 +1939,11 @@ pub struct sandlock_entry_t {
     pub digest: [u8; 32],
 }
 
-unsafe fn change_side<'a>(r: *const sandlock_result_t, i: usize, side: c_int) -> Option<&'a Option<sandlock_core::Entry>> {
+unsafe fn change_side<'a>(
+    r: *const sandlock_result_t,
+    i: usize,
+    side: c_int,
+) -> Option<&'a Option<sandlock_core::Entry>> {
     if r.is_null() {
         return None;
     }
@@ -1939,7 +1970,9 @@ pub unsafe extern "C" fn sandlock_result_change_entry(
     out: *mut sandlock_entry_t,
 ) -> c_int {
     use sandlock_core::EntryKind;
-    let Some(entry) = change_side(r, i, side) else { return -1 };
+    let Some(entry) = change_side(r, i, side) else {
+        return -1;
+    };
     let Some(e) = entry else { return 1 };
     if out.is_null() {
         return -1;
@@ -1974,7 +2007,9 @@ pub unsafe extern "C" fn sandlock_result_change_target(
         .and_then(|e| e.as_ref())
         .and_then(|e| e.target.as_deref());
     match target {
-        Some(t) => CString::new(t).map(|s| s.into_raw()).unwrap_or(ptr::null_mut()),
+        Some(t) => CString::new(t)
+            .map(|s| s.into_raw())
+            .unwrap_or(ptr::null_mut()),
         None => ptr::null_mut(),
     }
 }
@@ -2752,20 +2787,33 @@ pub unsafe extern "C" fn sandlock_image_pull(
     }
     let fail = |msg: String| {
         if !err_msg.is_null() {
-            *err_msg = CString::new(msg).map(CString::into_raw).unwrap_or(ptr::null_mut());
+            *err_msg = CString::new(msg)
+                .map(CString::into_raw)
+                .unwrap_or(ptr::null_mut());
         }
         ptr::null_mut()
     };
-    let Some(reference) = (!reference.is_null()).then(|| CStr::from_ptr(reference).to_str().ok()).flatten() else {
+    let Some(reference) = (!reference.is_null())
+        .then(|| CStr::from_ptr(reference).to_str().ok())
+        .flatten()
+    else {
         return fail("image reference must be a UTF-8 string".into());
     };
     let cache_dir = (!cache_dir.is_null())
-        .then(|| CStr::from_ptr(cache_dir).to_str().ok().map(std::path::PathBuf::from))
+        .then(|| {
+            CStr::from_ptr(cache_dir)
+                .to_str()
+                .ok()
+                .map(std::path::PathBuf::from)
+        })
         .flatten();
-    let pulled = with_runtime(|rt| rt.block_on(sandlock_core::image::pull(reference, cache_dir.as_deref())));
+    let pulled =
+        with_runtime(|rt| rt.block_on(sandlock_core::image::pull(reference, cache_dir.as_deref())));
     match pulled {
         Some(Ok(image)) => match serde_json::to_string(&image) {
-            Ok(json) => CString::new(json).map(CString::into_raw).unwrap_or(ptr::null_mut()),
+            Ok(json) => CString::new(json)
+                .map(CString::into_raw)
+                .unwrap_or(ptr::null_mut()),
             Err(e) => fail(e.to_string()),
         },
         Some(Err(e)) => fail(e.to_string()),
@@ -2791,11 +2839,16 @@ pub unsafe extern "C" fn sandlock_profile_resolve(
     }
     let fail = |msg: String| {
         if !err_msg.is_null() {
-            *err_msg = CString::new(msg).map(CString::into_raw).unwrap_or(ptr::null_mut());
+            *err_msg = CString::new(msg)
+                .map(CString::into_raw)
+                .unwrap_or(ptr::null_mut());
         }
         ptr::null_mut()
     };
-    let Some(toml) = (!toml.is_null()).then(|| CStr::from_ptr(toml).to_str().ok()).flatten() else {
+    let Some(toml) = (!toml.is_null())
+        .then(|| CStr::from_ptr(toml).to_str().ok())
+        .flatten()
+    else {
         return fail("profile must be a UTF-8 string".into());
     };
     let resolved = match sandlock_core::profile::resolve_profile(toml) {
@@ -2803,7 +2856,9 @@ pub unsafe extern "C" fn sandlock_profile_resolve(
         Err(e) => return fail(e.to_string()),
     };
     match serde_json::to_string(&resolved) {
-        Ok(json) => CString::new(json).map(CString::into_raw).unwrap_or(ptr::null_mut()),
+        Ok(json) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
         Err(e) => fail(e.to_string()),
     }
 }
@@ -2825,7 +2880,9 @@ pub unsafe extern "C" fn sandlock_profile_dir(err_msg: *mut *mut c_char) -> *mut
             .unwrap_or(ptr::null_mut()),
         Err(e) => {
             if !err_msg.is_null() {
-                *err_msg = CString::new(e.to_string()).map(CString::into_raw).unwrap_or(ptr::null_mut());
+                *err_msg = CString::new(e.to_string())
+                    .map(CString::into_raw)
+                    .unwrap_or(ptr::null_mut());
             }
             ptr::null_mut()
         }
@@ -2996,7 +3053,9 @@ pub unsafe extern "C" fn sandlock_restore_interactive(
     // keeps running; the Sandbox owns it). Skipped fds live on the Sandbox.
     let cp_ref = &(*cp)._private;
     let restored = matches!(
-        block_on_runtime(&rt, async { sb.restore_interactive(cp_ref).await.map(|_| ()) }),
+        block_on_runtime(&rt, async {
+            sb.restore_interactive(cp_ref).await.map(|_| ())
+        }),
         Some(Ok(()))
     );
     if !restored {
@@ -3018,9 +3077,7 @@ pub unsafe extern "C" fn sandlock_restore_interactive(
 /// `h` must be null or a valid handle.
 #[cfg(feature = "checkpoint")]
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handle_restore_skipped_len(
-    h: *const sandlock_handle_t,
-) -> usize {
+pub unsafe extern "C" fn sandlock_handle_restore_skipped_len(h: *const sandlock_handle_t) -> usize {
     if h.is_null() {
         return 0;
     }
@@ -3128,12 +3185,24 @@ mod tests {
 
     #[test]
     fn exit_reason_maps_every_exit_status() {
-        assert!(matches!(exit_reason(&ExitStatus::Code(0)), sandlock_exit_reason_t::Exited));
-        assert!(matches!(exit_reason(&ExitStatus::Signal(15)), sandlock_exit_reason_t::Signaled));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Code(0)),
+            sandlock_exit_reason_t::Exited
+        ));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Signal(15)),
+            sandlock_exit_reason_t::Signaled
+        ));
         // SIGKILL folds into Killed in core, so KILLED is a distinct reason with
         // no recoverable signal — the "systemd-style minus oom-kill" boundary.
-        assert!(matches!(exit_reason(&ExitStatus::Killed), sandlock_exit_reason_t::Killed));
-        assert!(matches!(exit_reason(&ExitStatus::Timeout), sandlock_exit_reason_t::Timeout));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Killed),
+            sandlock_exit_reason_t::Killed
+        ));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Timeout),
+            sandlock_exit_reason_t::Timeout
+        ));
         assert_eq!(exit_signal(&ExitStatus::Signal(15)), 15);
         for s in [ExitStatus::Code(7), ExitStatus::Killed, ExitStatus::Timeout] {
             assert_eq!(exit_signal(&s), -1, "only Signal(n) yields a number");

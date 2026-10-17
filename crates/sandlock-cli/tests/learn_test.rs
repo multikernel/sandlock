@@ -49,7 +49,10 @@ fn test_learn_captures_fs_read() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
     assert!(
         read_line.contains("/etc/hostname"),
         "expected /etc/hostname under read = [...], got: {read_line}",
@@ -67,7 +70,9 @@ fn test_learn_captures_real_binary_path_via_maps() {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    if python3.is_empty() { return; }
+    if python3.is_empty() {
+        return;
+    }
     let real = match std::fs::canonicalize(&python3) {
         Ok(p) => p,
         Err(_) => return,
@@ -82,10 +87,16 @@ fn test_learn_captures_real_binary_path_via_maps() {
         .args(["learn", "--", "python3", "-c", "pass"])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
     assert!(
         read_line.contains(&real_str),
         "real binary {real_str} not in reads (only visible via r-xp maps): {read_line}",
@@ -98,7 +109,9 @@ fn test_learn_captures_real_binary_path_via_maps() {
 #[test]
 fn test_learn_captures_fs_write() {
     let tmp1 = tempfile::NamedTempFile::new().expect("tempfile");
-    let tmp2 = tempfile::Builder::new().tempdir_in("/var/tmp").expect("tempdir");
+    let tmp2 = tempfile::Builder::new()
+        .tempdir_in("/var/tmp")
+        .expect("tempdir");
     let tmp2_file = tmp2.path().join("sandlock-learn-write2.txt");
     let path1 = tmp1.path().to_str().unwrap().to_owned();
     let path2 = tmp2_file.to_str().unwrap().to_owned();
@@ -113,13 +126,24 @@ fn test_learn_captures_fs_write() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(write_line.contains(&path1), "expected {path1} under write = [...], got: {write_line}");
-    assert!(write_line.contains(&path2) || write_line.contains(tmp2.path().to_str().unwrap()),
-        "expected {path2} (or its parent) under write = [...], got: {write_line}");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains(&path1),
+        "expected {path1} under write = [...], got: {write_line}"
+    );
+    assert!(
+        write_line.contains(&path2) || write_line.contains(tmp2.path().to_str().unwrap()),
+        "expected {path2} (or its parent) under write = [...], got: {write_line}"
+    );
     // COW: real file must not have been modified
     let content = std::fs::read_to_string(&path1).unwrap_or_default();
-    assert!(content.is_empty(), "COW isolation failed: real file was written to");
+    assert!(
+        content.is_empty(),
+        "COW isolation failed: real file was written to"
+    );
 }
 
 /// Creates to non-existent files collapse to the parent directory.
@@ -139,12 +163,18 @@ fn test_learn_new_file_collapses_to_parent() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
     assert!(
         write_line.contains("/var/tmp"),
         "expected /var/tmp under write = [...], got: {write_line}",
     );
-    assert!(!path.exists(), "COW isolation failed: real filesystem was modified");
+    assert!(
+        !path.exists(),
+        "COW isolation failed: real filesystem was modified"
+    );
 }
 
 /// Directory creates and deletions are captured. COW ensures the real filesystem is not modified.
@@ -160,14 +190,28 @@ fn test_learn_captures_dir_create_and_delete() {
         .args(["learn", "--", "sh", "-c", &cmd])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(write_line.contains("/var/tmp"),
-        "expected /var/tmp in write = [...], got: {write_line}");
-    assert!(!dir.exists(), "COW isolation failed: dir was created on real FS");
-    assert!(std::path::Path::new(&file_path).exists(), "COW isolation failed: file was deleted on real FS");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains("/var/tmp"),
+        "expected /var/tmp in write = [...], got: {write_line}"
+    );
+    assert!(
+        !dir.exists(),
+        "COW isolation failed: dir was created on real FS"
+    );
+    assert!(
+        std::path::Path::new(&file_path).exists(),
+        "COW isolation failed: file was deleted on real FS"
+    );
 }
 
 /// Renames capture both source and destination parents. COW ensures the real filesystem is not modified.
@@ -181,14 +225,32 @@ fn test_learn_captures_rename() {
         .args(["learn", "--", "sh", "-c", &cmd])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(write_line.contains("/var/tmp"), "expected /var/tmp (src parent) in: {write_line}");
-    assert!(write_line.contains("/tmp"), "expected /tmp (dst parent) in: {write_line}");
-    assert!(src.path().exists(), "COW isolation failed: src was deleted on real FS");
-    assert!(!std::path::Path::new(dst).exists(), "COW isolation failed: dst was created on real FS");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains("/var/tmp"),
+        "expected /var/tmp (src parent) in: {write_line}"
+    );
+    assert!(
+        write_line.contains("/tmp"),
+        "expected /tmp (dst parent) in: {write_line}"
+    );
+    assert!(
+        src.path().exists(),
+        "COW isolation failed: src was deleted on real FS"
+    );
+    assert!(
+        !std::path::Path::new(dst).exists(),
+        "COW isolation failed: dst was created on real FS"
+    );
 }
 
 /// Symlink creates are captured by the link path, not the target.
@@ -203,12 +265,24 @@ fn test_learn_captures_symlink() {
         .args(["learn", "--", "sh", "-c", &cmd])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(write_line.contains("/var/tmp"), "expected /var/tmp (link parent) in: {write_line}");
-    assert!(!link.exists(), "COW isolation failed: symlink created on real FS");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains("/var/tmp"),
+        "expected /var/tmp (link parent) in: {write_line}"
+    );
+    assert!(
+        !link.exists(),
+        "COW isolation failed: symlink created on real FS"
+    );
 }
 
 /// Hard link creates are captured by destination; source appears in reads.
@@ -225,15 +299,36 @@ fn test_learn_captures_hardlink() {
         .args(["learn", "--", "sh", "-c", &cmd])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
-    assert!(write_line.contains("/tmp"), "expected /tmp (dst parent) in: {write_line}");
-    assert!(!write_line.contains("/var/tmp"), "src parent /var/tmp wrongly recorded as write in: {write_line}");
-    assert!(read_line.contains(&src_path), "expected src {src_path} in reads: {read_line}");
-    assert!(!dst.exists(), "COW isolation failed: hardlink created on real FS");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains("/tmp"),
+        "expected /tmp (dst parent) in: {write_line}"
+    );
+    assert!(
+        !write_line.contains("/var/tmp"),
+        "src parent /var/tmp wrongly recorded as write in: {write_line}"
+    );
+    assert!(
+        read_line.contains(&src_path),
+        "expected src {src_path} in reads: {read_line}"
+    );
+    assert!(
+        !dst.exists(),
+        "COW isolation failed: hardlink created on real FS"
+    );
 }
 
 /// Truncate is captured as a write on the file path itself. COW ensures the real file is unchanged.
@@ -246,14 +341,25 @@ fn test_learn_captures_truncate() {
         .args(["learn", "--", "sh", "-c", &format!("truncate -s 0 {path}")])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(write_line.contains(&path),
-        "expected file path {path} in write = [...], got: {write_line}");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains(&path),
+        "expected file path {path} in write = [...], got: {write_line}"
+    );
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    assert_eq!(content, "original content", "COW isolation failed: real file was truncated");
+    assert_eq!(
+        content, "original content",
+        "COW isolation failed: real file was truncated"
+    );
 }
 
 // ── Network ───────────────────────────────────────────────────────────────────
@@ -263,11 +369,12 @@ fn test_learn_captures_truncate() {
 fn test_learn_captures_net_connect() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let _t = std::thread::spawn(move || { let _ = listener.accept(); });
+    let _t = std::thread::spawn(move || {
+        let _ = listener.accept();
+    });
 
-    let script = format!(
-        "import socket; s=socket.socket(); s.connect(('127.0.0.1',{port})); s.close()"
-    );
+    let script =
+        format!("import socket; s=socket.socket(); s.connect(('127.0.0.1',{port})); s.close()");
     let output = sandlock_bin()
         .args(["learn", "--", "python3", "-c", &script])
         .output()
@@ -279,7 +386,10 @@ fn test_learn_captures_net_connect() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = format!("127.0.0.1:{port}");
-    let net_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("");
+    let net_line = stdout
+        .lines()
+        .find(|l| l.starts_with("allow = ["))
+        .unwrap_or("");
     assert!(
         net_line.contains(&expected),
         "expected {expected} under [network] allow = [...], got: {net_line}",
@@ -292,10 +402,15 @@ fn test_learn_captures_net_connect() {
 fn test_learn_captures_ipv6_connect() {
     let listener = match std::net::TcpListener::bind("[::1]:0") {
         Ok(l) => l,
-        Err(_) => { eprintln!("skipped: IPv6 loopback unavailable"); return; }
+        Err(_) => {
+            eprintln!("skipped: IPv6 loopback unavailable");
+            return;
+        }
     };
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || { let _ = listener.accept(); });
+    std::thread::spawn(move || {
+        let _ = listener.accept();
+    });
 
     let script = format!(
         "import socket; s=socket.socket(socket.AF_INET6); s.connect(('::1',{port})); s.close()"
@@ -304,29 +419,50 @@ fn test_learn_captures_ipv6_connect() {
         .args(["learn", "--", "python3", "-c", &script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = format!("tcp://[::1]:{port}");
-    let net_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("");
-    assert!(net_line.contains(&expected),
-        "expected {expected} under [network] allow = [...], got: {net_line}");
+    let net_line = stdout
+        .lines()
+        .find(|l| l.starts_with("allow = ["))
+        .unwrap_or("");
+    assert!(
+        net_line.contains(&expected),
+        "expected {expected} under [network] allow = [...], got: {net_line}"
+    );
 }
 
 /// getaddrinfo routing probes (UDP connect to port 80) must not appear in the profile.
 #[test]
 fn test_learn_no_phantom_udp_from_getaddrinfo() {
     let output = sandlock_bin()
-        .args(["learn", "--", "python3", "-c",
-               "import socket; socket.getaddrinfo('localhost', 80)"])
+        .args([
+            "learn",
+            "--",
+            "python3",
+            "-c",
+            "import socket; socket.getaddrinfo('localhost', 80)",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let allow_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("allow = []");
-    assert!(!allow_line.contains("udp://"),
-        "phantom UDP entries from routing probes must not appear in profile: {allow_line}");
+    let allow_line = stdout
+        .lines()
+        .find(|l| l.starts_with("allow = ["))
+        .unwrap_or("allow = []");
+    assert!(
+        !allow_line.contains("udp://"),
+        "phantom UDP entries from routing probes must not appear in profile: {allow_line}"
+    );
 }
 
 /// Bind calls are recorded under [network] allow_bind.
@@ -343,10 +479,16 @@ fn test_learn_captures_bind() {
         .args(["learn", "--", "python3", "-c", script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let bind_line = stdout.lines().find(|l| l.starts_with("allow_bind = [")).unwrap_or("");
+    let bind_line = stdout
+        .lines()
+        .find(|l| l.starts_with("allow_bind = ["))
+        .unwrap_or("");
     assert!(
         bind_line.contains("19876"),
         "expected 19876 in allow_bind, got: {bind_line}",
@@ -367,13 +509,21 @@ fn test_learn_captures_unix_bind() {
         .args(["learn", "--", "python3", "-c", &script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
     let parent = dir.path().to_str().unwrap();
-    assert!(write_line.contains(parent),
-        "expected parent dir {parent} in write = [...], got: {write_line}");
+    assert!(
+        write_line.contains(parent),
+        "expected parent dir {parent} in write = [...], got: {write_line}"
+    );
 }
 
 /// mknod/mknodat: FIFO creates are captured by the parent directory (Landlock
@@ -384,18 +534,34 @@ fn test_learn_captures_mknod() {
     let fifo = dir.path().join("test.fifo");
     let fifo_str = fifo.to_str().unwrap();
     let output = sandlock_bin()
-        .args(["learn", "--", "python3", "-c",
-               &format!("import os; os.mkfifo('{fifo_str}')")])
+        .args([
+            "learn",
+            "--",
+            "python3",
+            "-c",
+            &format!("import os; os.mkfifo('{fifo_str}')"),
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
     let parent = dir.path().to_str().unwrap();
-    assert!(write_line.contains(parent),
-        "expected parent dir {parent} in write = [...], got: {write_line}");
-    assert!(!fifo.exists(), "COW isolation failed: FIFO was created on real FS");
+    assert!(
+        write_line.contains(parent),
+        "expected parent dir {parent} in write = [...], got: {write_line}"
+    );
+    assert!(
+        !fifo.exists(),
+        "COW isolation failed: FIFO was created on real FS"
+    );
 }
 
 /// UDP destinations via sendto and sendmsg are both recorded under [network] allow.
@@ -440,8 +606,14 @@ fn test_learn_captures_sendmmsg_all_destinations() {
     let sock2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port1 = sock1.local_addr().unwrap().port();
     let port2 = sock2.local_addr().unwrap().port();
-    std::thread::spawn(move || { let mut b = [0u8;8]; let _ = sock1.recv_from(&mut b); });
-    std::thread::spawn(move || { let mut b = [0u8;8]; let _ = sock2.recv_from(&mut b); });
+    std::thread::spawn(move || {
+        let mut b = [0u8; 8];
+        let _ = sock1.recv_from(&mut b);
+    });
+    std::thread::spawn(move || {
+        let mut b = [0u8; 8];
+        let _ = sock2.recv_from(&mut b);
+    });
 
     let script = format!(concat!(
         "import ctypes, socket, struct\n",
@@ -490,14 +662,24 @@ fn test_learn_captures_sendmmsg_all_destinations() {
         .args(["learn", "--", "python3", "-c", &script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let allow_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("");
-    assert!(allow_line.contains(&format!("udp://127.0.0.1:{port1}")),
-        "expected port {port1} in allow, got: {allow_line}");
-    assert!(allow_line.contains(&format!("udp://127.0.0.1:{port2}")),
-        "expected port {port2} (second sendmmsg destination) in allow, got: {allow_line}");
+    let allow_line = stdout
+        .lines()
+        .find(|l| l.starts_with("allow = ["))
+        .unwrap_or("");
+    assert!(
+        allow_line.contains(&format!("udp://127.0.0.1:{port1}")),
+        "expected port {port1} in allow, got: {allow_line}"
+    );
+    assert!(
+        allow_line.contains(&format!("udp://127.0.0.1:{port2}")),
+        "expected port {port2} (second sendmmsg destination) in allow, got: {allow_line}"
+    );
 }
 
 // ── Resource limits ───────────────────────────────────────────────────────────
@@ -515,8 +697,14 @@ fn test_learn_captures_resource_limits() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("memory = \""), "expected memory limit in learn output, got:\n{stdout}");
-    assert!(stdout.contains("processes = "), "expected processes limit in learn output, got:\n{stdout}");
+    assert!(
+        stdout.contains("memory = \""),
+        "expected memory limit in learn output, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("processes = "),
+        "expected processes limit in learn output, got:\n{stdout}"
+    );
     // TODO: uncomment when open_files enforcement is implemented in the supervisor
     // assert!(stdout.contains("open_files = "), "expected open_files limit in learn output, got:\n{stdout}");
 }
@@ -529,7 +717,10 @@ fn test_learn_captures_resource_limits() {
 fn test_learn_device_write_open_reaches_real_device() {
     let output = sandlock_bin()
         .args([
-            "learn", "--", "python3", "-c",
+            "learn",
+            "--",
+            "python3",
+            "-c",
             "import os, stat; fd = os.open('/dev/null', os.O_RDWR); \
              print('ISCHR', stat.S_ISCHR(os.fstat(fd).st_mode))",
         ])
@@ -541,16 +732,31 @@ fn test_learn_device_write_open_reaches_real_device() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("ISCHR True"), "expected a real character device, got:\n{stdout}");
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(write_line.contains("/dev/null"), "expected /dev/null in writes, got: {write_line}");
+    assert!(
+        stdout.contains("ISCHR True"),
+        "expected a real character device, got:\n{stdout}"
+    );
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains("/dev/null"),
+        "expected /dev/null in writes, got: {write_line}"
+    );
 }
 
 /// Dedup removes a path when an ancestor is already in the read set.
 #[test]
 fn test_read_dedup_removes_leaf_when_ancestor_present() {
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", "ls /etc > /dev/null && cat /etc/hostname"])
+        .args([
+            "learn",
+            "--",
+            "sh",
+            "-c",
+            "ls /etc > /dev/null && cat /etc/hostname",
+        ])
         .output()
         .expect("failed to run sandlock learn");
     assert!(
@@ -559,10 +765,18 @@ fn test_read_dedup_removes_leaf_when_ancestor_present() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
-    assert!(read_line.contains("/etc"), "expected /etc in reads, got: {read_line}");
-    assert!(!read_line.contains("/etc/hostname"),
-        "expected /etc/hostname removed by dedup (covered by /etc), got: {read_line}");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
+    assert!(
+        read_line.contains("/etc"),
+        "expected /etc in reads, got: {read_line}"
+    );
+    assert!(
+        !read_line.contains("/etc/hostname"),
+        "expected /etc/hostname removed by dedup (covered by /etc), got: {read_line}"
+    );
 }
 
 /// N-threshold collapse replaces individual files with their parent directory.
@@ -593,14 +807,19 @@ fn test_collapse_threshold_reads() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
     assert!(
         read_line.contains(&format!("\"{}\"", dir_path.display())),
         "expected {} collapsed in reads, got: {read_line}",
         dir_path.display(),
     );
-    assert!(!read_line.contains("observed1.txt"),
-        "expected individual files removed after collapse, got: {read_line}");
+    assert!(
+        !read_line.contains("observed1.txt"),
+        "expected individual files removed after collapse, got: {read_line}"
+    );
 }
 
 /// --collapse-prefix forces collapse regardless of the file count threshold.
@@ -621,7 +840,13 @@ fn test_collapse_prefix_forces_collapse() {
         .collect();
 
     let mut cmd = sandlock_bin();
-    cmd.args(["learn", "--collapse-prefix", dir_path.to_str().unwrap(), "--", "cat"]);
+    cmd.args([
+        "learn",
+        "--collapse-prefix",
+        dir_path.to_str().unwrap(),
+        "--",
+        "cat",
+    ]);
     cmd.args(&observed);
     let output = cmd.output().expect("failed to run sandlock learn");
     assert!(
@@ -630,71 +855,127 @@ fn test_collapse_prefix_forces_collapse() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
     assert!(
         read_line.contains(&format!("\"{}\"", dir_path.display())),
         "expected {} collapsed in reads, got: {read_line}",
         dir_path.display(),
     );
-    assert!(!read_line.contains("observed1.txt"),
-        "expected individual files removed after prefix collapse, got: {read_line}");
+    assert!(
+        !read_line.contains("observed1.txt"),
+        "expected individual files removed after prefix collapse, got: {read_line}"
+    );
 }
 
 /// Guarded paths are not collapsed by the N-threshold; individual files are kept.
 #[test]
 fn test_collapse_guarded_not_collapsed_by_threshold() {
     let output = sandlock_bin()
-        .args(["learn", "--collapse", "--", "sh", "-c",
-               "cat /etc/hostname /etc/hosts /etc/resolv.conf /etc/passwd"])
+        .args([
+            "learn",
+            "--collapse",
+            "--",
+            "sh",
+            "-c",
+            "cat /etc/hostname /etc/hosts /etc/resolv.conf /etc/passwd",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
-    assert!(read_line.contains("/etc/hostname"),
-        "expected individual /etc files kept (guarded, not collapsed), got: {read_line}");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
+    assert!(
+        read_line.contains("/etc/hostname"),
+        "expected individual /etc files kept (guarded, not collapsed), got: {read_line}"
+    );
 }
 
 /// --collapse-prefix on a guarded path requires --force-sensitive-collapse.
 #[test]
 fn test_collapse_prefix_guarded_requires_force() {
     let output = sandlock_bin()
-        .args(["learn", "--collapse-prefix", "/etc", "--", "cat", "/etc/hostname"])
+        .args([
+            "learn",
+            "--collapse-prefix",
+            "/etc",
+            "--",
+            "cat",
+            "/etc/hostname",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(!output.status.success(), "expected failure without --force-sensitive-collapse");
+    assert!(
+        !output.status.success(),
+        "expected failure without --force-sensitive-collapse"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--force-sensitive-collapse"),
-        "expected hint about --force-sensitive-collapse in stderr, got: {stderr}");
+    assert!(
+        stderr.contains("--force-sensitive-collapse"),
+        "expected hint about --force-sensitive-collapse in stderr, got: {stderr}"
+    );
 }
 
 /// --collapse-prefix on a guarded path with --force-sensitive-collapse collapses and emits a warning.
 #[test]
 fn test_collapse_prefix_guarded_with_force() {
     let output = sandlock_bin()
-        .args(["learn", "--collapse-prefix", "/etc", "--force-sensitive-collapse",
-               "--", "cat", "/etc/hostname"])
+        .args([
+            "learn",
+            "--collapse-prefix",
+            "/etc",
+            "--force-sensitive-collapse",
+            "--",
+            "cat",
+            "/etc/hostname",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
     assert!(
         read_line.contains("/etc\"") || read_line.contains("/etc,"),
         "expected /etc in reads after forced collapse, got: {read_line}",
     );
-    assert!(!read_line.contains("/etc/hostname"),
-        "expected /etc/hostname removed after collapse, got: {read_line}");
-    assert!(stderr.contains("guarded directory"),
-        "expected guarded directory warning, got: {stderr}");
+    assert!(
+        !read_line.contains("/etc/hostname"),
+        "expected /etc/hostname removed after collapse, got: {read_line}"
+    );
+    assert!(
+        stderr.contains("guarded directory"),
+        "expected guarded directory warning, got: {stderr}"
+    );
 }
 
 /// Write collapse to filesystem root is skipped entirely.
 #[test]
 fn test_write_collapse_skips_root() {
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", "echo x > /sandlock_learn_root_test_$$"])
+        .args([
+            "learn",
+            "--",
+            "sh",
+            "-c",
+            "echo x > /sandlock_learn_root_test_$$",
+        ])
         .output()
         .expect("failed to run sandlock learn");
     assert!(
@@ -704,17 +985,31 @@ fn test_write_collapse_skips_root() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(!write_line.contains("\"/\""), "write list must not contain \"/\", got: {write_line}");
-    assert!(stderr.contains("filesystem root"),
-        "expected filesystem root warning in stderr, got: {stderr}");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        !write_line.contains("\"/\""),
+        "write list must not contain \"/\", got: {write_line}"
+    );
+    assert!(
+        stderr.contains("filesystem root"),
+        "expected filesystem root warning in stderr, got: {stderr}"
+    );
 }
 
 /// Write collapse to a sensitive path emits a warning and observed-vs-granted diff.
 #[test]
 fn test_write_collapse_warns_sensitive() {
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", "echo x > /etc/sandlock_learn_sensitive_test_$$"])
+        .args([
+            "learn",
+            "--",
+            "sh",
+            "-c",
+            "echo x > /etc/sandlock_learn_sensitive_test_$$",
+        ])
         .output()
         .expect("failed to run sandlock learn");
     assert!(
@@ -724,12 +1019,22 @@ fn test_write_collapse_warns_sensitive() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
-    assert!(write_line.contains("/etc"), "expected /etc in write list, got: {write_line}");
-    assert!(stderr.contains("guarded directory"),
-        "expected 'guarded directory' warning in stderr, got: {stderr}");
-    assert!(stderr.contains("unobserved siblings now writable under"),
-        "expected observed-vs-granted diff in stderr, got: {stderr}");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("");
+    assert!(
+        write_line.contains("/etc"),
+        "expected /etc in write list, got: {write_line}"
+    );
+    assert!(
+        stderr.contains("guarded directory"),
+        "expected 'guarded directory' warning in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("unobserved siblings now writable under"),
+        "expected observed-vs-granted diff in stderr, got: {stderr}"
+    );
 }
 
 /// Runs `sandlock learn -- sh -c <cmd>` with $HOME pointed at `home`.
@@ -739,10 +1044,20 @@ fn learn_sh_with_home(cmd: &str, home: &std::path::Path) -> (String, String) {
         .args(["learn", "--", "sh", "-c", cmd])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("write = []");
-    (write_line.to_owned(), String::from_utf8_lossy(&output.stderr).into_owned())
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("write = []");
+    (
+        write_line.to_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 /// A protected directory is never granted, whether the workload creates a
@@ -753,12 +1068,19 @@ fn test_write_grant_skips_protected() {
     let ssh = base.path().join(".ssh");
     std::fs::create_dir(&ssh).expect("create .ssh");
     let ssh_str = ssh.to_str().unwrap();
-    for cmd in [format!("echo x > {ssh_str}/new_key"), format!("mkdir {ssh_str}/sub")] {
+    for cmd in [
+        format!("echo x > {ssh_str}/new_key"),
+        format!("mkdir {ssh_str}/sub"),
+    ] {
         let (write_line, stderr) = learn_sh_with_home(&cmd, base.path());
-        assert!(!write_line.contains(ssh_str),
-            "`{cmd}`: write list must not contain {ssh_str} (protected), got: {write_line}");
-        assert!(stderr.contains("protected path"),
-            "`{cmd}`: expected 'protected path' warning in stderr, got: {stderr}");
+        assert!(
+            !write_line.contains(ssh_str),
+            "`{cmd}`: write list must not contain {ssh_str} (protected), got: {write_line}"
+        );
+        assert!(
+            stderr.contains("protected path"),
+            "`{cmd}`: expected 'protected path' warning in stderr, got: {stderr}"
+        );
     }
 }
 
@@ -769,14 +1091,23 @@ fn test_write_grant_warns_guarded_home() {
     let home = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
     std::fs::write(home.path().join("untouched"), b"x").expect("seed sibling");
     let home_str = home.path().to_str().unwrap();
-    for cmd in [format!("echo x > {home_str}/new_dotfile"), format!("mkdir {home_str}/sub")] {
+    for cmd in [
+        format!("echo x > {home_str}/new_dotfile"),
+        format!("mkdir {home_str}/sub"),
+    ] {
         let (write_line, stderr) = learn_sh_with_home(&cmd, home.path());
-        assert!(write_line.contains(&format!("\"{home_str}\"")),
-            "`{cmd}`: expected {home_str} in write list, got: {write_line}");
-        assert!(stderr.contains("guarded directory"),
-            "`{cmd}`: expected 'guarded directory' warning in stderr, got: {stderr}");
-        assert!(stderr.contains("unobserved siblings now writable under"),
-            "`{cmd}`: expected observed-vs-granted diff in stderr, got: {stderr}");
+        assert!(
+            write_line.contains(&format!("\"{home_str}\"")),
+            "`{cmd}`: expected {home_str} in write list, got: {write_line}"
+        );
+        assert!(
+            stderr.contains("guarded directory"),
+            "`{cmd}`: expected 'guarded directory' warning in stderr, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("unobserved siblings now writable under"),
+            "`{cmd}`: expected observed-vs-granted diff in stderr, got: {stderr}"
+        );
     }
 }
 
@@ -791,13 +1122,25 @@ fn test_mkdirat_eexist_no_write() {
     // mkdirat fires pre-syscall; without the EEXIST guard the parent
     // (base_str) would be inserted into the write set.
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", &format!("mkdir {existing_str} 2>/dev/null; true")])
+        .args([
+            "learn",
+            "--",
+            "sh",
+            "-c",
+            &format!("mkdir {existing_str} 2>/dev/null; true"),
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("write = []");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("write = []");
     assert!(!write_line.contains(base_str),
         "mkdirat on existing target must not insert parent {base_str} into writes, got: {write_line}");
 }
@@ -807,38 +1150,71 @@ fn test_mkdirat_eexist_no_write() {
 fn test_direct_write_root_skipped() {
     let dir = format!("/sandlock_learn_root_mkdir_{}", std::process::id());
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", &format!("mkdir {dir} 2>/dev/null; true")])
+        .args([
+            "learn",
+            "--",
+            "sh",
+            "-c",
+            &format!("mkdir {dir} 2>/dev/null; true"),
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("write = []");
-    assert!(!write_line.contains("\"/\""),
-        "direct write of \"/\" must be dropped, got: {write_line}");
-    assert!(stderr.contains("filesystem root"),
-        "expected filesystem root warning in stderr, got: {stderr}");
+    let write_line = stdout
+        .lines()
+        .find(|l| l.starts_with("write = ["))
+        .unwrap_or("write = []");
+    assert!(
+        !write_line.contains("\"/\""),
+        "direct write of \"/\" must be dropped, got: {write_line}"
+    );
+    assert!(
+        stderr.contains("filesystem root"),
+        "expected filesystem root warning in stderr, got: {stderr}"
+    );
 }
 
 /// /proc/self/maps must appear in the profile as /proc/self/maps
 #[test]
 fn test_proc_self_maps_preserved() {
     let output = sandlock_bin()
-        .args(["learn", "--", "python3", "-c", "open('/proc/self/maps').read()"])
+        .args([
+            "learn",
+            "--",
+            "python3",
+            "-c",
+            "open('/proc/self/maps').read()",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
-    assert!(read_line.contains("\"/proc/self/maps\""),
-        "/proc/self/maps must be recorded as-is, got: {read_line}");
-    let has_numeric_pid = read_line.split("\"/proc/").skip(1).any(|s| {
-        s.chars().next().map_or(false, |c| c.is_ascii_digit())
-    });
-    assert!(!has_numeric_pid,
-        "must not contain a numeric-pid /proc/<pid>/... entry, got: {read_line}");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
+    assert!(
+        read_line.contains("\"/proc/self/maps\""),
+        "/proc/self/maps must be recorded as-is, got: {read_line}"
+    );
+    let has_numeric_pid = read_line
+        .split("\"/proc/")
+        .skip(1)
+        .any(|s| s.chars().next().map_or(false, |c| c.is_ascii_digit()));
+    assert!(
+        !has_numeric_pid,
+        "must not contain a numeric-pid /proc/<pid>/... entry, got: {read_line}"
+    );
 }
 
 /// /proc/self/exe is a symlink to the real binary; it must be resolved to the
@@ -846,15 +1222,29 @@ fn test_proc_self_maps_preserved() {
 #[test]
 fn test_proc_self_exe_resolves_to_binary() {
     let output = sandlock_bin()
-        .args(["learn", "--", "python3", "-c", "import os; os.open('/proc/self/exe', os.O_RDONLY)"])
+        .args([
+            "learn",
+            "--",
+            "python3",
+            "-c",
+            "import os; os.open('/proc/self/exe', os.O_RDONLY)",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
-    assert!(!read_line.contains("\"/proc/self/exe\""),
-        "/proc/self/exe must be resolved to the binary path, not recorded as-is: {read_line}");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
+    assert!(
+        !read_line.contains("\"/proc/self/exe\""),
+        "/proc/self/exe must be resolved to the binary path, not recorded as-is: {read_line}"
+    );
     let interp = std::process::Command::new("python3")
         .args(["-c", "import sys; print(sys.executable)"])
         .output()
@@ -862,8 +1252,10 @@ fn test_proc_self_exe_resolves_to_binary() {
     let interp = String::from_utf8_lossy(&interp.stdout).trim().to_string();
     let interp = std::fs::canonicalize(&interp).expect("canonicalize python3");
     let expected = format!("\"{}\"", interp.display());
-    assert!(read_line.contains(&expected),
-        "expected resolved interpreter {expected} in reads, got: {read_line}");
+    assert!(
+        read_line.contains(&expected),
+        "expected resolved interpreter {expected} in reads, got: {read_line}"
+    );
 }
 
 /// Opening /proc/self itself (no sub-entry) must be recorded as /proc/self,
@@ -871,15 +1263,29 @@ fn test_proc_self_exe_resolves_to_binary() {
 #[test]
 fn test_proc_self_bare_preserved() {
     let output = sandlock_bin()
-        .args(["learn", "--", "python3", "-c", "import os; os.listdir('/proc/self')"])
+        .args([
+            "learn",
+            "--",
+            "python3",
+            "-c",
+            "import os; os.listdir('/proc/self')",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
-    assert!(read_line.contains("\"/proc/self\""),
-        "/proc/self must be recorded as-is, got: {read_line}");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
+    assert!(
+        read_line.contains("\"/proc/self\""),
+        "/proc/self must be recorded as-is, got: {read_line}"
+    );
 }
 
 // ── Merge and canonicalization ────────────────────────────────────────────────
@@ -893,23 +1299,42 @@ fn test_learn_merge_unions_profiles() {
         .args(["learn", "-o", &profile_path, "--", "cat", "/etc/hostname"])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn1.status.success(),
-        "first learn failed: {}", String::from_utf8_lossy(&learn1.stderr));
+    assert!(
+        learn1.status.success(),
+        "first learn failed: {}",
+        String::from_utf8_lossy(&learn1.stderr)
+    );
 
     let learn2 = sandlock_bin()
-        .args(["learn", "--merge", &profile_path, "--", "cat", "/etc/os-release"])
+        .args([
+            "learn",
+            "--merge",
+            &profile_path,
+            "--",
+            "cat",
+            "/etc/os-release",
+        ])
         .output()
         .expect("failed to run sandlock learn --merge");
-    assert!(learn2.status.success(),
-        "merge learn failed: {}", String::from_utf8_lossy(&learn2.stderr));
+    assert!(
+        learn2.status.success(),
+        "merge learn failed: {}",
+        String::from_utf8_lossy(&learn2.stderr)
+    );
 
     let merged = std::fs::read_to_string(&profile_path).expect("read merged profile");
-    assert!(merged.contains("/etc/hostname") || merged.contains("/etc"),
-        "merged profile missing /etc/hostname: {merged}");
-    assert!(merged.contains("/etc/os-release") || merged.contains("/etc"),
-        "merged profile missing /etc/os-release: {merged}");
-    assert!(merged.contains("hostname"),
-        "merged profile must keep [program] from first run: {merged}");
+    assert!(
+        merged.contains("/etc/hostname") || merged.contains("/etc"),
+        "merged profile missing /etc/hostname: {merged}"
+    );
+    assert!(
+        merged.contains("/etc/os-release") || merged.contains("/etc"),
+        "merged profile missing /etc/os-release: {merged}"
+    );
+    assert!(
+        merged.contains("hostname"),
+        "merged profile must keep [program] from first run: {merged}"
+    );
 
     // deny rules and port ranges in the existing profile must survive a merge.
     let existing = format!(
@@ -917,18 +1342,34 @@ fn test_learn_merge_unions_profiles() {
     );
     std::fs::write(&profile_path, &existing).expect("write existing profile");
     let learn3 = sandlock_bin()
-        .args(["learn", "--merge", &profile_path, "--", "cat", "/etc/hostname"])
+        .args([
+            "learn",
+            "--merge",
+            &profile_path,
+            "--",
+            "cat",
+            "/etc/hostname",
+        ])
         .output()
         .expect("failed to run sandlock learn --merge");
-    assert!(learn3.status.success(),
-        "merge with deny rules failed: {}", String::from_utf8_lossy(&learn3.stderr));
+    assert!(
+        learn3.status.success(),
+        "merge with deny rules failed: {}",
+        String::from_utf8_lossy(&learn3.stderr)
+    );
     let merged2 = std::fs::read_to_string(&profile_path).expect("read merged profile");
-    assert!(merged2.contains("/secret"),
-        "deny rule must survive merge: {merged2}");
-    assert!(merged2.contains("9000-9005"),
-        "port range spec must survive merge verbatim: {merged2}");
-    assert!(merged2.contains("8080"),
-        "numeric port must survive merge: {merged2}");
+    assert!(
+        merged2.contains("/secret"),
+        "deny rule must survive merge: {merged2}"
+    );
+    assert!(
+        merged2.contains("9000-9005"),
+        "port range spec must survive merge verbatim: {merged2}"
+    );
+    assert!(
+        merged2.contains("8080"),
+        "numeric port must survive merge: {merged2}"
+    );
 }
 
 /// Paths accessed through symlinks are recorded as their canonical real path.
@@ -951,8 +1392,11 @@ fn test_learn_symlink_path_canonicalized() {
         .args(["learn", "-o", &profile_path, "--", "cat", &via_link])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let profile_content = std::fs::read_to_string(&profile_path).expect("read profile");
     assert!(
@@ -962,12 +1406,21 @@ fn test_learn_symlink_path_canonicalized() {
     );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "cat", &real_path])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "cat",
+            &real_path,
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(),
+    assert!(
+        run.status.success(),
         "run via real path failed (canonicalization not applied): {}",
-        String::from_utf8_lossy(&run.stderr));
+        String::from_utf8_lossy(&run.stderr)
+    );
 
     let _ = std::fs::remove_file(&link);
 }
@@ -984,7 +1437,10 @@ fn spawn_http_server() -> u16 {
     std::thread::spawn(move || {
         // Accept multiple connections so the server handles repeated test requests.
         for stream in listener.incoming() {
-            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
             // Read until the end of HTTP headers.
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
@@ -1003,18 +1459,44 @@ fn test_learn_captures_http_request() {
     let url = format!("http://127.0.0.1:{port}/hello");
 
     let output = sandlock_bin()
-        .args(["learn", "--http-port", &port.to_string(), "--", "curl", "-sf", &url])
+        .args([
+            "learn",
+            "--http-port",
+            &port.to_string(),
+            "--",
+            "curl",
+            "-sf",
+            &url,
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let profile = String::from_utf8_lossy(&output.stdout);
-    assert!(profile.contains("[http]"), "expected [http] section: {profile}");
-    assert!(profile.contains("ports"), "expected ports in [http]: {profile}");
-    assert!(profile.contains(&port.to_string()), "expected port {port} in [http].ports: {profile}");
-    assert!(profile.contains("GET"), "expected GET rule in [http].allow: {profile}");
-    assert!(profile.contains("/hello"), "expected /hello path in [http].allow: {profile}");
+    assert!(
+        profile.contains("[http]"),
+        "expected [http] section: {profile}"
+    );
+    assert!(
+        profile.contains("ports"),
+        "expected ports in [http]: {profile}"
+    );
+    assert!(
+        profile.contains(&port.to_string()),
+        "expected port {port} in [http].ports: {profile}"
+    );
+    assert!(
+        profile.contains("GET"),
+        "expected GET rule in [http].allow: {profile}"
+    );
+    assert!(
+        profile.contains("/hello"),
+        "expected /hello path in [http].allow: {profile}"
+    );
 }
 
 /// --http-port writes only the intercepted port to [http].ports, not port 80.
@@ -1025,15 +1507,28 @@ fn test_learn_http_port_not_inflated() {
     let url = format!("http://127.0.0.1:{port}/hello");
 
     let output = sandlock_bin()
-        .args(["learn", "--http-port", &port.to_string(), "--", "curl", "-sf", &url])
+        .args([
+            "learn",
+            "--http-port",
+            &port.to_string(),
+            "--",
+            "curl",
+            "-sf",
+            &url,
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let profile = String::from_utf8_lossy(&output.stdout);
-    assert!(profile.contains(&format!("ports = [{}]", port)),
-        "expected only port {port} in [http].ports, got: {profile}");
+    assert!(
+        profile.contains(&format!("ports = [{}]", port)),
+        "expected only port {port} in [http].ports, got: {profile}"
+    );
 }
 
 /// Multiple distinct requests to different paths are all recorded and deduplicated.
@@ -1047,16 +1542,29 @@ fn test_learn_captures_http_multiple_paths() {
     let cmd = format!("curl -sf {url_a} && curl -sf {url_b} && curl -sf {url_a}");
 
     let output = sandlock_bin()
-        .args(["learn", "--http-port", &port.to_string(), "--", "sh", "-c", &cmd])
+        .args([
+            "learn",
+            "--http-port",
+            &port.to_string(),
+            "--",
+            "sh",
+            "-c",
+            &cmd,
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let profile = String::from_utf8_lossy(&output.stdout);
     let allow_count = profile.matches("GET 127.0.0.1").count();
-    assert_eq!(allow_count, 2,
-        "expected exactly 2 unique GET rules (/a and /b), got {allow_count}: {profile}");
+    assert_eq!(
+        allow_count, 2,
+        "expected exactly 2 unique GET rules (/a and /b), got {allow_count}: {profile}"
+    );
 }
 
 /// Returns the first system CA bundle path that exists on this machine,
@@ -1078,7 +1586,9 @@ fn system_ca_bundle() -> Option<&'static str> {
 /// Returns true if host:443 accepts a TCP connection within 3 seconds.
 fn https_reachable(host: &str) -> bool {
     use std::net::ToSocketAddrs;
-    let Ok(mut it) = format!("{host}:443").to_socket_addrs() else { return false };
+    let Ok(mut it) = format!("{host}:443").to_socket_addrs() else {
+        return false;
+    };
     let Some(addr) = it.next() else { return false };
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
 }
@@ -1102,20 +1612,42 @@ fn test_learn_captures_https_request() {
     let output = sandlock_bin()
         .args([
             "learn",
-            "--http-inject-ca", ca_bundle,
-            "--", "curl", "-sf", "https://example.com/",
+            "--http-inject-ca",
+            ca_bundle,
+            "--",
+            "curl",
+            "-sf",
+            "https://example.com/",
         ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(output.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let profile = String::from_utf8_lossy(&output.stdout);
-    assert!(profile.contains("[http]"), "expected [http] section: {profile}");
-    assert!(profile.contains("example.com"), "expected example.com in [http].allow: {profile}");
-    assert!(profile.contains("[config]"), "expected [config] section: {profile}");
-    assert!(profile.contains("http_inject_ca"), "expected http_inject_ca in [config]: {profile}");
-    assert!(profile.contains(ca_bundle), "expected ca bundle path in [config]: {profile}");
+    assert!(
+        profile.contains("[http]"),
+        "expected [http] section: {profile}"
+    );
+    assert!(
+        profile.contains("example.com"),
+        "expected example.com in [http].allow: {profile}"
+    );
+    assert!(
+        profile.contains("[config]"),
+        "expected [config] section: {profile}"
+    );
+    assert!(
+        profile.contains("http_inject_ca"),
+        "expected http_inject_ca in [config]: {profile}"
+    );
+    assert!(
+        profile.contains(ca_bundle),
+        "expected ca bundle path in [config]: {profile}"
+    );
 }
 
 /// --merge keeps a hand-written ${HOME} and does not append its expanded twin.
@@ -1129,27 +1661,49 @@ fn test_learn_merge_preserves_home_variable() {
 
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
-    std::fs::write(&profile_path, "[filesystem]\nread = [\"${HOME}/.config\", \"/usr\"]\n")
-        .expect("seed profile");
+    std::fs::write(
+        &profile_path,
+        "[filesystem]\nread = [\"${HOME}/.config\", \"/usr\"]\n",
+    )
+    .expect("seed profile");
 
     let learn = sandlock_bin()
-        .args(["learn", "--merge", &profile_path, "--", "cat", probe.to_str().unwrap()])
+        .args([
+            "learn",
+            "--merge",
+            &profile_path,
+            "--",
+            "cat",
+            probe.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to run sandlock learn --merge");
     let _ = std::fs::remove_file(&probe);
-    assert!(learn.status.success(),
-        "merge learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "merge learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let merged = std::fs::read_to_string(&profile_path).expect("read merged profile");
     let parsed: sandlock_core::ProfileInput = toml::from_str(&merged).expect("parse merged");
-    let reads: Vec<String> = parsed.filesystem.read.iter()
+    let reads: Vec<String> = parsed
+        .filesystem
+        .read
+        .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
 
-    assert!(reads.iter().any(|r| r == "${HOME}/.config"),
-        "merge dropped the ${{HOME}} spelling: {reads:?}");
-    assert!(!reads.iter().any(|r| r.starts_with(&format!("{home}/.config"))),
-        "merge added a machine-specific duplicate of ${{HOME}}/.config: {reads:?}");
+    assert!(
+        reads.iter().any(|r| r == "${HOME}/.config"),
+        "merge dropped the ${{HOME}} spelling: {reads:?}"
+    );
+    assert!(
+        !reads
+            .iter()
+            .any(|r| r.starts_with(&format!("{home}/.config"))),
+        "merge added a machine-specific duplicate of ${{HOME}}/.config: {reads:?}"
+    );
 }
 
 /// A timeout ends the whole session, background jobs included, and still
@@ -1157,21 +1711,37 @@ fn test_learn_merge_preserves_home_variable() {
 #[test]
 fn test_learn_timeout_ends_the_session() {
     // A sleep length no other process uses, so the job can be found afterwards.
-    let marker = format!("{}.{}", 3000 + std::process::id() % 1000, std::process::id());
+    let marker = format!(
+        "{}.{}",
+        3000 + std::process::id() % 1000,
+        std::process::id()
+    );
     let cmd = format!("cat /etc/hostname; sleep {marker} & sleep 60");
     let started = std::time::Instant::now();
     let output = sandlock_bin()
         .args(["learn", "--timeout", "1", "--", "sh", "-c", &cmd])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(started.elapsed() < std::time::Duration::from_secs(30), "learn ignored its timeout");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "learn ignored its timeout"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    let read_line = stdout
+        .lines()
+        .find(|l| l.starts_with("read = ["))
+        .unwrap_or("");
     assert!(
         read_line.contains("/etc/hostname"),
         "expected a partial profile with /etc/hostname, got: {stdout}; stderr={}",
         String::from_utf8_lossy(&output.stderr),
     );
-    let survivors = Command::new("pgrep").args(["-f", &format!("sleep {marker}")]).output().unwrap();
-    assert!(survivors.stdout.is_empty(), "the background job outlived the timeout");
+    let survivors = Command::new("pgrep")
+        .args(["-f", &format!("sleep {marker}")])
+        .output()
+        .unwrap();
+    assert!(
+        survivors.stdout.is_empty(),
+        "the background job outlived the timeout"
+    );
 }

@@ -153,7 +153,14 @@ impl Transaction {
     /// [`list_preserved`](crate::recovery::list_preserved).
     pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
-        run_txn(self.stages, timeout, Disposition::Commit, self.commit_lock_wait, self.tee_stderr).await
+        run_txn(
+            self.stages,
+            timeout,
+            Disposition::Commit,
+            self.commit_lock_wait,
+            self.tee_stderr,
+        )
+        .await
     }
 
     /// Run every stage and report what the transaction *would* change, then
@@ -167,7 +174,14 @@ impl Transaction {
     /// out first.
     pub async fn dry_run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
-        run_txn(self.stages, timeout, Disposition::DryRun, self.commit_lock_wait, self.tee_stderr).await
+        run_txn(
+            self.stages,
+            timeout,
+            Disposition::DryRun,
+            self.commit_lock_wait,
+            self.tee_stderr,
+        )
+        .await
     }
 }
 
@@ -498,7 +512,9 @@ fn validate_txn_stages(stages: &[Stage]) -> Result<(), TxnError> {
                 "transaction: stage {i} sets chroot, which is unsupported with a shared COW workdir"
             )));
         }
-        if sb.fs_storage != base.fs_storage || sb.max_disk.map(|b| b.0).unwrap_or(0) != base_max_disk {
+        if sb.fs_storage != base.fs_storage
+            || sb.max_disk.map(|b| b.0).unwrap_or(0) != base_max_disk
+        {
             return Err(reject(format!(
                 "transaction: stage {i} sets a different fs_storage/max_disk; all stages share one COW upper, so these must match stage 0"
             )));
@@ -534,18 +550,28 @@ async fn run_txn(
     // All stages share the validated workdir; take COW storage/quota from the
     // first stage (they overlay the same lower).
     let base = &stages[0].sandbox;
-    let workdir = base.workdir.clone().expect("validated: stage 0 has a workdir");
+    let workdir = base
+        .workdir
+        .clone()
+        .expect("validated: stage 0 has a workdir");
     let storage = base.fs_storage.clone();
     let max_disk = base.max_disk.map(|b| b.0).unwrap_or(0);
 
-    let branch = crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk)
-        .map_err(|source| TxnError::Branch { workdir: workdir.clone(), source })?;
+    let branch =
+        crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk)
+            .map_err(|source| TxnError::Branch {
+                workdir: workdir.clone(),
+                source,
+            })?;
     let upper_dir = branch.upper_dir().to_path_buf();
 
     let mut cow_state = crate::seccomp::state::CowState::new();
     cow_state.branch = Some(branch);
     let state = std::sync::Arc::new(tokio::sync::Mutex::new(cow_state));
-    let shared = crate::sandbox::SharedCow { state: std::sync::Arc::clone(&state), upper_dir: upper_dir.clone() };
+    let shared = crate::sandbox::SharedCow {
+        state: std::sync::Arc::clone(&state),
+        upper_dir: upper_dir.clone(),
+    };
 
     // Stage results are accumulated through a handle the coordinator also holds,
     // so a timeout that cancels the driver future does not take the completed
@@ -583,8 +609,9 @@ async fn run_txn(
     // reporting a commit that did not happen.
     if let Some(branch) = taken {
         let want_commit = all_ok && disposition == Disposition::Commit;
-        let handle =
-            tokio::task::spawn_blocking(move || finish_branch(branch, commit_lock_wait, want_commit));
+        let handle = tokio::task::spawn_blocking(move || {
+            finish_branch(branch, commit_lock_wait, want_commit)
+        });
         let finished = match handle.await {
             Ok(f) => f,
             Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
@@ -594,13 +621,25 @@ async fn run_txn(
         match finished.commit {
             Some(Ok(())) => committed = true,
             Some(Err(CommitError::Contended(waited))) => {
-                return Err(TxnError::Conflict { workdir, waited, preserved_upper: upper_dir })
+                return Err(TxnError::Conflict {
+                    workdir,
+                    waited,
+                    preserved_upper: upper_dir,
+                })
             }
             Some(Err(CommitError::Lock(source))) => {
-                return Err(TxnError::CommitLock { workdir, preserved_upper: upper_dir, source })
+                return Err(TxnError::CommitLock {
+                    workdir,
+                    preserved_upper: upper_dir,
+                    source,
+                })
             }
             Some(Err(CommitError::Merge(source))) => {
-                return Err(TxnError::Merge { workdir, preserved_upper: upper_dir, source })
+                return Err(TxnError::Merge {
+                    workdir,
+                    preserved_upper: upper_dir,
+                    source,
+                })
             }
             // The upper was discarded rather than merged: a dry run, or a run
             // that aborted.
@@ -625,7 +664,11 @@ async fn run_txn(
         (false, None) => TxnDisposition::DryRun,
         (false, Some(r)) => TxnDisposition::Aborted(r),
     };
-    Ok(TxnOutcome { disposition, stages, changes })
+    Ok(TxnOutcome {
+        disposition,
+        stages,
+        changes,
+    })
 }
 
 /// What the commit phase did with the shared upper.
@@ -672,12 +715,18 @@ fn finish_branch(
     let changes = branch.changes().unwrap_or_default();
     if !commit {
         let _ = branch.abort();
-        return Finished { changes, commit: None };
+        return Finished {
+            changes,
+            commit: None,
+        };
     }
     // The lock (and preserve-on-contention) lives inside the branch now, so both
     // this coordinator and a plain Sandbox serialize on the one workdir flock.
     let r = branch.commit_with_lock_polling(commit_lock_wait, std::thread::sleep);
-    Finished { changes, commit: Some(r) }
+    Finished {
+        changes,
+        commit: Some(r),
+    }
 }
 
 /// Cap on the bytes captured from one stage's stderr. Head+tail biased around
@@ -724,7 +773,9 @@ async fn drive_txn_stages(
         // execve.
         let (read_fd, write_fd) = crate::sandbox::make_cloexec_pipe()
             .map_err(|e| at(SandboxRuntimeError::Io(e).into()))?;
-        sb.create_with_io(&cmd_refs, None, None, Some(write_fd.as_raw_fd())).await.map_err(at)?;
+        sb.create_with_io(&cmd_refs, None, None, Some(write_fd.as_raw_fd()))
+            .await
+            .map_err(at)?;
         // Close the parent's copy of the write end now (the fork is done), or the
         // read end never sees EOF on child exit and the drain hangs.
         drop(write_fd);
@@ -888,7 +939,10 @@ mod tests {
     /// every validation test below is rejected (or accepted) before `run_txn`
     /// touches a cage.
     fn ok_stage(workdir: &std::path::Path) -> Stage {
-        Stage::new(&Sandbox::builder().workdir(workdir).build().unwrap(), &["true"])
+        Stage::new(
+            &Sandbox::builder().workdir(workdir).build().unwrap(),
+            &["true"],
+        )
     }
 
     /// The rejection message of a stage set, or `None` if it validates.
@@ -918,7 +972,12 @@ mod tests {
     #[test]
     fn per_stage_branch_actions_are_rejected_unless_both_are_the_default() {
         let wd = tempfile::tempdir().unwrap();
-        let actions = [BranchAction::Commit, BranchAction::Abort, BranchAction::Keep, BranchAction::Defer];
+        let actions = [
+            BranchAction::Commit,
+            BranchAction::Abort,
+            BranchAction::Keep,
+            BranchAction::Defer,
+        ];
 
         for on_exit in &actions {
             for on_error in &actions {
@@ -973,11 +1032,19 @@ mod tests {
         let cases: [(&str, Sandbox); 4] = [
             (
                 "has no_supervisor=true",
-                Sandbox::builder().workdir(wd.path()).no_supervisor(true).build().unwrap(),
+                Sandbox::builder()
+                    .workdir(wd.path())
+                    .no_supervisor(true)
+                    .build()
+                    .unwrap(),
             ),
             (
                 "sets chroot",
-                Sandbox::builder().workdir(wd.path()).chroot(chroot.path()).build().unwrap(),
+                Sandbox::builder()
+                    .workdir(wd.path())
+                    .chroot(chroot.path())
+                    .build()
+                    .unwrap(),
             ),
             (
                 "sets on_exit/on_error",
@@ -1024,8 +1091,17 @@ mod tests {
         };
 
         for (entry, err) in [
-            ("run", Transaction::new(stageless()).run(None).await.unwrap_err()),
-            ("dry_run", Transaction::new(stageless()).dry_run(None).await.unwrap_err()),
+            (
+                "run",
+                Transaction::new(stageless()).run(None).await.unwrap_err(),
+            ),
+            (
+                "dry_run",
+                Transaction::new(stageless())
+                    .dry_run(None)
+                    .await
+                    .unwrap_err(),
+            ),
         ] {
             assert!(
                 matches!(&err, TxnError::Invalid(m) if m.contains("stage 0 has no workdir")),
@@ -1047,7 +1123,9 @@ mod tests {
         let wd = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let with = |disk: Option<u64>| {
-            let mut b = Sandbox::builder().workdir(wd.path()).fs_storage(storage.path());
+            let mut b = Sandbox::builder()
+                .workdir(wd.path())
+                .fs_storage(storage.path());
             if let Some(d) = disk {
                 b = b.max_disk(ByteSize(d));
             }
@@ -1059,8 +1137,9 @@ mod tests {
             None,
             "an unset quota and a zero quota both mean unlimited and must be interchangeable"
         );
-        let msg = rejection(&[with(Some(4096)), with(Some(8192))])
-            .expect("two stages asking for different quotas over one shared upper must be rejected");
+        let msg = rejection(&[with(Some(4096)), with(Some(8192))]).expect(
+            "two stages asking for different quotas over one shared upper must be rejected",
+        );
         assert!(
             msg.contains("stage 1 sets a different fs_storage/max_disk"),
             "a differing quota must be reported as the fs_storage/max_disk conflict, got: {msg}"
@@ -1109,15 +1188,14 @@ mod tests {
             );
         }
         for spelling in [alias.clone(), real.join("..").join("wd")] {
-            let msg = rejection(&[named(real.clone()), named(spelling.clone())]).unwrap_or_else(
-                || {
+            let msg =
+                rejection(&[named(real.clone()), named(spelling.clone())]).unwrap_or_else(|| {
                     panic!(
                         "{} is not the same path as {} and must be rejected",
                         spelling.display(),
                         real.display()
                     )
-                },
-            );
+                });
             assert!(
                 msg.contains("stages must share one workdir"),
                 "a differing workdir spelling must be reported as the shared-workdir conflict, \
@@ -1141,8 +1219,11 @@ mod tests {
         let chroot = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
 
-        let chrooted =
-            Sandbox::builder().workdir(wd.path()).chroot(chroot.path()).build().unwrap();
+        let chrooted = Sandbox::builder()
+            .workdir(wd.path())
+            .chroot(chroot.path())
+            .build()
+            .unwrap();
         let msg = rejection(&[
             Stage::new(&chrooted, &["true"]),
             Stage::new(&chrooted, &["true"]),
@@ -1153,8 +1234,11 @@ mod tests {
             "a chroot every stage sets must still be rejected, at the first stage, got: {msg}"
         );
 
-        let unsupervised =
-            Sandbox::builder().workdir(wd.path()).no_supervisor(true).build().unwrap();
+        let unsupervised = Sandbox::builder()
+            .workdir(wd.path())
+            .no_supervisor(true)
+            .build()
+            .unwrap();
         let msg = rejection(&[
             Stage::new(&unsupervised, &["true"]),
             Stage::new(&unsupervised, &["true"]),
@@ -1172,7 +1256,10 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            rejection(&[Stage::new(&shared, &["true"]), Stage::new(&shared, &["true"])]),
+            rejection(&[
+                Stage::new(&shared, &["true"]),
+                Stage::new(&shared, &["true"])
+            ]),
             None,
             "one storage dir and one quota named by every stage is the ordinary configuration \
              and must be accepted"
@@ -1195,10 +1282,22 @@ mod tests {
 
         // Across stages: stage 1 breaks chroot, stage 2 breaks no_supervisor.
         // Stage 1 is reported even though the rule it breaks is checked later.
-        let s1 = Sandbox::builder().workdir(wd.path()).chroot(chroot.path()).build().unwrap();
-        let s2 = Sandbox::builder().workdir(wd.path()).no_supervisor(true).build().unwrap();
-        let msg = rejection(&[ok_stage(wd.path()), Stage::new(&s1, &["true"]), Stage::new(&s2, &["true"])])
-            .expect("two offending stages must still be rejected");
+        let s1 = Sandbox::builder()
+            .workdir(wd.path())
+            .chroot(chroot.path())
+            .build()
+            .unwrap();
+        let s2 = Sandbox::builder()
+            .workdir(wd.path())
+            .no_supervisor(true)
+            .build()
+            .unwrap();
+        let msg = rejection(&[
+            ok_stage(wd.path()),
+            Stage::new(&s1, &["true"]),
+            Stage::new(&s2, &["true"]),
+        ])
+        .expect("two offending stages must still be rejected");
         assert!(
             msg.contains("stage 1 sets chroot"),
             "the lowest offending stage index wins, got: {msg}"
@@ -1354,7 +1453,10 @@ mod tests {
     #[test]
     fn flattening_a_commit_channel_failure_keeps_the_phrase_that_names_the_workdir_state() {
         let tokens = [
-            ("failed to create the shared COW branch over /wd", "nothing ran"),
+            (
+                "failed to create the shared COW branch over /wd",
+                "nothing ran",
+            ),
             ("gave up after", "contended, retry"),
             ("could not take the commit lock on /wd", "lock broken"),
             ("may be partially merged", "torn workdir"),
@@ -1427,8 +1529,14 @@ mod tests {
         );
 
         let rendered: std::collections::HashSet<String> =
-            [stage_failed, AbortReason::TimedOut.to_string()].into_iter().collect();
-        assert_eq!(rendered.len(), 2, "each abort reason must render differently: {rendered:?}");
+            [stage_failed, AbortReason::TimedOut.to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            rendered.len(),
+            2,
+            "each abort reason must render differently: {rendered:?}"
+        );
     }
 
     /// `exit_code()`/`committed()` are pinned for each of the four terminal
@@ -1454,7 +1562,11 @@ mod tests {
                 stages: Vec::new(),
                 changes: Vec::new(),
             };
-            assert_eq!(outcome.committed(), committed, "committed() for {disposition:?}");
+            assert_eq!(
+                outcome.committed(),
+                committed,
+                "committed() for {disposition:?}"
+            );
             assert_eq!(outcome.exit_code(), code, "exit_code() for {disposition:?}");
         }
     }
@@ -1499,7 +1611,11 @@ mod tests {
         let mut big = vec![b'x'; cap * 2];
         big.extend_from_slice(sentinel);
         let (captured, teed) = run(&big, cap);
-        assert!(captured.len() <= cap + 64, "capture must be bounded, got {}", captured.len());
+        assert!(
+            captured.len() <= cap + 64,
+            "capture must be bounded, got {}",
+            captured.len()
+        );
         assert!(
             captured.windows(sentinel.len()).any(|w| w == sentinel),
             "the tail (terminal error line) must survive truncation"
@@ -1558,7 +1674,11 @@ mod tests {
     /// duplication across the seam and no truncation marker.
     #[test]
     fn drain_capped_tee_stitches_the_head_tail_seam_without_duplication() {
-        assert_eq!(STAGE_STDERR_CAP, 64 * 1024, "this test's arithmetic assumes a 64 KiB cap");
+        assert_eq!(
+            STAGE_STDERR_CAP,
+            64 * 1024,
+            "this test's arithmetic assumes a 64 KiB cap"
+        );
         let total = 48 * 1024; // 32K < 48K <= 64K: head and tail overlap by 16 KiB.
         let input: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
         let (captured, _) = drain_bytes(&input, false);
@@ -1567,7 +1687,10 @@ mod tests {
             input.len(),
             "an under-cap capture must reconstruct the input without duplicating the overlap",
         );
-        assert_eq!(captured, input, "the head/tail seam must reconstruct the input byte-for-byte");
+        assert_eq!(
+            captured, input,
+            "the head/tail seam must reconstruct the input byte-for-byte"
+        );
         let marker = b"[stderr truncated]";
         assert!(
             !captured.windows(marker.len()).any(|w| w == marker),
@@ -1599,7 +1722,11 @@ mod tests {
             captured.windows(marker.len()).any(|w| w == marker),
             "total == cap + 1 must carry the truncation marker",
         );
-        assert!(captured.len() <= cap + 32, "an over-cap capture is bounded, got {}", captured.len());
+        assert!(
+            captured.len() <= cap + 32,
+            "an over-cap capture is bounded, got {}",
+            captured.len()
+        );
         assert_eq!(
             *captured.last().unwrap(),
             0xAB,
@@ -1635,17 +1762,27 @@ mod tests {
 
         // (b) no tee: capture byte-identical.
         let (captured, teed) = drain_bytes(b"no tee here\n", false);
-        assert_eq!(captured, b"no tee here\n", "a capture with no tee is verbatim");
+        assert_eq!(
+            captured, b"no tee here\n",
+            "a capture with no tee is verbatim"
+        );
         assert!(teed.is_none(), "no tee was requested");
 
         // (c) empty source: empty capture, no marker, nothing teed.
         let (captured, teed) = drain_bytes(b"", true);
-        assert!(captured.is_empty(), "an empty source yields an empty capture");
+        assert!(
+            captured.is_empty(),
+            "an empty source yields an empty capture"
+        );
         assert!(
             !captured.windows(marker.len()).any(|w| w == marker),
             "an empty capture carries no marker",
         );
-        assert_eq!(teed.unwrap(), Vec::<u8>::new(), "nothing is teed for an empty source");
+        assert_eq!(
+            teed.unwrap(),
+            Vec::<u8>::new(),
+            "nothing is teed for an empty source"
+        );
     }
 
     // ------------------------------------------------------------
@@ -1699,7 +1836,10 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("the unpublished change set must survive on disk, but reading it gave {e}")
             });
-        assert_eq!(survived, "plan\n", "the preserved upper must still hold the stage's bytes");
+        assert_eq!(
+            survived, "plan\n",
+            "the preserved upper must still hold the stage's bytes"
+        );
         let preserved = crate::cow::seccomp::read_preserved(&branch_dir)
             .expect("a preserved upper must be findable through its marker");
         assert_eq!(
@@ -1731,7 +1871,10 @@ mod tests {
             Stage::new(&sb, &["true"]),
         ])
         .expect("two stages are a valid chain");
-        assert!(!chain.is_empty(), "a constructed pipeline always has stages");
+        assert!(
+            !chain.is_empty(),
+            "a constructed pipeline always has stages"
+        );
         assert_eq!(chain.len(), 2, "and reports how many");
     }
 
@@ -1780,8 +1923,9 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let err = acquire_commit_lock_polling(dir.path(), Duration::from_millis(200), std::thread::sleep)
-            .expect_err("a lock that is never released must time out");
+        let err =
+            acquire_commit_lock_polling(dir.path(), Duration::from_millis(200), std::thread::sleep)
+                .expect_err("a lock that is never released must time out");
         let waited = started.elapsed();
         drop(held);
 
@@ -1801,8 +1945,9 @@ mod tests {
     fn commit_lock_reports_a_missing_workdir_as_io() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("no-such-workdir");
-        let err = acquire_commit_lock_polling(&gone, Duration::from_millis(200), std::thread::sleep)
-            .expect_err("a workdir that does not exist cannot be locked");
+        let err =
+            acquire_commit_lock_polling(&gone, Duration::from_millis(200), std::thread::sleep)
+                .expect_err("a workdir that does not exist cannot be locked");
         assert!(
             matches!(err, LockFailure::Io(_)),
             "a missing workdir is an I/O failure, not contention, got: {err:?}"
@@ -1829,7 +1974,10 @@ mod tests {
         }
         .into();
         assert!(
-            matches!(stage, SandlockError::Runtime(SandboxRuntimeError::NotRunning)),
+            matches!(
+                stage,
+                SandlockError::Runtime(SandboxRuntimeError::NotRunning)
+            ),
             "a stage driver failure must flatten to the stage's own error, got: {stage:?}"
         );
 
@@ -1883,14 +2031,23 @@ mod tests {
         };
         let invalid = TxnError::Invalid("bad stages".into());
 
-        let codes = [stage.exit_code(), merge.exit_code(), conflict.exit_code(), invalid.exit_code()];
+        let codes = [
+            stage.exit_code(),
+            merge.exit_code(),
+            conflict.exit_code(),
+            invalid.exit_code(),
+        ];
         let unique: std::collections::HashSet<i32> = codes.iter().copied().collect();
         assert_eq!(
             unique.len(),
             codes.len(),
             "stage/commit/conflict/config must not share an exit code, got {codes:?}"
         );
-        assert_eq!(conflict.exit_code(), 75, "a conflict is EX_TEMPFAIL: retry it");
+        assert_eq!(
+            conflict.exit_code(),
+            75,
+            "a conflict is EX_TEMPFAIL: retry it"
+        );
     }
 
     /// A zero wait must give up on a held lock immediately, without sleeping
@@ -2000,7 +2157,10 @@ mod tests {
             (ExitStatus::Killed, 128 + libc::SIGKILL),
             (ExitStatus::Timeout, 124),
         ] {
-            let outcome = aborted(AbortReason::StageFailed { index: 1, status: status.clone() });
+            let outcome = aborted(AbortReason::StageFailed {
+                index: 1,
+                status: status.clone(),
+            });
             assert_eq!(
                 outcome.exit_code(),
                 want,
@@ -2024,8 +2184,15 @@ mod tests {
             stages: Vec::new(),
             changes: Vec::new(),
         };
-        assert!(committed.committed(), "a committed transaction is committed()");
-        assert_eq!(committed.exit_code(), 0, "a committed transaction succeeded");
+        assert!(
+            committed.committed(),
+            "a committed transaction is committed()"
+        );
+        assert_eq!(
+            committed.exit_code(),
+            0,
+            "a committed transaction succeeded"
+        );
 
         let dry = TxnOutcome {
             disposition: TxnDisposition::DryRun,
@@ -2043,16 +2210,16 @@ mod tests {
     /// A branch over a fresh workdir whose upper already holds `a.txt`, as a
     /// run whose stages all succeeded would have left it. The tempdirs are
     /// returned because dropping them removes the workdir and the storage.
-    fn branch_holding_one_added_file(
-    ) -> (tempfile::TempDir, tempfile::TempDir, crate::cow::seccomp::SeccompCowBranch) {
+    fn branch_holding_one_added_file() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::cow::seccomp::SeccompCowBranch,
+    ) {
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let branch = crate::cow::seccomp::SeccompCowBranch::create(
-            workdir.path(),
-            Some(storage.path()),
-            0,
-        )
-        .unwrap();
+        let branch =
+            crate::cow::seccomp::SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0)
+                .unwrap();
         std::fs::write(branch.upper_dir().join("a.txt"), "plan\n").unwrap();
         (workdir, storage, branch)
     }
@@ -2079,14 +2246,20 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            vec![(crate::result::ChangeKind::Added, std::path::PathBuf::from("a.txt"))],
+            vec![(
+                crate::result::ChangeKind::Added,
+                std::path::PathBuf::from("a.txt")
+            )],
             "the discarded change set must still be reported"
         );
         assert!(
             !workdir.path().join("a.txt").exists(),
             "a discarded upper must not reach the workdir"
         );
-        assert!(!branch_dir.exists(), "a discarded upper must be reclaimed from disk");
+        assert!(
+            !branch_dir.exists(),
+            "a discarded upper must be reclaimed from disk"
+        );
     }
 
     /// The commit merges the upper into the workdir and does not keep the
@@ -2109,7 +2282,10 @@ mod tests {
             "plan\n",
             "the committed change set must be in the workdir, with its bytes"
         );
-        assert!(!branch_dir.exists(), "a merged upper must be reclaimed from disk");
+        assert!(
+            !branch_dir.exists(),
+            "a merged upper must be reclaimed from disk"
+        );
 
         let after = std::fs::File::open(workdir.path()).unwrap();
         assert_eq!(
@@ -2157,7 +2333,10 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("the unpublished change set must survive on disk, but reading it gave {e}")
             });
-        assert_eq!(survived, "plan\n", "the preserved upper must still hold the stage's bytes");
+        assert_eq!(
+            survived, "plan\n",
+            "the preserved upper must still hold the stage's bytes"
+        );
         let preserved = crate::cow::seccomp::read_preserved(&branch_dir)
             .expect("a preserved upper must be findable through its marker");
         assert_eq!(
@@ -2179,12 +2358,9 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         std::fs::create_dir(workdir.path().join("x")).unwrap();
-        let branch = crate::cow::seccomp::SeccompCowBranch::create(
-            workdir.path(),
-            Some(storage.path()),
-            0,
-        )
-        .unwrap();
+        let branch =
+            crate::cow::seccomp::SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0)
+                .unwrap();
         let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
         std::fs::write(branch.upper_dir().join("x"), "built\n").unwrap();
 
@@ -2194,11 +2370,14 @@ mod tests {
             matches!(finished.commit, Some(Err(CommitError::Merge(_)))),
             "a merge that cannot write an entry into the workdir must report a merge failure"
         );
-        let remainder = std::fs::read_to_string(branch_dir.join("upper").join("x"))
-            .unwrap_or_else(|e| {
+        let remainder =
+            std::fs::read_to_string(branch_dir.join("upper").join("x")).unwrap_or_else(|e| {
                 panic!("the change that did not land must survive on disk, but reading it gave {e}")
             });
-        assert_eq!(remainder, "built\n", "the preserved remainder must still hold its bytes");
+        assert_eq!(
+            remainder, "built\n",
+            "the preserved remainder must still hold its bytes"
+        );
         let preserved = crate::cow::seccomp::read_preserved(&branch_dir)
             .expect("a preserved remainder must be findable through its marker");
         assert_eq!(
@@ -2223,11 +2402,18 @@ mod tests {
         let tee = open_stderr_tee().expect("opening /proc/self/fd/2 must succeed under test");
         let nonblock = |fd: std::os::fd::BorrowedFd<'_>| {
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-            assert!(flags >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+            assert!(
+                flags >= 0,
+                "F_GETFL failed: {}",
+                std::io::Error::last_os_error()
+            );
             flags & libc::O_NONBLOCK != 0
         };
         use std::os::fd::AsFd;
-        assert!(nonblock(tee.as_fd()), "the tee description must be non-blocking");
+        assert!(
+            nonblock(tee.as_fd()),
+            "the tee description must be non-blocking"
+        );
         let clone = tee.try_clone().expect("per-stage clone must succeed");
         assert!(
             nonblock(clone.as_fd()),
@@ -2287,12 +2473,22 @@ mod tests {
         let out = drain.join().unwrap();
         drop(tee_r); // never read
 
-        assert!(out.starts_with(b"HEADSTART"), "the head of the capture must be preserved");
-        assert!(out.ends_with(b"TAILEND"), "the tail of the capture must be preserved");
         assert!(
-            out.windows(b"[stderr truncated]".len()).any(|w| w == b"[stderr truncated]"),
+            out.starts_with(b"HEADSTART"),
+            "the head of the capture must be preserved"
+        );
+        assert!(
+            out.ends_with(b"TAILEND"),
+            "the tail of the capture must be preserved"
+        );
+        assert!(
+            out.windows(b"[stderr truncated]".len())
+                .any(|w| w == b"[stderr truncated]"),
             "an over-cap capture must carry the truncation marker",
         );
-        assert!(out.len() < 200 * 1024, "the capture must be bounded by the cap, not the full flood");
+        assert!(
+            out.len() < 200 * 1024,
+            "the capture must be bounded by the cap, not the full flood"
+        );
     }
 }

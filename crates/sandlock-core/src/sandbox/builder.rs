@@ -7,10 +7,16 @@ use super::*;
 /// duplicating the flag declarations.
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct SandboxBuilder {
-    #[cfg_attr(feature = "cli", arg(short = 'r', long = "fs-read", value_name = "PATH"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(short = 'r', long = "fs-read", value_name = "PATH")
+    )]
     pub fs_readable: Vec<PathBuf>,
 
-    #[cfg_attr(feature = "cli", arg(short = 'w', long = "fs-write", value_name = "PATH"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(short = 'w', long = "fs-write", value_name = "PATH")
+    )]
     pub fs_writable: Vec<PathBuf>,
 
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
@@ -18,13 +24,19 @@ pub struct SandboxBuilder {
 
     /// Extra syscall or syscall-group name to deny, in addition to Sandlock's
     /// default blocklist (groups: sysv_ipc). Repeatable.
-    #[cfg_attr(feature = "cli", arg(long = "extra-deny-syscall", value_name = "NAME|GROUP"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(long = "extra-deny-syscall", value_name = "NAME|GROUP")
+    )]
     pub extra_deny_syscalls: Vec<String>,
 
     /// Syscall group name to allow back from the default blocklist
     /// (groups: sysv_ipc). Individual syscalls cannot be re-allowed.
     /// Repeatable.
-    #[cfg_attr(feature = "cli", arg(long = "extra-allow-syscall", value_name = "GROUP"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(long = "extra-allow-syscall", value_name = "GROUP")
+    )]
     pub extra_allow_syscalls: Vec<String>,
 
     /// Outbound endpoint allow rule. Repeatable. Each value is
@@ -218,7 +230,6 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub policy_fn: Option<crate::policy_fn::PolicyFn>,
 
-
     // Sandbox instance name: stored for transfer into the Sandbox at build time.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub name: Option<String>,
@@ -394,7 +405,8 @@ impl SandboxBuilder {
     /// continue to report the degraded protection so the posture is
     /// observable.
     pub fn allow_degraded(mut self, protection: Protection) -> Self {
-        self.protection_policy.set(protection, ProtectionState::Degradable);
+        self.protection_policy
+            .set(protection, ProtectionState::Degradable);
         self
     }
 
@@ -411,7 +423,8 @@ impl SandboxBuilder {
     /// Use [`allow_degraded`](Self::allow_degraded) if you want REFER
     /// enforced only where the kernel supports it.
     pub fn disable(mut self, protection: Protection) -> Self {
-        self.protection_policy.set(protection, ProtectionState::Disabled);
+        self.protection_policy
+            .set(protection, ProtectionState::Disabled);
         self
     }
 
@@ -559,7 +572,10 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn http_log_fn(mut self, f: std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>) -> Self {
+    pub fn http_log_fn(
+        mut self,
+        f: std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>,
+    ) -> Self {
         self.http_log_fn = Some(f);
         self
     }
@@ -717,14 +733,22 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn fs_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
+    pub fn fs_mount(
+        mut self,
+        virtual_path: impl Into<PathBuf>,
+        host_path: impl Into<PathBuf>,
+    ) -> Self {
         self.fs_mount.push((virtual_path.into(), host_path.into()));
         self
     }
 
     /// Add a read-only mount: the host path is visible at `virtual_path` for
     /// reading, but writes through it are denied (e.g. the host procfs mount).
-    pub fn fs_mount_ro(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
+    pub fn fs_mount_ro(
+        mut self,
+        virtual_path: impl Into<PathBuf>,
+        host_path: impl Into<PathBuf>,
+    ) -> Self {
         let virtual_path = virtual_path.into();
         self.fs_mount.push((virtual_path.clone(), host_path.into()));
         self.fs_mount_ro.push(virtual_path);
@@ -753,7 +777,9 @@ impl SandboxBuilder {
         self.workdir.get_or_insert_with(|| image.rootfs.clone());
         for var in &image.config.env {
             if let Some((key, value)) = var.split_once('=') {
-                self.env.entry(key.to_string()).or_insert_with(|| value.to_string());
+                self.env
+                    .entry(key.to_string())
+                    .or_insert_with(|| value.to_string());
             }
         }
         if let Some(dir) = &image.config.working_dir {
@@ -761,7 +787,6 @@ impl SandboxBuilder {
         }
         self
     }
-
 
     pub fn gpu_devices(mut self, devices: Vec<u32>) -> Self {
         self.gpu_devices = Some(devices);
@@ -877,12 +902,21 @@ impl SandboxBuilder {
         }
 
         #[cfg(not(feature = "cow"))]
-        if self.workdir.is_some() || self.fs_storage.is_some() || self.max_disk.is_some()
-            || self.on_exit.as_ref().is_some_and(|a| *a != BranchAction::Commit)
-            || self.on_error.as_ref().is_some_and(|a| *a != BranchAction::Commit)
+        if self.workdir.is_some()
+            || self.fs_storage.is_some()
+            || self.max_disk.is_some()
+            || self
+                .on_exit
+                .as_ref()
+                .is_some_and(|a| *a != BranchAction::Commit)
+            || self
+                .on_error
+                .as_ref()
+                .is_some_and(|a| *a != BranchAction::Commit)
         {
             return Err(SandboxError::FeatureDisabled {
-                what: "copy-on-write filesystem".into(), feature: "cow",
+                what: "copy-on-write filesystem".into(),
+                feature: "cow",
             });
         }
 
@@ -963,7 +997,10 @@ impl SandboxBuilder {
                 ("http_log_fn", self.http_log_fn.is_some()),
             ];
             if let Some((what, _)) = set.iter().find(|(_, on)| *on) {
-                return Err(SandboxError::FeatureDisabled { what: what.to_string(), feature: "http" });
+                return Err(SandboxError::FeatureDisabled {
+                    what: what.to_string(),
+                    feature: "http",
+                });
             }
         }
 
@@ -976,17 +1013,15 @@ impl SandboxBuilder {
 
         // --http-inject-ca / --http-ca-out are meaningless without an HTTP ACL
         // proxy to do MITM, which only spawns when http rules or a log callback exist.
-        let has_http_rules = !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some();
+        let has_http_rules =
+            !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some();
         if !self.http_inject_ca.is_empty() && !has_http_rules {
             return Err(SandboxError::Invalid(
                 "--http-inject-ca requires --http-allow or --http-deny".into(),
             ));
         }
         // --http-ca-out needs an actual CA to export (BYO or generated).
-        if self.http_ca_out.is_some()
-            && self.http_ca.is_none()
-            && self.http_inject_ca.is_empty()
-        {
+        if self.http_ca_out.is_some() && self.http_ca.is_none() && self.http_inject_ca.is_empty() {
             return Err(SandboxError::Invalid(
                 "--http-ca-out requires --http-ca or --http-inject-ca".into(),
             ));
@@ -1135,8 +1170,16 @@ impl SandboxBuilder {
             cwd: self.cwd,
             fs_storage: self.fs_storage,
             max_disk: self.max_disk,
-            on_exit: if discard { BranchAction::Abort } else { self.on_exit.unwrap_or_default() },
-            on_error: if discard { BranchAction::Abort } else { self.on_error.unwrap_or_default() },
+            on_exit: if discard {
+                BranchAction::Abort
+            } else {
+                self.on_exit.unwrap_or_default()
+            },
+            on_error: if discard {
+                BranchAction::Abort
+            } else {
+                self.on_error.unwrap_or_default()
+            },
             fs_mount: self.fs_mount,
             fs_mount_ro: self.fs_mount_ro,
             chroot: self.chroot,
@@ -1273,12 +1316,24 @@ mod tests {
     #[test]
     fn spec_setters_fail_the_build_naming_the_knob() {
         for (b, knob) in [
-            (super::SandboxBuilder::default().max_memory_spec("1.5G"), "max_memory"),
-            (super::SandboxBuilder::default().max_disk_spec("1T"), "max_disk"),
-            (super::SandboxBuilder::default().time_start_spec("1767225600"), "time_start"),
+            (
+                super::SandboxBuilder::default().max_memory_spec("1.5G"),
+                "max_memory",
+            ),
+            (
+                super::SandboxBuilder::default().max_disk_spec("1T"),
+                "max_disk",
+            ),
+            (
+                super::SandboxBuilder::default().time_start_spec("1767225600"),
+                "time_start",
+            ),
         ] {
             let msg = b.build().expect_err("must not build").to_string();
-            assert!(msg.starts_with(&format!("invalid sandbox: {knob}: ")), "got: {msg}");
+            assert!(
+                msg.starts_with(&format!("invalid sandbox: {knob}: ")),
+                "got: {msg}"
+            );
         }
     }
 
@@ -1357,10 +1412,16 @@ mod tests {
         assert_eq!(found(std::slice::from_ref(&secret)), None);
         assert_eq!(found(std::slice::from_ref(&dir)), None);
         // A deny elsewhere does not suppress the warning.
-        assert_eq!(found(&[PathBuf::from("/nonexistent-deny")]), Some(dir.clone()));
+        assert_eq!(
+            found(&[PathBuf::from("/nonexistent-deny")]),
+            Some(dir.clone())
+        );
         // Outside every grant: nothing to report.
         let other = vec![PathBuf::from("/nonexistent-grant")];
-        assert_eq!(exposing_grant(&secret, other.iter(), &[], None).map(|e| e.grant), None);
+        assert_eq!(
+            exposing_grant(&secret, other.iter(), &[], None).map(|e| e.grant),
+            None
+        );
 
         let _ = std::fs::remove_file(&secret);
         let _ = std::fs::remove_dir(&dir);
@@ -1389,15 +1450,17 @@ mod tests {
         // what the warning now advises) suppresses it.
         assert!(exposing_grant(&secret, grants.iter(), &[virtual_path.clone()], chroot).is_none());
         // Denying a covering in-jail directory also suppresses.
-        assert!(
-            exposing_grant(&secret, grants.iter(), &[PathBuf::from("/etc")], chroot).is_none()
-        );
+        assert!(exposing_grant(&secret, grants.iter(), &[PathBuf::from("/etc")], chroot).is_none());
         // The old advice (the host path) does NOT suppress: at runtime the child
         // opens /etc/token, so a /jail/etc/token deny never fires. This is the
         // regression the fix closes.
-        assert!(
-            exposing_grant(&secret, grants.iter(), std::slice::from_ref(&secret), chroot).is_some()
-        );
+        assert!(exposing_grant(
+            &secret,
+            grants.iter(),
+            std::slice::from_ref(&secret),
+            chroot
+        )
+        .is_some());
 
         let _ = std::fs::remove_file(&secret);
         let _ = std::fs::remove_dir(&etc);

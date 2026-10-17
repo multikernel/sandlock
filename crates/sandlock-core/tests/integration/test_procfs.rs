@@ -1,5 +1,5 @@
 use sandlock_core::sandbox::ByteSize;
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 
 /// Test that num_cpus virtualizes both /proc/cpuinfo and sched_getaffinity.
 #[tokio::test]
@@ -16,16 +16,30 @@ async fn test_num_cpus_virtualization() {
         .unwrap();
 
     // Verify /proc/cpuinfo shows 2 processors.
-    let result = policy.clone().run(&["sh", "-c", "grep -c ^processor /proc/cpuinfo"]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["sh", "-c", "grep -c ^processor /proc/cpuinfo"])
+        .await
+        .unwrap();
     assert!(result.success(), "grep /proc/cpuinfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "2", "/proc/cpuinfo should show 2 processors, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        "2",
+        "/proc/cpuinfo should show 2 processors, got: {:?}",
+        stdout.trim()
+    );
 
     // Verify nproc (sched_getaffinity) also reports 2.
     let result = policy.clone().run(&["nproc"]).await.unwrap();
     assert!(result.success(), "nproc should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "2", "nproc should report 2 CPUs, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        "2",
+        "nproc should report 2 CPUs, got: {:?}",
+        stdout.trim()
+    );
 }
 
 /// Test that max_memory virtualizes /proc/meminfo.
@@ -49,7 +63,8 @@ async fn test_meminfo_virtualization() {
     // 256 MiB = 262144 kB
     assert!(
         stdout.contains("MemTotal:       262144 kB"),
-        "Expected MemTotal of 262144 kB (256 MiB), got: {:?}", stdout
+        "Expected MemTotal of 262144 kB (256 MiB), got: {:?}",
+        stdout
     );
 }
 
@@ -112,7 +127,11 @@ async fn test_sensitive_proc_resists_bypasses() {
         "print('|'.join(results))\n",
     );
 
-    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     for label in ["dirfd", "dotdot", "curdir", "slash2"] {
         let needle = format!("{label}:DENIED");
@@ -156,7 +175,11 @@ async fn test_proc_virt_resists_bypasses() {
         "print(results)\n",
     );
 
-    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     for label in ["dirfd", "dotdot", "curdir", "slash2"] {
         let needle = format!("'{label}': 2");
@@ -187,10 +210,7 @@ async fn test_no_proc_virt_still_works() {
 /// Test that /proc/net/tcp is filtered with port_remap — only shows sandbox's own ports.
 #[tokio::test]
 async fn test_proc_net_tcp_filtered() {
-    let out = std::env::temp_dir().join(format!(
-        "sandlock-test-procnet-{}",
-        std::process::id()
-    ));
+    let out = std::env::temp_dir().join(format!("sandlock-test-procnet-{}", std::process::id()));
 
     // Pick a free port to avoid conflicts with parallel tests.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -198,37 +218,54 @@ async fn test_proc_net_tcp_filtered() {
     drop(listener);
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
         .net_allow_bind_port(port)
         .port_remap(true)
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "s.bind(('127.0.0.1', {port}))\n",
-        "s.listen(1)\n",
-        "with open('/proc/net/tcp') as f:\n",
-        "  lines = f.readlines()\n",
-        "s.close()\n",
-        "ports = []\n",
-        "for line in lines[1:]:\n",
-        "  parts = line.split()\n",
-        "  if len(parts) >= 2:\n",
-        "    port_hex = parts[1].split(':')[1]\n",
-        "    ports.append(int(port_hex, 16))\n",
-        "open('{out}', 'w').write(str(len(ports)))\n",
-    ), port = port, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "s.bind(('127.0.0.1', {port}))\n",
+            "s.listen(1)\n",
+            "with open('/proc/net/tcp') as f:\n",
+            "  lines = f.readlines()\n",
+            "s.close()\n",
+            "ports = []\n",
+            "for line in lines[1:]:\n",
+            "  parts = line.split()\n",
+            "  if len(parts) >= 2:\n",
+            "    port_hex = parts[1].split(':')[1]\n",
+            "    ports.append(int(port_hex, 16))\n",
+            "open('{out}', 'w').write(str(len(ports)))\n",
+        ),
+        port = port,
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let count: usize = content.parse().unwrap_or(999);
-    assert!(count <= 2, "/proc/net/tcp should be filtered, got {} entries", count);
+    assert!(
+        count <= 2,
+        "/proc/net/tcp should be filtered, got {} entries",
+        count
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -237,8 +274,13 @@ async fn test_proc_net_tcp_filtered() {
 #[tokio::test]
 async fn test_proc_mounts_virtualized() {
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .build()
         .unwrap();
 
@@ -246,108 +288,171 @@ async fn test_proc_mounts_virtualized() {
     assert!(result.success(), "cat /proc/mounts should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // Should contain the root entry (no chroot → rootfs)
-    assert!(stdout.contains("rootfs / rootfs rw 0 0"), "Should show root mount, got: {}", stdout);
+    assert!(
+        stdout.contains("rootfs / rootfs rw 0 0"),
+        "Should show root mount, got: {}",
+        stdout
+    );
     // Should NOT leak host mounts (e.g. /home, /boot, real device paths)
-    assert!(!stdout.contains("/home"), "Should not leak host /home mount");
-    assert!(!stdout.contains("nvme"), "Should not leak host disk device names");
+    assert!(
+        !stdout.contains("/home"),
+        "Should not leak host /home mount"
+    );
+    assert!(
+        !stdout.contains("nvme"),
+        "Should not leak host disk device names"
+    );
 }
 
 /// Test that /proc/self/mountinfo is virtualized.
 #[tokio::test]
 async fn test_proc_self_mountinfo_virtualized() {
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["cat", "/proc/self/mountinfo"]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["cat", "/proc/self/mountinfo"])
+        .await
+        .unwrap();
     assert!(result.success(), "cat /proc/self/mountinfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // Should contain root entry in mountinfo format
-    assert!(stdout.contains("/ / rw - rootfs rootfs rw"), "Should show root in mountinfo, got: {}", stdout);
-    assert!(!stdout.contains("/home"), "Should not leak host /home mount in mountinfo");
+    assert!(
+        stdout.contains("/ / rw - rootfs rootfs rw"),
+        "Should show root in mountinfo, got: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("/home"),
+        "Should not leak host /home mount in mountinfo"
+    );
 }
 
 /// Test that /proc/{ppid}/ is blocked (non-sandbox PID isolation).
 #[tokio::test]
 async fn test_proc_parent_pid_blocked() {
-    let out = std::env::temp_dir().join(format!(
-        "sandlock-test-procparent-{}",
-        std::process::id()
-    ));
+    let out = std::env::temp_dir().join(format!("sandlock-test-procparent-{}", std::process::id()));
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import os\n",
-        "ppid = os.getppid()\n",
-        "results = []\n",
-        "for entry in ['cmdline', 'status']:\n",
-        "  try:\n",
-        "    open(f'/proc/{{ppid}}/{{entry}}').read()\n",
-        "    results.append('LEAKED')\n",
-        "  except PermissionError:\n",
-        "    results.append('BLOCKED')\n",
-        "  except Exception as e:\n",
-        "    results.append(f'ERR:{{e}}')\n",
-        "# Verify /proc/self still works\n",
-        "try:\n",
-        "  open('/proc/self/status').read()\n",
-        "  results.append('SELF_OK')\n",
-        "except Exception:\n",
-        "  results.append('SELF_FAIL')\n",
-        "open('{out}', 'w').write(','.join(results))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import os\n",
+            "ppid = os.getppid()\n",
+            "results = []\n",
+            "for entry in ['cmdline', 'status']:\n",
+            "  try:\n",
+            "    open(f'/proc/{{ppid}}/{{entry}}').read()\n",
+            "    results.append('LEAKED')\n",
+            "  except PermissionError:\n",
+            "    results.append('BLOCKED')\n",
+            "  except Exception as e:\n",
+            "    results.append(f'ERR:{{e}}')\n",
+            "# Verify /proc/self still works\n",
+            "try:\n",
+            "  open('/proc/self/status').read()\n",
+            "  results.append('SELF_OK')\n",
+            "except Exception:\n",
+            "  results.append('SELF_FAIL')\n",
+            "open('{out}', 'w').write(','.join(results))\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "script should exit 0");
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     let parts: Vec<&str> = content.split(',').collect();
-    assert_eq!(parts.get(0), Some(&"BLOCKED"), "/proc/ppid/cmdline should be blocked, got: {}", content);
-    assert_eq!(parts.get(1), Some(&"BLOCKED"), "/proc/ppid/status should be blocked, got: {}", content);
-    assert_eq!(parts.get(2), Some(&"SELF_OK"), "/proc/self/status should still work, got: {}", content);
+    assert_eq!(
+        parts.get(0),
+        Some(&"BLOCKED"),
+        "/proc/ppid/cmdline should be blocked, got: {}",
+        content
+    );
+    assert_eq!(
+        parts.get(1),
+        Some(&"BLOCKED"),
+        "/proc/ppid/status should be blocked, got: {}",
+        content
+    );
+    assert_eq!(
+        parts.get(2),
+        Some(&"SELF_OK"),
+        "/proc/self/status should still work, got: {}",
+        content
+    );
 }
 
 /// Test that /proc/net/tcp hides host ports when sandbox has no bindings.
 #[tokio::test]
 async fn test_proc_net_tcp_hides_host_ports() {
-    let out = std::env::temp_dir().join(format!(
-        "sandlock-test-procnet-hide-{}",
-        std::process::id()
-    ));
+    let out =
+        std::env::temp_dir().join(format!("sandlock-test-procnet-hide-{}", std::process::id()));
 
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
         .port_remap(true)
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "with open('/proc/net/tcp') as f:\n",
-        "  lines = f.readlines()\n",
-        "ports = []\n",
-        "for line in lines[1:]:\n",
-        "  parts = line.split()\n",
-        "  if len(parts) >= 2:\n",
-        "    port_hex = parts[1].split(':')[1]\n",
-        "    ports.append(int(port_hex, 16))\n",
-        "open('{out}', 'w').write(str(len(ports)))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "with open('/proc/net/tcp') as f:\n",
+            "  lines = f.readlines()\n",
+            "ports = []\n",
+            "for line in lines[1:]:\n",
+            "  parts = line.split()\n",
+            "  if len(parts) >= 2:\n",
+            "    port_hex = parts[1].split(':')[1]\n",
+            "    ports.append(int(port_hex, 16))\n",
+            "open('{out}', 'w').write(str(len(ports)))\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let count: usize = content.parse().unwrap_or(999);
-    assert_eq!(count, 0, "/proc/net/tcp should show 0 entries when sandbox has no bindings");
+    assert_eq!(
+        count, 0,
+        "/proc/net/tcp should show 0 entries when sandbox has no bindings"
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -374,7 +479,10 @@ async fn test_proc_net_virt_covers_per_task_spellings() {
     let result = policy.clone().run(&["sh", "-c", script]).await.unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     let counts: Vec<&str> = stdout.lines().collect();
-    assert_eq!(counts, ["1"; 5], "only loopback should be listed under every spelling");
+    assert_eq!(
+        counts, ["1"; 5],
+        "only loopback should be listed under every spelling"
+    );
 }
 
 fn proc_grant() -> sandlock_core::SandboxBuilder {
@@ -407,7 +515,10 @@ async fn test_proc_mounts_virt_covers_per_task_spellings() {
     );
     let (_, out) = run_sh(&policy, script).await;
     let counts: Vec<&str> = out.lines().map(str::trim).collect();
-    assert_eq!(counts, ["1"; 11], "only the sandbox root should be listed under every spelling");
+    assert_eq!(
+        counts, ["1"; 11],
+        "only the sandbox root should be listed under every spelling"
+    );
 }
 
 /// mountstats is generated from the same --fs-mount list as /proc/mounts.
@@ -426,10 +537,21 @@ async fn test_proc_mountstats_lists_fs_mounts() {
     let (mounts, mountstats) = out.split_once("\n\n").expect("both files should print");
 
     let mounted_on: Vec<&str> = mounts.lines().filter_map(|l| l.split(' ').nth(1)).collect();
-    let stats_on: Vec<&str> = mountstats.lines().filter_map(|l| l.split(' ').nth(4)).collect();
+    let stats_on: Vec<&str> = mountstats
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .collect();
     assert_eq!(mounted_on, ["/", "/work", "/data"], "got: {}", mounts);
-    assert_eq!(stats_on, mounted_on, "mountstats should name the mounts /proc/mounts does, got: {}", mountstats);
-    assert!(!out.contains(host.to_str().unwrap()), "host paths should not appear, got: {}", out);
+    assert_eq!(
+        stats_on, mounted_on,
+        "mountstats should name the mounts /proc/mounts does, got: {}",
+        mountstats
+    );
+    assert!(
+        !out.contains(host.to_str().unwrap()),
+        "host paths should not appear, got: {}",
+        out
+    );
 }
 
 /// /proc/self/cgroup names the host's slice and scope, so every spelling
@@ -444,7 +566,10 @@ async fn test_proc_cgroup_is_virtualized() {
     );
     let (_, out) = run_sh(&policy, script).await;
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines, ["0::/"; 4], "the host's cgroup path should not be visible");
+    assert_eq!(
+        lines, ["0::/"; 4],
+        "the host's cgroup path should not be visible"
+    );
 }
 
 fn no_proc_grant() -> sandlock_core::SandboxBuilder {
@@ -476,20 +601,35 @@ async fn test_listed_proc_self_entry_covers_every_process() {
     // `; true` keeps sh from exec'ing grep in place of forking it.
     let (ok, out) = run_sh(&policy, "grep -c . /proc/self/maps; true").await;
     assert!(ok);
-    assert!(out.parse::<u32>().unwrap_or(0) > 0, "a forked child should read its maps, got: {:?}", out);
+    assert!(
+        out.parse::<u32>().unwrap_or(0) > 0,
+        "a forked child should read its maps, got: {:?}",
+        out
+    );
 }
 
 #[tokio::test]
 async fn test_unlisted_proc_self_entry_is_refused() {
     let policy = no_proc_grant().fs_read("/proc/self/maps").build().unwrap();
-    let script = format!("{}; {}", openable("/proc/self/status"), openable("/proc/self/maps"));
+    let script = format!(
+        "{}; {}",
+        openable("/proc/self/status"),
+        openable("/proc/self/maps")
+    );
     let (_, out) = run_sh(&policy, &script).await;
     assert_eq!(out, "0\n1", "only the listed entry should be served");
 
     let policy = no_proc_grant().build().unwrap();
-    let script = format!("{}; {}", openable("/proc/self/maps"), openable("/etc/passwd"));
+    let script = format!(
+        "{}; {}",
+        openable("/proc/self/maps"),
+        openable("/etc/passwd")
+    );
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n1", "nothing under /proc/self should be served without a grant");
+    assert_eq!(
+        out, "0\n1",
+        "nothing under /proc/self should be served without a grant"
+    );
 }
 
 /// The fd a child gets has to describe the child, not the first process.
@@ -500,7 +640,11 @@ async fn test_own_proc_self_resolves_to_the_caller() {
     let (ok, out) = run_sh(&policy, &format!("sh -c '{}'; true", inner)).await;
     assert!(ok);
     let (from_stat, own_pid) = out.split_once(' ').unwrap_or_default();
-    assert!(!own_pid.is_empty() && from_stat == own_pid, "stat should name the caller, got: {:?}", out);
+    assert!(
+        !own_pid.is_empty() && from_stat == own_pid,
+        "stat should name the caller, got: {:?}",
+        out
+    );
 }
 
 #[tokio::test]
@@ -540,7 +684,10 @@ async fn test_proc_self_write_grant_honors_denies() {
         .unwrap();
     let script = "for p in /proc/self/comm /proc/$$/comm; do if ( : > $p ); then exit 1; fi; done";
     let (ok, _) = run_sh(&policy, script).await;
-    assert!(ok, "a write grant must not override a deny under either spelling");
+    assert!(
+        ok,
+        "a write grant must not override a deny under either spelling"
+    );
 }
 
 #[tokio::test]
@@ -576,8 +723,17 @@ else:
 "#;
     for grant in ["/proc/self/task", "/proc/thread-self/comm"] {
         let policy = no_proc_grant().fs_write(grant).build().unwrap();
-        let result = policy.clone().run(&["python3", "-c", script, &libc::SYS_openat.to_string()]).await.unwrap();
-        assert!(result.success(), "grant {}: {}", grant, String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+        let result = policy
+            .clone()
+            .run(&["python3", "-c", script, &libc::SYS_openat.to_string()])
+            .await
+            .unwrap();
+        assert!(
+            result.success(),
+            "grant {}: {}",
+            grant,
+            String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+        );
     }
 }
 
@@ -605,8 +761,16 @@ t.start()
 t.join()
 assert not allowed, allowed
 "#;
-    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
-    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
 }
 
 #[tokio::test]
@@ -617,7 +781,10 @@ async fn test_proc_self_write_grant_survives_no_supervisor() {
         .build()
         .unwrap();
     let (ok, _) = run_sh(&policy, "echo parent > /proc/self/comm").await;
-    assert!(ok, "the first process should retain its native Landlock write grant");
+    assert!(
+        ok,
+        "the first process should retain its native Landlock write grant"
+    );
 }
 
 #[tokio::test]
@@ -645,8 +812,16 @@ for flags, mode, resolve, expected in [
         assert fd >= 0, ctypes.get_errno()
         os.close(fd)
 "#;
-    let result = policy.clone().run(&["python3", "-c", script, &libc::SYS_openat2.to_string()]).await.unwrap();
-    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script, &libc::SYS_openat2.to_string()])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
 }
 
 #[tokio::test]
@@ -680,19 +855,32 @@ with open('/proc/self/uid_map') as f:
     assert f.read().strip()
 print('ok')
 "#;
-    let result = policy.clone().run(&["python3", "-c", script, aliases.path().to_str().unwrap()]).await.unwrap();
-    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script, aliases.path().to_str().unwrap()])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
     assert_eq!(result.stdout.as_deref(), Some(b"ok\n".as_slice()));
 }
 
 /// `root`, `cwd` and `fd/N` lead out of /proc; their targets stay under the policy.
 #[tokio::test]
 async fn test_own_proc_self_does_not_follow_links_out() {
-    let secret = std::env::temp_dir().join(format!("sandlock-test-procself-{}", std::process::id()));
+    let secret =
+        std::env::temp_dir().join(format!("sandlock-test-procself-{}", std::process::id()));
     std::fs::write(&secret, "secret").unwrap();
 
     let policy = no_proc_grant().fs_read("/proc/self").build().unwrap();
-    let script = format!("{}; {}", openable(&format!("/proc/self/root{}", secret.display())), openable("/proc/self/status"));
+    let script = format!(
+        "{}; {}",
+        openable(&format!("/proc/self/root{}", secret.display())),
+        openable("/proc/self/status")
+    );
     let (_, out) = run_sh(&policy, &script).await;
     let _ = std::fs::remove_file(&secret);
     assert_eq!(out, "0\n1", "only the link's target should be refused");
@@ -702,9 +890,16 @@ async fn test_own_proc_self_does_not_follow_links_out() {
 #[tokio::test]
 async fn test_own_proc_self_excludes_net() {
     let policy = no_proc_grant().fs_read("/proc/self").build().unwrap();
-    let script = format!("{}; {}", openable("/proc/self/net/arp"), openable("/proc/self/status"));
+    let script = format!(
+        "{}; {}",
+        openable("/proc/self/net/arp"),
+        openable("/proc/self/status")
+    );
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n1", "a /proc/self grant should not reach the net subtree");
+    assert_eq!(
+        out, "0\n1",
+        "a /proc/self grant should not reach the net subtree"
+    );
 }
 
 /// The supervisor may hold capabilities the task lacks, and these files show
@@ -712,20 +907,40 @@ async fn test_own_proc_self_excludes_net() {
 #[tokio::test]
 async fn test_own_proc_self_excludes_opener_privileged_files() {
     let policy = no_proc_grant().fs_read("/proc/self").build().unwrap();
-    let script = [openable("/proc/self/pagemap"), openable("/proc/self/stack"), openable("/proc/self/status")].join("; ");
+    let script = [
+        openable("/proc/self/pagemap"),
+        openable("/proc/self/stack"),
+        openable("/proc/self/status"),
+    ]
+    .join("; ");
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n0\n1", "pagemap and stack should not be opened on the task's behalf");
+    assert_eq!(
+        out, "0\n0\n1",
+        "pagemap and stack should not be opened on the task's behalf"
+    );
 }
 
 #[tokio::test]
 async fn test_own_proc_self_honors_fs_deny() {
-    let policy = no_proc_grant().fs_read("/proc/self").fs_deny("/proc/self/maps").build().unwrap();
+    let policy = no_proc_grant()
+        .fs_read("/proc/self")
+        .fs_deny("/proc/self/maps")
+        .build()
+        .unwrap();
     // The shell reads the numeric path itself: for a forked reader, $$ would
     // name its parent rather than its own directory.
     let own_numeric = "if read -r line < /proc/$$/maps; then echo 1; else echo 0; fi";
-    let script = [&openable("/proc/self/maps"), own_numeric, &openable("/proc/self/status")].join("; ");
+    let script = [
+        &openable("/proc/self/maps"),
+        own_numeric,
+        &openable("/proc/self/status"),
+    ]
+    .join("; ");
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n0\n1", "the deny should hold under both spellings and nothing else");
+    assert_eq!(
+        out, "0\n0\n1",
+        "the deny should hold under both spellings and nothing else"
+    );
 }
 
 /// /proc/self names the thread group, /proc/thread-self the calling thread,
@@ -744,16 +959,28 @@ async fn test_own_proc_self_from_a_thread() {
         "t.start()\n",
         "t.join()\n",
     );
-    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "True True", "stderr: {}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    assert_eq!(
+        stdout.trim(),
+        "True True",
+        "stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
 }
 
 /// With a deny active, opens the handlers pass on are resolved by the
 /// supervisor, where /proc/self would be the supervisor's own directory.
 #[tokio::test]
 async fn test_own_proc_self_is_the_caller_with_a_deny_active() {
-    let policy = proc_grant().fs_deny("/tmp/sandlock-test-no-such-file").build().unwrap();
+    let policy = proc_grant()
+        .fs_deny("/tmp/sandlock-test-no-such-file")
+        .build()
+        .unwrap();
     let (_, out) = run_sh(&policy, "cat /proc/self/comm; true").await;
     assert_eq!(out, "cat");
 }
@@ -762,7 +989,11 @@ async fn test_own_proc_self_is_the_caller_with_a_deny_active() {
 /// remain a Landlock rule, first pid only as that is.
 #[tokio::test]
 async fn test_listed_proc_self_entry_survives_no_supervisor() {
-    let policy = no_proc_grant().fs_read("/proc/self/maps").no_supervisor(true).build().unwrap();
+    let policy = no_proc_grant()
+        .fs_read("/proc/self/maps")
+        .no_supervisor(true)
+        .build()
+        .unwrap();
     let (ok, out) = run_sh(&policy, "exec grep -c . /proc/self/maps").await;
     assert!(ok);
     assert!(out.parse::<u32>().unwrap_or(0) > 0, "got: {:?}", out);
@@ -773,7 +1004,8 @@ struct LinkDir(std::path::PathBuf);
 
 impl LinkDir {
     fn new(tag: &str, links: &[(&str, &str)]) -> Self {
-        let dir = std::env::temp_dir().join(format!("sandlock-test-{}-{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("sandlock-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (name, target) in links {
@@ -797,7 +1029,14 @@ impl Drop for LinkDir {
 /// the /proc handlers refuse: they only judged the string the child wrote.
 #[tokio::test]
 async fn test_deny_active_hides_proc_targets_behind_links() {
-    let links = LinkDir::new("proclinks", &[("init", "/proc/1"), ("syms", "/proc/kallsyms"), ("passwd", "/etc/passwd")]);
+    let links = LinkDir::new(
+        "proclinks",
+        &[
+            ("init", "/proc/1"),
+            ("syms", "/proc/kallsyms"),
+            ("passwd", "/etc/passwd"),
+        ],
+    );
     let policy = proc_grant()
         .fs_read(&links.0)
         .fs_deny("/tmp/sandlock-test-no-such-file")
@@ -812,7 +1051,10 @@ async fn test_deny_active_hides_proc_targets_behind_links() {
     ]
     .join("; ");
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n0\n1", "a link should not reach a /proc entry the direct path is refused");
+    assert_eq!(
+        out, "0\n0\n1",
+        "a link should not reach a /proc entry the direct path is refused"
+    );
 }
 
 /// Issue #246: the supervisor walks the path when a deny is active, so
@@ -820,7 +1062,10 @@ async fn test_deny_active_hides_proc_targets_behind_links() {
 /// /proc/self/fd/0, would be refused as a magic link.
 #[tokio::test]
 async fn test_deny_active_reads_proc_self_as_the_caller() {
-    let links = LinkDir::new("selflinks", &[("self", "/proc/self"), ("thread", "/proc/thread-self")]);
+    let links = LinkDir::new(
+        "selflinks",
+        &[("self", "/proc/self"), ("thread", "/proc/thread-self")],
+    );
     let policy = proc_grant()
         .fs_read("/dev")
         .fs_read(&links.0)
@@ -845,7 +1090,11 @@ async fn test_deny_active_reads_proc_self_as_the_caller() {
         links.path("self"),
         links.path("thread"),
     );
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(
         stdout.trim(),
@@ -867,26 +1116,39 @@ async fn test_deny_active_matches_proc_self_under_its_pid() {
         .build()
         .unwrap();
     let (_, out) = run_sh(&policy, &format!("cat {}/comm; true", links.path("self"))).await;
-    assert_eq!(out, "cat", "a /proc/self grant should cover the entry behind a link");
+    assert_eq!(
+        out, "cat",
+        "a /proc/self grant should cover the entry behind a link"
+    );
 
     let policy = proc_grant().fs_deny("/proc/self/maps").build().unwrap();
     let own_numeric = "if read -r line < /proc/$$/maps; then echo 1; else echo 0; fi";
     let script = [own_numeric, &openable("/proc/self/status")].join("; ");
     let (_, out) = run_sh(&policy, &script).await;
-    assert_eq!(out, "0\n1", "the deny should hold under the numeric spelling with /proc readable");
+    assert_eq!(
+        out, "0\n1",
+        "the deny should hold under the numeric spelling with /proc readable"
+    );
 }
 
 /// A link to a magic link stays refused: only the kernel could say whose fd
 /// it means.
 #[tokio::test]
 async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
-    let links = LinkDir::new("nslinks", &[("self", "/proc/self"), ("chain", "/proc/self/fd/0")]);
+    let links = LinkDir::new(
+        "nslinks",
+        &[("self", "/proc/self"), ("chain", "/proc/self/fd/0")],
+    );
     let policy = proc_grant()
         .fs_read(&links.0)
         .fs_deny("/tmp/sandlock-test-no-such-file")
         .build()
         .unwrap();
-    let script = [openable(&links.path("chain")), openable(&format!("{}/status", links.path("self")))].join("; ");
+    let script = [
+        openable(&links.path("chain")),
+        openable(&format!("{}/status", links.path("self"))),
+    ]
+    .join("; ");
     let (_, out) = run_sh(&policy, &script).await;
     assert_eq!(out, "0\n1");
 }
@@ -895,7 +1157,14 @@ async fn test_deny_active_refuses_what_it_cannot_resolve_for_the_caller() {
 /// took the kernel to entries the handlers refuse by name.
 #[tokio::test]
 async fn test_links_into_proc_cannot_reach_hidden_entries() {
-    let links = LinkDir::new("proc236", &[("init", "/proc/1"), ("syms", "/proc/kallsyms"), ("self", "/proc/self")]);
+    let links = LinkDir::new(
+        "proc236",
+        &[
+            ("init", "/proc/1"),
+            ("syms", "/proc/kallsyms"),
+            ("self", "/proc/self"),
+        ],
+    );
     let policy = proc_grant().fs_read(&links.0).build().unwrap();
     let script = [
         openable(&format!("{}/cmdline", links.path("init"))),
@@ -932,7 +1201,12 @@ async fn test_proc_grant_serves_virtual_net_entries() {
 async fn test_links_to_virtual_files_show_the_virtual_content() {
     let links = LinkDir::new(
         "virtlinks",
-        &[("cpu", "/proc/cpuinfo"), ("self", "/proc/self"), ("host", "/etc/hostname"), ("hosts", "/etc/hosts")],
+        &[
+            ("cpu", "/proc/cpuinfo"),
+            ("self", "/proc/self"),
+            ("host", "/etc/hostname"),
+            ("hosts", "/etc/hosts"),
+        ],
     );
     let script = format!(
         concat!(
@@ -951,7 +1225,11 @@ async fn test_links_to_virtual_files_show_the_virtual_content() {
             policy = policy.fs_deny("/tmp/sandlock-test-no-such-file");
         }
         let (_, out) = run_sh(&policy.build().unwrap(), &script).await;
-        assert_eq!(out, "2\n1\nsame-hostname\nsame-hosts", "deny active: {}", deny_active);
+        assert_eq!(
+            out, "2\n1\nsame-hostname\nsame-hosts",
+            "deny active: {}",
+            deny_active
+        );
     }
 }
 
@@ -960,7 +1238,9 @@ async fn test_links_to_virtual_files_show_the_virtual_content() {
 /// reach it. The rest of /etc stays readable and listable.
 #[tokio::test]
 async fn test_virtualized_etc_file_has_no_grant_on_its_real_inode() {
-    let Ok(real) = std::fs::read_to_string("/etc/hostname") else { return };
+    let Ok(real) = std::fs::read_to_string("/etc/hostname") else {
+        return;
+    };
     let policy = proc_grant().build().unwrap();
     let script = concat!(
         "cd /etc && printf 'cwd:%s\n' \"$(cat /proc/self/cwd/hostname 2>&1)\"; ",
@@ -969,7 +1249,11 @@ async fn test_virtualized_etc_file_has_no_grant_on_its_real_inode() {
     let (_, out) = run_sh(&policy, script).await;
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 3, "{:?}", out);
-    assert!(!lines[0].contains(real.trim()), "the real hostname leaked through a magic link: {:?}", out);
+    assert!(
+        !lines[0].contains(real.trim()),
+        "the real hostname leaked through a magic link: {:?}",
+        out
+    );
     assert_eq!(lines[1], "/etc/passwd");
     assert!(lines[2].starts_with("sandbox-"), "{:?}", out);
 }
@@ -989,7 +1273,10 @@ async fn test_root_and_cwd_magic_links_name_the_virtual_file() {
         "&& echo stat-through-links"
     );
     let (_, out) = run_sh(&policy, script).await;
-    assert_eq!(out, "root-hostname\n1\ncwd-hostname\npid-root-hosts\nstat-through-links");
+    assert_eq!(
+        out,
+        "root-hostname\n1\ncwd-hostname\npid-root-hosts\nstat-through-links"
+    );
 }
 
 #[tokio::test]
@@ -1035,7 +1322,11 @@ for base in ['/proc/net', '/proc/self/net', '/proc/thread-self/net',
 print('OK')
 "#;
     let result = policy.run(&["python3", "-c", script]).await.unwrap();
-    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
 }
 
 #[tokio::test]
@@ -1048,7 +1339,8 @@ async fn test_proc_net_owned_sockets_without_remap() {
         assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
         st.st_ino
     }
-    let script = format!(r#"
+    let script = format!(
+        r#"
 import os, socket
 sockets = []
 for kind, table, foreign in [(socket.SOCK_STREAM, 'tcp', {tcp}), (socket.SOCK_DGRAM, 'udp', {udp})]:
@@ -1062,10 +1354,21 @@ for kind, table, foreign in [(socket.SOCK_STREAM, 'tcp', {tcp}), (socket.SOCK_DG
     assert own in found, (table, own, rows)
     assert foreign not in found, (table, foreign, rows)
 print('OK')
-"#, tcp = inode(host_tcp.as_raw_fd()), udp = inode(host_udp.as_raw_fd()));
-    let mut policy = proc_grant().net_allow("udp://127.0.0.1:53").net_allow_bind("0").build().unwrap();
+"#,
+        tcp = inode(host_tcp.as_raw_fd()),
+        udp = inode(host_udp.as_raw_fd())
+    );
+    let mut policy = proc_grant()
+        .net_allow("udp://127.0.0.1:53")
+        .net_allow_bind("0")
+        .build()
+        .unwrap();
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
 }
 
 #[tokio::test]
@@ -1122,7 +1425,11 @@ os.close(fd)
 print('OK')
 "#;
     let result = policy.run(&["python3", "-c", script]).await.unwrap();
-    assert!(result.success(), "{}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
 }
 
 #[tokio::test]
@@ -1156,21 +1463,36 @@ for base in ['/proc/net', '/network', '/mapped']:
     os.close(fd)
 print('OK')
 "#;
-    let mut builder = proc_grant().chroot(root.path()).fs_read("/network")
+    let mut builder = proc_grant()
+        .chroot(root.path())
+        .fs_read("/network")
         .fs_mount("/mapped", "/proc/net")
-        .fs_mount("/proc", "/proc").fs_mount("/p", "/proc");
+        .fs_mount("/proc", "/proc")
+        .fs_mount("/p", "/proc");
     for path in ["/usr", "/lib", "/lib64", "/bin", "/etc"] {
-        if std::path::Path::new(path).exists() { builder = builder.fs_mount(path, path); }
+        if std::path::Path::new(path).exists() {
+            builder = builder.fs_mount(path, path);
+        }
     }
-    let result = builder.build().unwrap().run(&["/usr/bin/python3", "-c", script]).await.unwrap();
+    let result = builder
+        .build()
+        .unwrap()
+        .run(&["/usr/bin/python3", "-c", script])
+        .await
+        .unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
 
     let work = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink("/proc/self/net", work.path().join("network")).unwrap();
-    let script = script.replace("'/network'", &format!("{:?}", work.path().join("network")))
+    let script = script
+        .replace("'/network'", &format!("{:?}", work.path().join("network")))
         .replace(", '/mapped'", "");
-    let mut policy = proc_grant().workdir(work.path()).fs_write(work.path())
-        .on_exit(sandlock_core::sandbox::BranchAction::Abort).build().unwrap();
+    let mut policy = proc_grant()
+        .workdir(work.path())
+        .fs_write(work.path())
+        .on_exit(sandlock_core::sandbox::BranchAction::Abort)
+        .build()
+        .unwrap();
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
 }
@@ -1214,7 +1536,8 @@ async fn test_proc_net_openat2_respects_resolution_root() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("proc/net")).unwrap();
     std::fs::write(root.path().join("proc/net/tcp"), b"ordinary file").unwrap();
-    let script = format!(r#"
+    let script = format!(
+        r#"
 import os, ctypes, errno
 libc = ctypes.CDLL(None, use_errno=True)
 class How(ctypes.Structure):
@@ -1234,7 +1557,9 @@ assert fd >= 0, ctypes.get_errno()
 assert b'lo:' in os.read(fd, 4096)
 os.close(fd)
 print('OK')
-"#, root = root.path().to_str().unwrap());
+"#,
+        root = root.path().to_str().unwrap()
+    );
     let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
@@ -1278,7 +1603,10 @@ check('/proc/self/fd/%d' % dirfd, root)
 print('OK')
 "#;
     let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
-    let result = policy.run(&["python3", "-c", script, root.path().to_str().unwrap()]).await.unwrap();
+    let result = policy
+        .run(&["python3", "-c", script, root.path().to_str().unwrap()])
+        .await
+        .unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
 }
 
@@ -1302,6 +1630,9 @@ for name, target in [('file', 'file'), ('dir', 'dir'), ('link', 'file'),
 print('OK')
 "#;
     let mut policy = proc_grant().fs_read(root.path()).build().unwrap();
-    let result = policy.run(&["python3", "-c", script, root.path().to_str().unwrap()]).await.unwrap();
+    let result = policy
+        .run(&["python3", "-c", script, root.path().to_str().unwrap()])
+        .await
+        .unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
 }

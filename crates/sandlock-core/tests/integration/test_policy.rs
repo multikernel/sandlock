@@ -1,4 +1,4 @@
-use sandlock_core::sandbox::{ByteSize, BranchAction, Sandbox};
+use sandlock_core::sandbox::{BranchAction, ByteSize, Sandbox};
 
 #[test]
 fn test_default_policy() {
@@ -40,7 +40,9 @@ fn test_builder_network() {
     // A scheme-less spec expands to a TCP rule plus a UDP rule.
     assert_eq!(policy.net_allow.len(), 2);
     for rule in &policy.net_allow {
-        assert!(matches!(&rule.target, sandlock_core::sandbox::NetTarget::Host(h) if h == "api.example.com"));
+        assert!(
+            matches!(&rule.target, sandlock_core::sandbox::NetTarget::Host(h) if h == "api.example.com")
+        );
         assert_eq!(rule.ports, vec![443, 80]);
     }
 }
@@ -53,7 +55,10 @@ fn test_net_allow_parse_grammar() {
     assert!(NetRule::parse_allow(":8080").is_ok());
     assert!(NetRule::parse_allow("*:8080").is_ok());
     assert!(NetRule::parse_allow("foo.com").is_ok()); // no port -> all ports
-    assert!(NetRule::parse_allow("foo.com").unwrap().iter().all(|r| r.all_ports));
+    assert!(NetRule::parse_allow("foo.com")
+        .unwrap()
+        .iter()
+        .all(|r| r.all_ports));
     assert!(NetRule::parse_allow("*").is_ok()); // any host, all ports
     assert!(NetRule::parse_allow("").is_err()); // empty rule
     assert!(NetRule::parse_allow("foo.com:abc").is_err()); // bad port
@@ -129,7 +134,10 @@ fn test_bytesize_that_does_not_fit_is_an_error_not_a_ceiling_of_zero() {
 
     // The largest value each suffix can carry still parses, so the check
     // refuses what does not fit rather than trimming the usable range.
-    assert_eq!(ByteSize::parse("17179869183G").unwrap().0, 17179869183 * 1024 * 1024 * 1024);
+    assert_eq!(
+        ByteSize::parse("17179869183G").unwrap().0,
+        17179869183 * 1024 * 1024 * 1024
+    );
     assert_eq!(ByteSize::parse("18446744073709551615").unwrap().0, u64::MAX);
 }
 
@@ -172,10 +180,7 @@ fn test_icmp_default_denied() {
 #[test]
 #[cfg(feature = "cow")]
 fn test_branch_action_defaults() {
-    let p = Sandbox::builder()
-        .workdir("/tmp")
-        .build()
-        .unwrap();
+    let p = Sandbox::builder().workdir("/tmp").build().unwrap();
     assert_eq!(p.on_exit, BranchAction::Commit);
     assert_eq!(p.on_error, BranchAction::Commit);
 }
@@ -204,9 +209,6 @@ fn test_cpu_cores_default_none() {
 
 #[test]
 fn test_cpu_cores_builder() {
-    let p = Sandbox::builder()
-        .cpu_cores(vec![0, 2, 3])
-        .build()
-        .unwrap();
+    let p = Sandbox::builder().cpu_cores(vec![0, 2, 3]).build().unwrap();
     assert_eq!(p.cpu_cores, Some(vec![0, 2, 3]));
 }

@@ -1,2 +1,2 @@
-pub mod resolve;
 pub mod dispatch;
+pub mod resolve;

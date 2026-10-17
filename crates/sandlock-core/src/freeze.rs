@@ -70,7 +70,9 @@ fn read_task_state(tid: i32) -> Option<char> {
     let line = status.lines().find(|l| l.starts_with("State:"))?;
     // Format is "State:\t<char> (<word>)" — find the first non-space
     // character after the colon.
-    line.split_whitespace().nth(1).and_then(|s| s.chars().next())
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.chars().next())
 }
 
 /// What `seize_and_interrupt` did with one tid.
@@ -118,9 +120,7 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
         return Ok(SeizeOutcome::NotNeeded);
     }
 
-    let ret = unsafe {
-        libc::ptrace(libc::PTRACE_SEIZE, tid, 0, 0)
-    };
+    let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE, tid, 0, 0) };
     if ret < 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
@@ -131,9 +131,7 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
     // PTRACE_SEIZE succeeded; from here, any error path must DETACH
     // before returning so we don't leave the task traced-but-running.
 
-    let ret = unsafe {
-        libc::ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0)
-    };
+    let ret = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0) };
     if ret < 0 {
         let err = io::Error::last_os_error();
         let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
@@ -278,7 +276,10 @@ pub(crate) fn freeze_sandbox_for_execve(
     processes: &crate::seccomp::state::ProcessIndex,
     caller_tid: i32,
 ) -> Result<SandboxFreeze, FreezeError> {
-    let no_pending = |error| FreezeError { error, pending_tids: Vec::new() };
+    let no_pending = |error| FreezeError {
+        error,
+        pending_tids: Vec::new(),
+    };
     let caller_tgid = read_tgid_of_tid(caller_tid).map_err(no_pending)?;
     let mut tgids: HashSet<i32> = processes.tgids_snapshot();
     tgids.insert(caller_tgid);
@@ -320,7 +321,10 @@ pub(crate) fn freeze_sandbox_for_execve(
                     for t in &peer_tids {
                         detach(*t);
                     }
-                    return Err(FreezeError { error: e, pending_tids });
+                    return Err(FreezeError {
+                        error: e,
+                        pending_tids,
+                    });
                 }
             }
         }
@@ -480,8 +484,8 @@ mod tests {
             .register(peer_pid)
             .expect("register peer in ProcessIndex");
 
-        let outcome = freeze_sandbox_for_execve(&processes, caller_tid)
-            .expect("freeze_sandbox_for_execve");
+        let outcome =
+            freeze_sandbox_for_execve(&processes, caller_tid).expect("freeze_sandbox_for_execve");
 
         // Peer's TID is its own TGID (single-threaded sleep), and it's
         // a different TGID from the execve caller, so it should be in peer_tids.
@@ -564,7 +568,10 @@ mod tests {
             if tids.len() >= 2 {
                 break tids;
             }
-            assert!(std::time::Instant::now() < deadline, "peer never became multi-threaded");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer never became multi-threaded"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
 

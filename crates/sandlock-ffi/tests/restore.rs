@@ -16,8 +16,8 @@ use sandlock_ffi::{
     sandlock_checkpoint_free, sandlock_handle_checkpoint, sandlock_handle_free,
     sandlock_handle_kill, sandlock_handle_pid, sandlock_handle_restore_skipped_fd,
     sandlock_handle_restore_skipped_len, sandlock_handle_restore_skipped_path,
-    sandlock_result_free, sandlock_restore_interactive,
-    sandlock_sandbox_build, sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_fs_write,
+    sandlock_restore_interactive, sandlock_result_free, sandlock_sandbox_build,
+    sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_fs_write,
     sandlock_sandbox_builder_new, sandlock_sandbox_free, sandlock_sandbox_t, sandlock_start,
     sandlock_string_free,
 };
@@ -62,9 +62,13 @@ void _start(void){{
 
 fn build_policy(tmp: &str) -> *mut sandlock_sandbox_t {
     let mut b = sandlock_sandbox_builder_new();
-    for p in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", tmp] {
+    for p in [
+        "/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev", tmp,
+    ] {
         // `/lib64` is absent on RISC-V glibc / musl; fs_read is mandatory.
-        if p == "/lib64" && !std::path::Path::new("/lib64").exists() { continue; }
+        if p == "/lib64" && !std::path::Path::new("/lib64").exists() {
+            continue;
+        }
         let c = CString::new(p).unwrap();
         b = unsafe { sandlock_sandbox_builder_fs_read(b, c.as_ptr()) };
     }
@@ -78,9 +82,8 @@ fn build_policy(tmp: &str) -> *mut sandlock_sandbox_t {
 }
 
 fn which(prog: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|d| d.join(prog).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(prog).is_file()))
 }
 
 fn read_counter(path: &str) -> Option<u64> {
@@ -221,8 +224,14 @@ fn restore_interactive_null_inputs_return_null() {
 
 #[test]
 fn restore_skipped_accessors_tolerate_null_handle() {
-    assert_eq!(unsafe { sandlock_handle_restore_skipped_len(ptr::null()) }, 0);
-    assert_eq!(unsafe { sandlock_handle_restore_skipped_fd(ptr::null(), 0) }, -1);
+    assert_eq!(
+        unsafe { sandlock_handle_restore_skipped_len(ptr::null()) },
+        0
+    );
+    assert_eq!(
+        unsafe { sandlock_handle_restore_skipped_fd(ptr::null(), 0) },
+        -1
+    );
     assert!(unsafe { sandlock_handle_restore_skipped_path(ptr::null(), 0) }.is_null());
 }
 

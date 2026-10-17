@@ -12,9 +12,8 @@ use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    classify_dest_shape, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr,
-    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr,
-    MaterializedMsg, MAX_SEND_BUF,
+    classify_dest_shape, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path,
+    parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr, MaterializedMsg, MAX_SEND_BUF,
 };
 use super::send_engine::{prepare_batch, prepare_send, wants_blocking};
 use super::unix::{
@@ -156,12 +155,7 @@ pub(super) async fn sendto_on_behalf(
                 // address and a sockaddr_nl both carry no pathname but are not the
                 // same case (see DestShape).
                 let dest = classify_dest_shape(&addr_bytes);
-                match classify_send_path(
-                    false,
-                    None,
-                    socket_is_unix(dup_fd.as_raw_fd()),
-                    &dest,
-                ) {
+                match classify_send_path(false, None, socket_is_unix(dup_fd.as_raw_fd()), &dest) {
                     SendPath::NamedUnixOnBehalf => match &dest {
                         // Resolve the target in the CHILD's root view and send to
                         // the pinned inode: the supervisor performs the send, so
@@ -319,11 +313,7 @@ enum PrescanResult {
 /// applies. Used by both `sendmsg_on_behalf` (one msghdr) and
 /// `sendmmsg_on_behalf` (one per `mmsghdr` entry, before doing any
 /// sends — Continue is a whole-syscall decision).
-fn prescan_msghdr(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    msghdr_ptr: u64,
-) -> PrescanResult {
+fn prescan_msghdr(notif: &SeccompNotif, notif_fd: RawFd, msghdr_ptr: u64) -> PrescanResult {
     let hdr = match ChildMsghdr::read(notif, notif_fd, msghdr_ptr) {
         Ok(h) => h,
         Err(e) => return PrescanResult::Errno(e),
@@ -331,7 +321,13 @@ fn prescan_msghdr(
     if hdr.connected() {
         return PrescanResult::ContinueWholeCall;
     }
-    let addr_bytes = match super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
+    let addr_bytes = match super::read_sockaddr(
+        notif_fd,
+        notif.id,
+        notif.pid,
+        hdr.name_ptr,
+        hdr.namelen as usize,
+    ) {
         Ok(b) => b,
         Err(e) => return PrescanResult::Errno(e),
     };
@@ -381,7 +377,13 @@ async fn send_msghdr_on_behalf(
     let addr_bytes = if connected {
         Vec::new()
     } else {
-        match super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
+        match super::read_sockaddr(
+            notif_fd,
+            notif.id,
+            notif.pid,
+            hdr.name_ptr,
+            hdr.namelen as usize,
+        ) {
             Ok(b) => b,
             Err(e) => return Err(e),
         }
@@ -524,7 +526,10 @@ pub(super) async fn sendmmsg_on_behalf(
             };
             let socket = match dup_fd.try_clone() {
                 Ok(socket) => socket,
-                Err(_) => { first_errno = Some(libc::EIO); break; }
+                Err(_) => {
+                    first_errno = Some(libc::EIO);
+                    break;
+                }
             };
             batch_bytes += m.data.len();
             if batch_bytes > super::materialize::MAX_SEND_BUF {
@@ -533,8 +538,14 @@ pub(super) async fn sendmmsg_on_behalf(
             }
             entries.push((socket, m, mmsg_msglen_addr(entry_ptr)));
         }
-        return prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
-            first_errno.unwrap_or(ECONNREFUSED));
+        return prepare_batch(
+            entries,
+            flags,
+            notif_fd,
+            notif.id,
+            notif.pid,
+            first_errno.unwrap_or(ECONNREFUSED),
+        );
     }
 
     // No destination policy: the connected fast path is safe (nothing to
@@ -568,16 +579,22 @@ pub(super) async fn sendmmsg_on_behalf(
         let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
         // Every entry is OnBehalf (IP, non-connected) per the prescan above, so
         // the resolved protocol is always required and present here.
-        let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, Some(protocol), entry_ptr).await {
-            Ok(m) => m,
-            Err(errno) => {
-                first_errno = Some(errno);
-                break;
-            }
-        };
+        let m =
+            match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, Some(protocol), entry_ptr)
+                .await
+            {
+                Ok(m) => m,
+                Err(errno) => {
+                    first_errno = Some(errno);
+                    break;
+                }
+            };
         let socket = match dup_fd.try_clone() {
             Ok(socket) => socket,
-            Err(_) => { first_errno = Some(libc::EIO); break; }
+            Err(_) => {
+                first_errno = Some(libc::EIO);
+                break;
+            }
         };
         batch_bytes += m.data.len();
         if batch_bytes > super::materialize::MAX_SEND_BUF {
@@ -587,6 +604,12 @@ pub(super) async fn sendmmsg_on_behalf(
         entries.push((socket, m, mmsg_msglen_addr(entry_ptr)));
     }
 
-    prepare_batch(entries, flags, notif_fd, notif.id, notif.pid,
-        first_errno.unwrap_or(ECONNREFUSED))
+    prepare_batch(
+        entries,
+        flags,
+        notif_fd,
+        notif.id,
+        notif.pid,
+        first_errno.unwrap_or(ECONNREFUSED),
+    )
 }

@@ -1,37 +1,51 @@
+use sandlock_core::Sandbox;
 use std::path::PathBuf;
-use sandlock_core::{Sandbox};
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64")
-        .fs_read("/bin").fs_read("/etc").fs_read("/proc")
-        .fs_read("/dev").fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
 }
 
 fn temp_out(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "sandlock-test-nlvirt-{}-{}", name, std::process::id()
+        "sandlock-test-nlvirt-{}-{}",
+        name,
+        std::process::id()
     ))
 }
 
 #[tokio::test]
 async fn if_nameindex_returns_only_lo() {
     let out = temp_out("if-nameindex");
-    let script = format!(concat!(
-        "import socket\n",
-        "ifs = socket.if_nameindex()\n",
-        "open('{out}', 'w').write(repr(ifs))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "ifs = socket.if_nameindex()\n",
+            "open('{out}', 'w').write(repr(ifs))\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert!(
         contents.contains("'lo'") && !contents.contains("'eth"),
-        "expected only lo, got: {}", contents
+        "expected only lo, got: {}",
+        contents
     );
     assert!(result.success());
 }
@@ -39,23 +53,29 @@ async fn if_nameindex_returns_only_lo() {
 #[tokio::test]
 async fn loopback_bind_succeeds() {
     let out = temp_out("loopback-bind");
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', 0))\n",
-        "  result = 'OK'\n",
-        "except OSError as e:\n",
-        "  result = f'FAIL:{{e}}'\n",
-        "finally:\n",
-        "  s.close()\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', 0))\n",
+            "  result = 'OK'\n",
+            "except OSError as e:\n",
+            "  result = f'FAIL:{{e}}'\n",
+            "finally:\n",
+            "  s.close()\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     // port 0 in Landlock net rules means "allow any port"
     let policy = base_policy().net_allow_bind_port(0).build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -80,17 +100,23 @@ async fn loopback_bind_succeeds() {
 #[tokio::test]
 async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
     let out = temp_out("getaddrinfo");
-    let script = format!(concat!(
-        "import socket\n",
-        "fams = sorted({{i[0].name for i in socket.getaddrinfo(",
-        "None, 443, type=socket.SOCK_STREAM, ",
-        "flags=socket.AI_PASSIVE | socket.AI_ADDRCONFIG)}})\n",
-        "open('{out}', 'w').write(','.join(fams))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "fams = sorted({{i[0].name for i in socket.getaddrinfo(",
+            "None, 443, type=socket.SOCK_STREAM, ",
+            "flags=socket.AI_PASSIVE | socket.AI_ADDRCONFIG)}})\n",
+            "open('{out}', 'w').write(','.join(fams))\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -107,19 +133,30 @@ async fn getaddrinfo_ai_addrconfig_returns_v4_and_v6() {
 #[tokio::test]
 async fn proc_net_dev_shows_only_lo() {
     let out = temp_out("proc-net-dev");
-    let script = format!(concat!(
-        "lines = open('/proc/net/dev').readlines()\n",
-        "ifaces = [l.split(':')[0].strip() for l in lines[2:]]\n",
-        "open('{out}', 'w').write(','.join(ifaces))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "lines = open('/proc/net/dev').readlines()\n",
+            "ifaces = [l.split(':')[0].strip() for l in lines[2:]]\n",
+            "open('{out}', 'w').write(','.join(ifaces))\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert_eq!(contents.trim(), "lo", "expected only lo in /proc/net/dev, got: {}", contents);
+    assert_eq!(
+        contents.trim(),
+        "lo",
+        "expected only lo in /proc/net/dev, got: {}",
+        contents
+    );
     assert!(result.success());
 }
 
@@ -127,19 +164,30 @@ async fn proc_net_dev_shows_only_lo() {
 #[tokio::test]
 async fn proc_net_if_inet6_shows_only_lo() {
     let out = temp_out("proc-net-if-inet6");
-    let script = format!(concat!(
-        "lines = open('/proc/net/if_inet6').readlines()\n",
-        "ifaces = [l.split()[-1] for l in lines if l.strip()]\n",
-        "open('{out}', 'w').write(','.join(ifaces))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "lines = open('/proc/net/if_inet6').readlines()\n",
+            "ifaces = [l.split()[-1] for l in lines if l.strip()]\n",
+            "open('{out}', 'w').write(','.join(ifaces))\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert_eq!(contents.trim(), "lo", "expected only lo in /proc/net/if_inet6, got: {}", contents);
+    assert_eq!(
+        contents.trim(),
+        "lo",
+        "expected only lo in /proc/net/if_inet6, got: {}",
+        contents
+    );
     assert!(result.success());
 }
 
@@ -147,32 +195,39 @@ async fn proc_net_if_inet6_shows_only_lo() {
 #[tokio::test]
 async fn ioctl_siocgifconf_blocked() {
     let out = temp_out("ioctl-siocgifconf");
-    let script = format!(concat!(
-        "import fcntl, struct, socket, errno\n",
-        "SIOCGIFCONF = 0x8912\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "buf = b'\\x00' * 4096\n",
-        "ifc = struct.pack('iP', len(buf), 0)\n",
-        "try:\n",
-        "  fcntl.ioctl(s.fileno(), SIOCGIFCONF, ifc)\n",
-        "  result = 'ALLOWED'\n",
-        "except OSError as e:\n",
-        "  result = f'BLOCKED:{{e.errno}}'\n",
-        "finally:\n",
-        "  s.close()\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import fcntl, struct, socket, errno\n",
+            "SIOCGIFCONF = 0x8912\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "buf = b'\\x00' * 4096\n",
+            "ifc = struct.pack('iP', len(buf), 0)\n",
+            "try:\n",
+            "  fcntl.ioctl(s.fileno(), SIOCGIFCONF, ifc)\n",
+            "  result = 'ALLOWED'\n",
+            "except OSError as e:\n",
+            "  result = f'BLOCKED:{{e.errno}}'\n",
+            "finally:\n",
+            "  s.close()\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert_eq!(
         contents.trim(),
         &format!("BLOCKED:{}", libc::EPERM),
-        "SIOCGIFCONF should be blocked with EPERM, got: {}", contents
+        "SIOCGIFCONF should be blocked with EPERM, got: {}",
+        contents
     );
     assert!(result.success());
 }
@@ -181,31 +236,38 @@ async fn ioctl_siocgifconf_blocked() {
 #[tokio::test]
 async fn ioctl_siocethtool_blocked() {
     let out = temp_out("ioctl-siocethtool");
-    let script = format!(concat!(
-        "import fcntl, struct, socket\n",
-        "SIOCETHTOOL = 0x8946\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "ifr = struct.pack('16sP', b'eth0', 0)\n",
-        "try:\n",
-        "  fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifr)\n",
-        "  result = 'ALLOWED'\n",
-        "except OSError as e:\n",
-        "  result = f'BLOCKED:{{e.errno}}'\n",
-        "finally:\n",
-        "  s.close()\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import fcntl, struct, socket\n",
+            "SIOCETHTOOL = 0x8946\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "ifr = struct.pack('16sP', b'eth0', 0)\n",
+            "try:\n",
+            "  fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifr)\n",
+            "  result = 'ALLOWED'\n",
+            "except OSError as e:\n",
+            "  result = f'BLOCKED:{{e.errno}}'\n",
+            "finally:\n",
+            "  s.close()\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert_eq!(
         contents.trim(),
         &format!("BLOCKED:{}", libc::EPERM),
-        "SIOCETHTOOL should be blocked with EPERM, got: {}", contents
+        "SIOCETHTOOL should be blocked with EPERM, got: {}",
+        contents
     );
     assert!(result.success());
 }
@@ -214,25 +276,32 @@ async fn ioctl_siocethtool_blocked() {
 #[tokio::test]
 async fn sys_class_net_blocked() {
     let out = temp_out("sys-class-net");
-    let script = format!(concat!(
-        "import os\n",
-        "try:\n",
-        "  entries = os.listdir('/sys/class/net')\n",
-        "  result = 'ALLOWED:' + ','.join(entries)\n",
-        "except OSError as e:\n",
-        "  result = f'BLOCKED:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import os\n",
+            "try:\n",
+            "  entries = os.listdir('/sys/class/net')\n",
+            "  result = 'ALLOWED:' + ','.join(entries)\n",
+            "except OSError as e:\n",
+            "  result = f'BLOCKED:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert!(
         contents.starts_with("BLOCKED:"),
-        "/sys/class/net should be blocked, got: {}", contents
+        "/sys/class/net should be blocked, got: {}",
+        contents
     );
     assert!(result.success());
 }
@@ -244,21 +313,27 @@ async fn sys_class_net_blocked() {
 #[tokio::test]
 async fn af_alg_socket_blocked() {
     let out = temp_out("af-alg-blocked");
-    let script = format!(concat!(
-        "import socket, errno\n",
-        "AF_ALG = 38\n",
-        "try:\n",
-        "  s = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except OSError as e:\n",
-        "  result = f'BLOCKED:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, errno\n",
+            "AF_ALG = 38\n",
+            "try:\n",
+            "  s = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except OSError as e:\n",
+            "  result = f'BLOCKED:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -279,28 +354,35 @@ async fn af_alg_socket_blocked() {
 async fn niche_socket_families_blocked() {
     // (name, AF_* numeric value)
     let families: &[(&str, i32)] = &[
-        ("AF_PACKET", 17),    // PACKET_MMAP has had UAFs
-        ("AF_VSOCK", 40),     // recurring use-after-frees
+        ("AF_PACKET", 17), // PACKET_MMAP has had UAFs
+        ("AF_VSOCK", 40),  // recurring use-after-frees
         ("AF_XDP", 44),
         ("AF_TIPC", 30),
     ];
 
     for (name, af) in families {
         let out = temp_out(&format!("family-blocked-{}", name));
-        let script = format!(concat!(
-            "import socket\n",
-            "try:\n",
-            "  s = socket.socket({af}, socket.SOCK_RAW, 0)\n",
-            "  s.close()\n",
-            "  result = 'ALLOWED'\n",
-            "except OSError as e:\n",
-            "  result = f'BLOCKED:{{e.errno}}'\n",
-            "open('{out}', 'w').write(result)\n",
-        ), af = af, out = out.display());
+        let script = format!(
+            concat!(
+                "import socket\n",
+                "try:\n",
+                "  s = socket.socket({af}, socket.SOCK_RAW, 0)\n",
+                "  s.close()\n",
+                "  result = 'ALLOWED'\n",
+                "except OSError as e:\n",
+                "  result = f'BLOCKED:{{e.errno}}'\n",
+                "open('{out}', 'w').write(result)\n",
+            ),
+            af = af,
+            out = out.display()
+        );
 
         let policy = base_policy().build().unwrap();
-        let result = policy.clone().run_interactive(&["python3", "-c", &script])
-            .await.unwrap();
+        let result = policy
+            .clone()
+            .run_interactive(&["python3", "-c", &script])
+            .await
+            .unwrap();
 
         let contents = std::fs::read_to_string(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
@@ -315,27 +397,34 @@ async fn niche_socket_families_blocked() {
 #[tokio::test]
 async fn non_route_netlink_still_blocked() {
     let out = temp_out("netlink-audit-blocked");
-    let script = format!(concat!(
-        "import socket\n",
-        "NETLINK_AUDIT = 9\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_AUDIT)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except OSError as e:\n",
-        "  result = f'BLOCKED:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "NETLINK_AUDIT = 9\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_AUDIT)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except OSError as e:\n",
+            "  result = f'BLOCKED:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert!(
         contents.starts_with("BLOCKED:"),
-        "NETLINK_AUDIT should be blocked, got: {}", contents
+        "NETLINK_AUDIT should be blocked, got: {}",
+        contents
     );
     assert!(result.success());
 }
@@ -354,16 +443,18 @@ async fn etc_hosts_virtualized_with_loopback_base() {
     );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     // With no `net_allow` rules the sandbox sees exactly the loopback
     // base; any deviation means the on-disk `/etc/hosts` leaked through.
     assert_eq!(
-        contents,
-        "127.0.0.1 localhost\n::1 localhost\n",
+        contents, "127.0.0.1 localhost\n::1 localhost\n",
         "virtual /etc/hosts content mismatch"
     );
     assert!(result.success());
@@ -378,24 +469,30 @@ async fn etc_hosts_virtualization_resists_path_bypasses() {
     // Python's builtin `open` goes through libc → `openat(AT_FDCWD, ...)`,
     // so we cover the dirfd-relative case via os.open + os.openat-style
     // file-descriptor reuse, and the non-canonical case directly.
-    let script = format!(concat!(
-        "import os\n",
-        "results = {{}}\n",
-        // 1. Dirfd-relative: open /etc, then read 'hosts' relative to it.
-        "etcfd = os.open('/etc', os.O_DIRECTORY | os.O_RDONLY)\n",
-        "fd = os.open('hosts', os.O_RDONLY, dir_fd=etcfd)\n",
-        "results['dirfd_relative'] = os.read(fd, 4096).decode()\n",
-        "os.close(fd); os.close(etcfd)\n",
-        // 2. Non-canonical absolute via redundant components.
-        "results['dotdot']  = open('/etc/../etc/hosts').read()\n",
-        "results['slash2']  = open('//etc/hosts').read()\n",
-        "results['curdir']  = open('/etc/./hosts').read()\n",
-        "open('{out}', 'w').write(repr(results))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import os\n",
+            "results = {{}}\n",
+            // 1. Dirfd-relative: open /etc, then read 'hosts' relative to it.
+            "etcfd = os.open('/etc', os.O_DIRECTORY | os.O_RDONLY)\n",
+            "fd = os.open('hosts', os.O_RDONLY, dir_fd=etcfd)\n",
+            "results['dirfd_relative'] = os.read(fd, 4096).decode()\n",
+            "os.close(fd); os.close(etcfd)\n",
+            // 2. Non-canonical absolute via redundant components.
+            "results['dotdot']  = open('/etc/../etc/hosts').read()\n",
+            "results['slash2']  = open('//etc/hosts').read()\n",
+            "results['curdir']  = open('/etc/./hosts').read()\n",
+            "open('{out}', 'w').write(repr(results))\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -433,20 +530,26 @@ async fn etc_hosts_virtualization_resists_path_bypasses() {
 async fn if_nameindex_works_under_destination_policy() {
     let out = temp_out("if-nameindex-netpolicy");
     let _ = std::fs::remove_file(&out);
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  result = repr(socket.if_nameindex())\n",
-        "except OSError as e:\n",
-        "  result = 'ERRNO:%d' % e.errno\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  result = repr(socket.if_nameindex())\n",
+            "except OSError as e:\n",
+            "  result = 'ERRNO:%d' % e.errno\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     // Any rule at all flips has_net_destination_policy on; the rule itself is
     // irrelevant to a unix/netlink send.
     let policy = base_policy().net_allow("127.0.0.1:9").build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -472,9 +575,17 @@ async fn reply_sender_address_looks_like_the_kernel() {
         "print(None if addr is None else (2 + len(addr), addr[2:6] == bytes(4)))\n",
     );
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "(12, True)", "expected sizeof(sockaddr_nl) and nl_pid == 0");
+    assert_eq!(
+        stdout.trim(),
+        "(12, True)",
+        "expected sizeof(sockaddr_nl) and nl_pid == 0"
+    );
 }
 
 /// iproute2 resolves `ip link show lo` with a non-dump `RTM_GETLINK` carrying
@@ -495,9 +606,17 @@ async fn link_lookup_by_name_finds_only_lo() {
         "print(lookup(b'lo'), lookup(b'eth0'))\n",
     );
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "16 -19", "expected RTM_NEWLINK for lo and -ENODEV for eth0");
+    assert_eq!(
+        stdout.trim(),
+        "16 -19",
+        "expected RTM_NEWLINK for lo and -ENODEV for eth0"
+    );
 }
 
 /// dup2 replaces the cookie fd without a close() the supervisor could see,
@@ -506,21 +625,36 @@ async fn link_lookup_by_name_finds_only_lo() {
 #[tokio::test]
 async fn dup2_over_the_cookie_fd_ends_the_netlink_fixups() {
     let out = temp_out("dup2-cookie");
-    let script = format!(concat!(
-        "import socket, os\n",
-        "nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)\n",
-        "plain = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
-        "os.dup2(plain.fileno(), nl.fileno())\n",
-        "open('{out}', 'w').write(repr(nl.getsockname()))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, os\n",
+            "nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)\n",
+            "plain = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
+            "os.dup2(plain.fileno(), nl.fileno())\n",
+            "open('{out}', 'w').write(repr(nl.getsockname()))\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(result.success(), "stderr: {}", String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
-    assert_eq!(contents.trim(), "''", "the fd is an unbound unix socket now");
+    assert!(
+        result.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
+    assert_eq!(
+        contents.trim(),
+        "''",
+        "the fd is an unbound unix socket now"
+    );
 }
 
 /// The netlink cookie is recognised by identity, so close() need not be
@@ -533,7 +667,8 @@ async fn close_is_not_a_notified_syscall() {
 }
 
 async fn check_socket_alias(setup: &str) {
-    let script = format!(r#"
+    let script = format!(
+        r#"
 import fcntl, os, socket, struct, sys
 original = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
 owner = os.getpid()
@@ -546,17 +681,26 @@ for receive in (s.recvfrom, s.recvmsg):
     assert struct.unpack_from('I', reply[0], 12)[0] == owner
     assert len(reply[-1]) == 10 and reply[-1][2:6] == bytes(4), reply[-1]
 print('OK', flush=True)
-"#);
+"#
+    );
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "stderr: {}",
-        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
     assert_eq!(result.stdout.as_deref().unwrap_or_default(), b"OK\n");
 }
 
 #[tokio::test]
 async fn duplicated_netlink_socket_retains_its_identity() {
-    check_socket_alias(r#"
+    check_socket_alias(
+        r#"
 first = os.dup(original.fileno())
 second = fcntl.fcntl(first, fcntl.F_DUPFD_CLOEXEC, 0)
 s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
@@ -567,17 +711,22 @@ plain = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 os.dup2(plain.fileno(), original.fileno())
 assert original.getsockname() == ''
 original.close()
-"#).await;
+"#,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn inherited_netlink_socket_retains_its_port_id() {
-    check_socket_alias(r#"
+    check_socket_alias(
+        r#"
 child = os.fork()
 if child:
     original.close()
     _, status = os.waitpid(child, 0)
     sys.exit(os.waitstatus_to_exitcode(status))
 s = original
-"#).await;
+"#,
+    )
+    .await;
 }

@@ -76,9 +76,9 @@ pub fn load_secret(source: &str) -> Result<SecretString, SandboxError> {
             &format!("file {val}"),
         )?,
         "fd" => {
-            let n: i32 = val
-                .parse()
-                .map_err(|_| SandboxError::Invalid(format!("credential fd must be an integer, got {val:?}")))?;
+            let n: i32 = val.parse().map_err(|_| {
+                SandboxError::Invalid(format!("credential fd must be an integer, got {val:?}"))
+            })?;
             read_fd(n)?
         }
         "literal" => {
@@ -88,7 +88,11 @@ pub fn load_secret(source: &str) -> Result<SecretString, SandboxError> {
                     .into(),
             ))
         }
-        other => return Err(SandboxError::Invalid(format!("unknown credential source {other:?}"))),
+        other => {
+            return Err(SandboxError::Invalid(format!(
+                "unknown credential source {other:?}"
+            )))
+        }
     };
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
@@ -97,7 +101,9 @@ pub fn load_secret(source: &str) -> Result<SecretString, SandboxError> {
         }
     }
     if bytes.is_empty() {
-        return Err(SandboxError::Invalid(format!("credential from {source:?} is empty")));
+        return Err(SandboxError::Invalid(format!(
+            "credential from {source:?} is empty"
+        )));
     }
     Ok(SecretString::new(bytes))
 }
@@ -292,7 +298,11 @@ impl InjectRule {
         Ok(Applied::Injected)
     }
 
-    fn set_query(&self, parts: &mut hyper::http::request::Parts, param: &str) -> Result<Applied, ()> {
+    fn set_query(
+        &self,
+        parts: &mut hyper::http::request::Parts,
+        param: &str,
+    ) -> Result<Applied, ()> {
         let uri = &parts.uri;
         let path = uri.path();
         let existing = uri.query();
@@ -304,9 +314,8 @@ impl InjectRule {
         // empty value instead of the injected one. Compare names DECODED, so a
         // child spelling the name with stray percent-encoding (`%6Bey=` for
         // `key=`) still counts as the target instead of evading the filter.
-        let is_target = |kv: &str| {
-            percent_decode_lossy(kv.split('=').next().unwrap_or(kv)) == param.as_bytes()
-        };
+        let is_target =
+            |kv: &str| percent_decode_lossy(kv.split('=').next().unwrap_or(kv)) == param.as_bytes();
         // Honor AddOnly: don't append a param the request already carries.
         if self.on_existing == OnExistingHeader::AddOnly {
             if let Some(q) = existing {
@@ -362,7 +371,9 @@ pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxErro
                 "basic auth user-id must not contain ':' (RFC 7617), got {user:?}"
             )))
         }
-        ("basic", Some(user)) if !user.is_empty() => AuthShape::Basic { username: user.to_string() },
+        ("basic", Some(user)) if !user.is_empty() => AuthShape::Basic {
+            username: user.to_string(),
+        },
         // `apikey:<header>` and `header:<name>` are the same rendering. Validate
         // the name here so a typo fails at build time; unchecked, it would only
         // surface as a per-request 502 when `apply` first renders the header.
@@ -372,14 +383,18 @@ pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxErro
                     "invalid header name {name:?} in auth shape {spec:?} for credential {credential:?}"
                 )));
             }
-            AuthShape::Header { name: name.to_string() }
+            AuthShape::Header {
+                name: name.to_string(),
+            }
         }
         // The de-dup filter matches param names percent-decoded, but not `+`
         // (form-encoded space) or the quirks of non-conformant server query
         // parsers. Use a plain URL-token name (letters/digits, no spaces, `+`,
         // or percent-encoding) so the injected pair reliably replaces the
         // child's rather than sitting alongside it.
-        ("query", Some(param)) if !param.is_empty() => AuthShape::Query { param: param.to_string() },
+        ("query", Some(param)) if !param.is_empty() => AuthShape::Query {
+            param: param.to_string(),
+        },
         _ => {
             return Err(SandboxError::Invalid(format!(
                 "invalid auth shape {spec:?} for credential {credential:?} \
@@ -417,10 +432,14 @@ pub fn resolve_inject_rules(
             SandboxError::Invalid(format!("--credential must be NAME=SOURCE, got {c:?}"))
         })?;
         if name.is_empty() {
-            return Err(SandboxError::Invalid(format!("--credential has empty name: {c:?}")));
+            return Err(SandboxError::Invalid(format!(
+                "--credential has empty name: {c:?}"
+            )));
         }
         if sources.insert(name, source).is_some() {
-            return Err(SandboxError::Invalid(format!("--credential {name:?} declared twice")));
+            return Err(SandboxError::Invalid(format!(
+                "--credential {name:?} declared twice"
+            )));
         }
     }
 
@@ -455,9 +474,17 @@ pub fn resolve_inject_rules(
             }
         };
         let source = *sources.get(cred).ok_or_else(|| {
-            SandboxError::Invalid(format!("--http-auth references undeclared credential {cred:?}"))
+            SandboxError::Invalid(format!(
+                "--http-auth references undeclared credential {cred:?}"
+            ))
         })?;
-        parsed.push(Parsed { name: cred, matcher, auth, on_existing, source });
+        parsed.push(Parsed {
+            name: cred,
+            matcher,
+            auth,
+            on_existing,
+            source,
+        });
     }
 
     // Load each referenced credential exactly once (so an `fd:` source is read
@@ -510,8 +537,16 @@ fn base64_encode(input: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -544,7 +579,9 @@ fn urlencode_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -578,7 +615,11 @@ mod tests {
         let s = SecretString::new(b"sk-supersecret".to_vec());
         assert_eq!(format!("{s:?}"), "SecretString(<redacted>)");
         // The rule's Debug must not leak the secret either.
-        let r = rule(AuthShape::Bearer, "sk-supersecret", OnExistingHeader::AddOnly);
+        let r = rule(
+            AuthShape::Bearer,
+            "sk-supersecret",
+            OnExistingHeader::AddOnly,
+        );
         assert!(!format!("{r:?}").contains("supersecret"));
     }
 
@@ -601,7 +642,9 @@ mod tests {
     #[test]
     fn bearer_injects_authorization() {
         let mut p = parts_of("https://api.example.com/v1/x", &[]);
-        rule(AuthShape::Bearer, "sk-abc", OnExistingHeader::AddOnly).apply(&mut p).unwrap();
+        rule(AuthShape::Bearer, "sk-abc", OnExistingHeader::AddOnly)
+            .apply(&mut p)
+            .unwrap();
         assert_eq!(p.headers.get("authorization").unwrap(), "Bearer sk-abc");
         assert!(p.headers.get("authorization").unwrap().is_sensitive());
     }
@@ -609,53 +652,120 @@ mod tests {
     #[test]
     fn basic_injects_base64() {
         let mut p = parts_of("https://api.example.com/x", &[]);
-        rule(AuthShape::Basic { username: "user".into() }, "pass", OnExistingHeader::AddOnly).apply(&mut p).unwrap();
+        rule(
+            AuthShape::Basic {
+                username: "user".into(),
+            },
+            "pass",
+            OnExistingHeader::AddOnly,
+        )
+        .apply(&mut p)
+        .unwrap();
         // base64("user:pass") == "dXNlcjpwYXNz"
-        assert_eq!(p.headers.get("authorization").unwrap(), "Basic dXNlcjpwYXNz");
+        assert_eq!(
+            p.headers.get("authorization").unwrap(),
+            "Basic dXNlcjpwYXNz"
+        );
     }
 
     #[test]
     fn header_shape_sets_named_header() {
         let mut p = parts_of("https://api.example.com/x", &[]);
-        rule(AuthShape::Header { name: "x-api-key".into() }, "k123", OnExistingHeader::AddOnly).apply(&mut p).unwrap();
+        rule(
+            AuthShape::Header {
+                name: "x-api-key".into(),
+            },
+            "k123",
+            OnExistingHeader::AddOnly,
+        )
+        .apply(&mut p)
+        .unwrap();
         assert_eq!(p.headers.get("x-api-key").unwrap(), "k123");
     }
 
     #[test]
     fn add_only_does_not_overwrite_but_replace_does() {
-        let mut p = parts_of("https://api.example.com/x", &[("authorization", "Bearer child-set")]);
-        rule(AuthShape::Bearer, "sk-real", OnExistingHeader::AddOnly).apply(&mut p).unwrap();
+        let mut p = parts_of(
+            "https://api.example.com/x",
+            &[("authorization", "Bearer child-set")],
+        );
+        rule(AuthShape::Bearer, "sk-real", OnExistingHeader::AddOnly)
+            .apply(&mut p)
+            .unwrap();
         assert_eq!(p.headers.get("authorization").unwrap(), "Bearer child-set");
 
-        let mut p2 = parts_of("https://api.example.com/x", &[("authorization", "Bearer child-set")]);
-        rule(AuthShape::Bearer, "sk-real", OnExistingHeader::Replace).apply(&mut p2).unwrap();
+        let mut p2 = parts_of(
+            "https://api.example.com/x",
+            &[("authorization", "Bearer child-set")],
+        );
+        rule(AuthShape::Bearer, "sk-real", OnExistingHeader::Replace)
+            .apply(&mut p2)
+            .unwrap();
         assert_eq!(p2.headers.get("authorization").unwrap(), "Bearer sk-real");
     }
 
     #[test]
     fn query_shape_appends_param() {
         let mut p = parts_of("https://api.example.com/v1/x?a=1", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "s e/cret", OnExistingHeader::AddOnly).apply(&mut p).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "s e/cret",
+            OnExistingHeader::AddOnly,
+        )
+        .apply(&mut p)
+        .unwrap();
         assert_eq!(p.uri.query().unwrap(), "a=1&key=s%20e%2Fcret");
 
         let mut p2 = parts_of("https://api.example.com/v1/x", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "abc", OnExistingHeader::AddOnly).apply(&mut p2).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "abc",
+            OnExistingHeader::AddOnly,
+        )
+        .apply(&mut p2)
+        .unwrap();
         assert_eq!(p2.uri.query().unwrap(), "key=abc");
     }
 
     #[test]
     fn parse_auth_shapes() {
         assert_eq!(parse_auth("bearer", "c").unwrap(), AuthShape::Bearer);
-        assert_eq!(parse_auth("basic:user", "c").unwrap(), AuthShape::Basic { username: "user".into() });
-        assert_eq!(parse_auth("header:x-api-key", "c").unwrap(), AuthShape::Header { name: "x-api-key".into() });
-        assert_eq!(parse_auth("apikey:x-key", "c").unwrap(), AuthShape::Header { name: "x-key".into() });
-        assert_eq!(parse_auth("query:token", "c").unwrap(), AuthShape::Query { param: "token".into() });
+        assert_eq!(
+            parse_auth("basic:user", "c").unwrap(),
+            AuthShape::Basic {
+                username: "user".into()
+            }
+        );
+        assert_eq!(
+            parse_auth("header:x-api-key", "c").unwrap(),
+            AuthShape::Header {
+                name: "x-api-key".into()
+            }
+        );
+        assert_eq!(
+            parse_auth("apikey:x-key", "c").unwrap(),
+            AuthShape::Header {
+                name: "x-key".into()
+            }
+        );
+        assert_eq!(
+            parse_auth("query:token", "c").unwrap(),
+            AuthShape::Query {
+                param: "token".into()
+            }
+        );
         assert!(parse_auth("basic:", "c").is_err());
         assert!(parse_auth("bogus", "c").is_err());
         // RFC 7617: ':' in the user-id is rejected (would shift the user:pass
         // boundary and leak part of the secret into the password field).
         assert!(parse_auth("basic:a:b", "c").is_err());
-        assert!(matches!(parse_auth("basic:alice", "c"), Ok(AuthShape::Basic { username }) if username == "alice"));
+        assert!(
+            matches!(parse_auth("basic:alice", "c"), Ok(AuthShape::Basic { username }) if username == "alice")
+        );
     }
 
     #[test]
@@ -663,7 +773,11 @@ mod tests {
         // A secret containing CR/LF can't be a header value — apply must report
         // failure (so the caller rejects the request) rather than silently drop.
         let mut p = parts_of("https://api.example.com/x", &[]);
-        let r = rule(AuthShape::Bearer, "sk\r\nx-evil: 1", OnExistingHeader::AddOnly);
+        let r = rule(
+            AuthShape::Bearer,
+            "sk\r\nx-evil: 1",
+            OnExistingHeader::AddOnly,
+        );
         assert!(r.apply(&mut p).is_err());
         assert!(p.headers.get("authorization").is_none());
         assert!(p.headers.get("x-evil").is_none()); // no header injection
@@ -673,27 +787,55 @@ mod tests {
     fn query_add_only_keeps_child_replace_overwrites() {
         // AddOnly: a param the child already carries is left untouched.
         let mut p = parts_of("https://api.example.com/x?key=child", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::AddOnly)
-            .apply(&mut p).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::AddOnly,
+        )
+        .apply(&mut p)
+        .unwrap();
         assert_eq!(p.uri.query().unwrap(), "key=child");
 
         // Replace must *replace*, not append a duplicate — otherwise a framework
         // reading the first occurrence authenticates against the child's value.
         let mut p2 = parts_of("https://api.example.com/x?key=child", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
-            .apply(&mut p2).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::Replace,
+        )
+        .apply(&mut p2)
+        .unwrap();
         assert_eq!(p2.uri.query().unwrap(), "key=sk-real");
 
         // Replace preserves other params and drops only the target's duplicates.
         let mut p3 = parts_of("https://api.example.com/x?a=1&key=old&b=2", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
-            .apply(&mut p3).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::Replace,
+        )
+        .apply(&mut p3)
+        .unwrap();
         assert_eq!(p3.uri.query().unwrap(), "a=1&b=2&key=sk-real");
 
         // Replace on a request without the param just appends it.
         let mut p4 = parts_of("https://api.example.com/x", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
-            .apply(&mut p4).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::Replace,
+        )
+        .apply(&mut p4)
+        .unwrap();
         assert_eq!(p4.uri.query().unwrap(), "key=sk-real");
     }
 
@@ -703,13 +845,26 @@ mod tests {
         // inject, not append `key&key=secret` (a first-occurrence-reading upstream
         // would authenticate with the child's empty value).
         let mut p = parts_of("https://api.example.com/x?key", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
-            .apply(&mut p).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::Replace,
+        )
+        .apply(&mut p)
+        .unwrap();
         assert_eq!(p.uri.query().unwrap(), "key=sk-real");
 
         // AddOnly sees the value-less param as present → keep the child's, skip.
         let mut p2 = parts_of("https://api.example.com/x?key", &[]);
-        let r = rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::AddOnly);
+        let r = rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::AddOnly,
+        );
         assert!(matches!(r.apply(&mut p2), Ok(Applied::Skipped)));
         assert_eq!(p2.uri.query().unwrap(), "key");
     }
@@ -760,8 +915,7 @@ mod tests {
         // the child, which could lseek back and re-read the secret. A pipe on
         // stdin (the documented pattern) can't rewind and stays allowed. Lib
         // tests run single-threaded in CI, and stdin is restored either way.
-        let path = std::env::temp_dir()
-            .join(format!("sandlock-cred-fd0-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("sandlock-cred-fd0-{}", std::process::id()));
         std::fs::write(&path, "sk-file\n").unwrap();
         let file_fd = std::fs::File::open(&path).unwrap().into_raw_fd();
         let saved = unsafe { libc::dup(0) };
@@ -797,8 +951,7 @@ mod tests {
         use std::os::fd::IntoRawFd;
         // Fds above 2 are closed in the child post-fork, so a seekable file fd
         // is safe there; only fd 0 carries the rewind restriction.
-        let path = std::env::temp_dir()
-            .join(format!("sandlock-cred-fdn-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("sandlock-cred-fdn-{}", std::process::id()));
         std::fs::write(&path, "sk-n").unwrap();
         let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
         let s = load_secret(&format!("fd:{fd}")).unwrap();
@@ -821,13 +974,26 @@ mod tests {
         // `%6Bey` decodes to `key`: Replace must treat it as the target and drop
         // it, not leave the child's pair alongside the injected one.
         let mut p = parts_of("https://api.example.com/x?%6Bey=child&a=1", &[]);
-        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
-            .apply(&mut p).unwrap();
+        rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::Replace,
+        )
+        .apply(&mut p)
+        .unwrap();
         assert_eq!(p.uri.query().unwrap(), "a=1&key=sk-real");
 
         // AddOnly sees the encoded spelling as present and keeps the child's value.
         let mut p2 = parts_of("https://api.example.com/x?%6Bey=child", &[]);
-        let r = rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::AddOnly);
+        let r = rule(
+            AuthShape::Query {
+                param: "key".into(),
+            },
+            "sk-real",
+            OnExistingHeader::AddOnly,
+        );
         assert!(matches!(r.apply(&mut p2), Ok(Applied::Skipped)));
         assert_eq!(p2.uri.query().unwrap(), "%6Bey=child");
     }
@@ -841,11 +1007,15 @@ mod tests {
         let (r, _) = resolve_inject_rules(&creds, &["* x.com/* bearer a".to_string()]).unwrap();
         assert_eq!(r[0].on_existing, OnExistingHeader::Replace);
         // Prove it at the apply level: a child-set Authorization is replaced.
-        let mut p = parts_of("https://x.com/v1", &[("authorization", "Bearer sk-placeholder")]);
+        let mut p = parts_of(
+            "https://x.com/v1",
+            &[("authorization", "Bearer sk-placeholder")],
+        );
         r[0].apply(&mut p).unwrap();
         assert_eq!(p.headers.get("authorization").unwrap(), "Bearer sk-x");
 
-        let (r2, _) = resolve_inject_rules(&creds, &["* x.com/* bearer a add-only".to_string()]).unwrap();
+        let (r2, _) =
+            resolve_inject_rules(&creds, &["* x.com/* bearer a add-only".to_string()]).unwrap();
         assert_eq!(r2[0].on_existing, OnExistingHeader::AddOnly);
         // Unknown trailing token is rejected.
         assert!(resolve_inject_rules(&creds, &["* x.com/* bearer a keep".to_string()]).is_err());

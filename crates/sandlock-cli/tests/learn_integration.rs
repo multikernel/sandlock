@@ -43,7 +43,15 @@ fn learn_then_run_script(profile_path: &str, script: &str) {
     );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", profile_path, "--", "python3", "-c", script])
+        .args([
+            "run",
+            "--profile-file",
+            profile_path,
+            "--",
+            "python3",
+            "-c",
+            script,
+        ])
         .output()
         .expect("failed to run sandlock run");
     assert!(
@@ -63,17 +71,32 @@ fn test_learn_then_run() {
         .args(["learn", "-o", &profile_path, "--", "cat", "/etc/hostname"])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: stderr={}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: stderr={}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "cat", "/etc/hostname"])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "cat",
+            "/etc/hostname",
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(),
-        "run failed: stderr={}", String::from_utf8_lossy(&run.stderr));
-    assert!(!String::from_utf8_lossy(&run.stdout).trim().is_empty(),
-        "expected output from cat /etc/hostname");
+    assert!(
+        run.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&run.stdout).trim().is_empty(),
+        "expected output from cat /etc/hostname"
+    );
 }
 
 /// Connected UDP send: an address-less send confirms the earlier UDP connect
@@ -97,7 +120,11 @@ fn test_learn_then_run_connected_udp_send() {
         profile_toml.contains(&format!("udp://127.0.0.1:{port}")),
         "expected connected UDP endpoint in profile:\n{profile_toml}"
     );
-    assert_eq!(sink.join().unwrap(), 2, "learn and run should each send one UDP datagram");
+    assert_eq!(
+        sink.join().unwrap(),
+        2,
+        "learn and run should each send one UDP datagram"
+    );
 }
 
 /// A connect observed on one thread and a send observed on a sibling thread
@@ -123,7 +150,11 @@ fn test_learn_then_run_connected_udp_send_from_thread() {
         profile_toml.contains(&format!("udp://127.0.0.1:{port}")),
         "expected connected UDP endpoint in profile:\n{profile_toml}"
     );
-    assert_eq!(sink.join().unwrap(), 2, "learn and run should each send one UDP datagram");
+    assert_eq!(
+        sink.join().unwrap(),
+        2,
+        "learn and run should each send one UDP datagram"
+    );
 }
 
 /// Write path: COW isolates during learn; run creates the file for real.
@@ -136,20 +167,48 @@ fn test_learn_then_run_write() {
     let write_path_str = write_path.to_str().unwrap();
 
     let learn = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path_str}")])
+        .args([
+            "learn",
+            "-o",
+            &profile_path,
+            "--",
+            "sh",
+            "-c",
+            &format!("echo hello > {write_path_str}"),
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
     assert!(!write_path.exists(), "COW isolation failed during learn");
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path_str}")])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "sh",
+            "-c",
+            &format!("echo hello > {write_path_str}"),
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
-    assert_eq!(std::fs::read_to_string(&write_path).unwrap_or_default().trim(), "hello",
-        "file not written during run");
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&write_path)
+            .unwrap_or_default()
+            .trim(),
+        "hello",
+        "file not written during run"
+    );
     let _ = std::fs::remove_file(&write_path);
 }
 
@@ -167,16 +226,34 @@ fn test_learn_then_run_write_and_read() {
         .args(["learn", "-o", &profile_path, "--", "sh", "-c", &script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", &script])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
-    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "hello",
-        "expected workload output");
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "hello",
+        "expected workload output"
+    );
     let _ = std::fs::remove_file(&file);
 }
 
@@ -185,23 +262,43 @@ fn test_learn_then_run_write_and_read() {
 fn test_learn_then_run_network() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || { let _ = listener.accept(); let _ = listener.accept(); });
+    std::thread::spawn(move || {
+        let _ = listener.accept();
+        let _ = listener.accept();
+    });
 
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
-    let script = format!("import socket; s=socket.socket(); s.connect(('127.0.0.1',{port})); s.close()");
+    let script =
+        format!("import socket; s=socket.socket(); s.connect(('127.0.0.1',{port})); s.close()");
 
     let learn = sandlock_bin()
         .args(["learn", "-o", &profile_path, "--", "python3", "-c", &script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", &script])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "python3",
+            "-c",
+            &script,
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 /// Bind: learned allow_bind port is permitted during run.
@@ -221,13 +318,29 @@ fn test_learn_then_run_bind() {
         .args(["learn", "-o", &profile_path, "--", "python3", "-c", script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", script])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "python3",
+            "-c",
+            script,
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 /// AF_UNIX bind: socket parent observed during learn, bind succeeds during run.
@@ -247,8 +360,11 @@ fn test_learn_then_run_unix_bind() {
         .args(["learn", "-o", &profile_path, "--", "python3", "-c", &script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     // bind() during learn is executed on-behalf by the supervisor (outside the
     // COW overlay), so the socket file exists on the real FS after learn.
@@ -256,12 +372,22 @@ fn test_learn_then_run_unix_bind() {
     let _ = std::fs::remove_file(&sock);
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", &script])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "python3",
+            "-c",
+            &script,
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(),
+    assert!(
+        run.status.success(),
         "run failed (unix bind parent not in writes?): {}",
-        String::from_utf8_lossy(&run.stderr));
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 /// Collapsed profile: directory grant covers files not individually observed during learn.
@@ -292,18 +418,35 @@ fn test_learn_then_run_collapse() {
     learn_cmd.args(["learn", "--collapse=4", "-o", &profile_path, "--", "cat"]);
     learn_cmd.args(&observed);
     let learn = learn_cmd.output().expect("failed to run sandlock learn");
-    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     // Run reads a file that was not individually observed; the collapsed
     // directory grant covers it.
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "cat", extra.to_str().unwrap()])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "cat",
+            extra.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(),
-        "run failed with collapsed profile: {}", String::from_utf8_lossy(&run.stderr));
-    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "covered by directory grant",
-        "unexpected output from unobserved file");
+    assert!(
+        run.status.success(),
+        "run failed with collapsed profile: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "covered by directory grant",
+        "unexpected output from unobserved file"
+    );
 }
 
 /// Learned memory limit reflects actual anonymous allocation, not just the floor.
@@ -318,19 +461,45 @@ fn test_learn_then_run_memory_limit() {
         .args(["learn", "-o", &profile_path, "--", "python3", "-c", script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let profile_toml = std::fs::read_to_string(&profile_path).expect("read profile");
-    let mem_line = profile_toml.lines().find(|l| l.starts_with("memory")).unwrap();
-    let mib: u64 = mem_line.trim_end_matches('"').split('"').nth(1)
-        .and_then(|s| s.trim_end_matches('M').parse().ok()).unwrap_or(0);
-    assert!(mib >= 25, "expected memory >= 25M (20M + 25% headroom), got {mib}M");
+    let mem_line = profile_toml
+        .lines()
+        .find(|l| l.starts_with("memory"))
+        .unwrap();
+    let mib: u64 = mem_line
+        .trim_end_matches('"')
+        .split('"')
+        .nth(1)
+        .and_then(|s| s.trim_end_matches('M').parse().ok())
+        .unwrap_or(0);
+    assert!(
+        mib >= 25,
+        "expected memory >= 25M (20M + 25% headroom), got {mib}M"
+    );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", script])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "python3",
+            "-c",
+            script,
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 /// Learned process limit reflects observed child processes.
@@ -341,22 +510,55 @@ fn test_learn_then_run_process_limit() {
 
     // sh forks cat as a child, observed peak is 2 processes.
     let learn = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--", "sh", "-c", "cat /etc/hostname & wait"])
+        .args([
+            "learn",
+            "-o",
+            &profile_path,
+            "--",
+            "sh",
+            "-c",
+            "cat /etc/hostname & wait",
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let profile_toml = std::fs::read_to_string(&profile_path).expect("read profile");
-    let proc_line = profile_toml.lines().find(|l| l.starts_with("processes")).unwrap();
-    let procs: u32 = proc_line.split('=').nth(1)
-        .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    assert!(procs >= 4, "expected processes >= 4 (2 observed * 2), got {procs}");
+    let proc_line = profile_toml
+        .lines()
+        .find(|l| l.starts_with("processes"))
+        .unwrap();
+    let procs: u32 = proc_line
+        .split('=')
+        .nth(1)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    assert!(
+        procs >= 4,
+        "expected processes >= 4 (2 observed * 2), got {procs}"
+    );
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", "cat /etc/hostname & wait"])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "sh",
+            "-c",
+            "cat /etc/hostname & wait",
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 /// mknod: FIFO created during learn round-trips to run.
@@ -373,16 +575,30 @@ fn test_learn_then_run_mknod() {
         .args(["learn", "-o", &profile_path, "--", "python3", "-c", &script])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
     assert!(!fifo.exists(), "COW isolation failed during learn");
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", &script])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "python3",
+            "-c",
+            &script,
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(),
-        "run failed (mknod not in profile writes?): {}", String::from_utf8_lossy(&run.stderr));
+    assert!(
+        run.status.success(),
+        "run failed (mknod not in profile writes?): {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert!(fifo.exists(), "FIFO not created during run");
     let _ = std::fs::remove_file(&fifo);
 }
@@ -405,10 +621,21 @@ fn test_learn_then_run_merge() {
 
     // Phase 1: learn access to dir_a/input.txt.
     let learn1 = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--", "cat", file_a.to_str().unwrap()])
+        .args([
+            "learn",
+            "-o",
+            &profile_path,
+            "--",
+            "cat",
+            file_a.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn1.status.success(), "learn1 failed: {}", String::from_utf8_lossy(&learn1.stderr));
+    assert!(
+        learn1.status.success(),
+        "learn1 failed: {}",
+        String::from_utf8_lossy(&learn1.stderr)
+    );
 
     // Operator hardens the profile: deny the secret file in dir_a.
     // Insert deny into the existing [filesystem] section.
@@ -419,28 +646,57 @@ fn test_learn_then_run_merge() {
 
     // Phase 2: merge, learn access to dir_b/input.txt.
     let learn2 = sandlock_bin()
-        .args(["learn", "--merge", &profile_path, "--", "cat", file_b.to_str().unwrap()])
+        .args([
+            "learn",
+            "--merge",
+            &profile_path,
+            "--",
+            "cat",
+            file_b.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to run sandlock learn --merge");
-    assert!(learn2.status.success(), "learn2 failed: {}", String::from_utf8_lossy(&learn2.stderr));
+    assert!(
+        learn2.status.success(),
+        "learn2 failed: {}",
+        String::from_utf8_lossy(&learn2.stderr)
+    );
 
     // Both files are readable, paths from both learn runs are in the profile.
     let run_ok = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--",
-               "cat", file_a.to_str().unwrap(), file_b.to_str().unwrap()])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "cat",
+            file_a.to_str().unwrap(),
+            file_b.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run_ok.status.success(),
-        "run with merged profile failed: {}", String::from_utf8_lossy(&run_ok.stderr));
+    assert!(
+        run_ok.status.success(),
+        "run with merged profile failed: {}",
+        String::from_utf8_lossy(&run_ok.stderr)
+    );
 
     // The deny rule survived the merge: the secret is blocked.
     let run_deny = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--",
-               "cat", secret.to_str().unwrap()])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "cat",
+            secret.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to run sandlock run (deny check)");
-    assert!(!run_deny.status.success(),
-        "secret should be blocked by deny rule after merge");
+    assert!(
+        !run_deny.status.success(),
+        "secret should be blocked by deny rule after merge"
+    );
 }
 
 // ── HTTP learning ─────────────────────────────────────────────────────────────
@@ -452,12 +708,14 @@ fn spawn_http_server() -> u16 {
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-            );
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         }
     });
     port
@@ -473,40 +731,82 @@ fn test_learn_then_run_http() {
     let profile_path = profile.path().to_str().unwrap().to_owned();
     let port = spawn_http_server();
     let url_learned = format!("http://127.0.0.1:{port}/data");
-    let url_other   = format!("http://127.0.0.1:{port}/other");
+    let url_other = format!("http://127.0.0.1:{port}/other");
     let port_str = port.to_string();
 
     // Learn only GET /data.
     let learn = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--http-port", &port_str,
-               "--", "curl", "-sf", &url_learned])
+        .args([
+            "learn",
+            "-o",
+            &profile_path,
+            "--http-port",
+            &port_str,
+            "--",
+            "curl",
+            "-sf",
+            &url_learned,
+        ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let profile_content = std::fs::read_to_string(&profile_path).expect("read profile");
-    assert!(profile_content.contains("[http]"), "profile must have [http] section: {profile_content}");
-    assert!(profile_content.contains("/data"), "profile must record /data: {profile_content}");
+    assert!(
+        profile_content.contains("[http]"),
+        "profile must have [http] section: {profile_content}"
+    );
+    assert!(
+        profile_content.contains("/data"),
+        "profile must record /data: {profile_content}"
+    );
 
     // Allowed: the learned path returns the real server response.
     let run_allow = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "curl", "-s", &url_learned])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "curl",
+            "-s",
+            &url_learned,
+        ])
         .output()
         .expect("failed to run sandlock run (allow)");
-    assert!(run_allow.status.success(),
-        "run failed for learned path: {}", String::from_utf8_lossy(&run_allow.stderr));
-    assert_eq!(String::from_utf8_lossy(&run_allow.stdout).trim(), "ok",
-        "expected 'ok' from test server for learned path");
+    assert!(
+        run_allow.status.success(),
+        "run failed for learned path: {}",
+        String::from_utf8_lossy(&run_allow.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_allow.stdout).trim(),
+        "ok",
+        "expected 'ok' from test server for learned path"
+    );
 
     // Blocked: a path not in the learned allow list gets 403 from the proxy.
     // curl -f exits non-zero on HTTP 4xx/5xx.
     let run_deny = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "curl", "-sf", &url_other])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "curl",
+            "-sf",
+            &url_other,
+        ])
         .output()
         .expect("failed to run sandlock run (deny)");
-    assert!(!run_deny.status.success(),
-        "run should have been blocked for non-learned path /other");
+    assert!(
+        !run_deny.status.success(),
+        "run should have been blocked for non-learned path /other"
+    );
 }
 
 fn system_ca_bundle() -> Option<&'static str> {
@@ -526,7 +826,9 @@ fn system_ca_bundle() -> Option<&'static str> {
 /// Returns true if host:443 accepts a TCP connection within 3 seconds.
 fn https_reachable(host: &str) -> bool {
     use std::net::ToSocketAddrs;
-    let Ok(mut it) = format!("{host}:443").to_socket_addrs() else { return false };
+    let Ok(mut it) = format!("{host}:443").to_socket_addrs() else {
+        return false;
+    };
     let Some(addr) = it.next() else { return false };
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
 }
@@ -553,37 +855,70 @@ fn test_learn_then_run_https() {
 
     let learn = sandlock_bin()
         .args([
-            "learn", "-o", &profile_path,
-            "--http-inject-ca", ca_bundle,
-            "--", "curl", "-sf", "https://example.com/",
+            "learn",
+            "-o",
+            &profile_path,
+            "--http-inject-ca",
+            ca_bundle,
+            "--",
+            "curl",
+            "-sf",
+            "https://example.com/",
         ])
         .output()
         .expect("failed to run sandlock learn");
-    assert!(learn.status.success(),
-        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(
+        learn.status.success(),
+        "learn failed: {}",
+        String::from_utf8_lossy(&learn.stderr)
+    );
 
     let profile_content = std::fs::read_to_string(&profile_path).expect("read profile");
-    assert!(profile_content.contains("http_inject_ca"),
-        "profile must record http_inject_ca in [config]: {profile_content}");
-    assert!(profile_content.contains("example.com"),
-        "profile must record example.com in [http].allow: {profile_content}");
+    assert!(
+        profile_content.contains("http_inject_ca"),
+        "profile must record http_inject_ca in [config]: {profile_content}"
+    );
+    assert!(
+        profile_content.contains("example.com"),
+        "profile must record example.com in [http].allow: {profile_content}"
+    );
 
     // Allowed: sandlock run picks up http_inject_ca from [config], no extra flags.
     let run_allow = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "curl", "-sf", "https://example.com/"])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "curl",
+            "-sf",
+            "https://example.com/",
+        ])
         .output()
         .expect("failed to run sandlock run (allow)");
-    assert!(run_allow.status.success(),
-        "run failed for learned path: {}", String::from_utf8_lossy(&run_allow.stderr));
+    assert!(
+        run_allow.status.success(),
+        "run failed for learned path: {}",
+        String::from_utf8_lossy(&run_allow.stderr)
+    );
 
     // Blocked: unlearned path returns 403 from proxy (curl -f exits non-zero on 4xx).
     let run_deny = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--",
-               "curl", "-sf", "https://example.com/not-learned-path"])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "curl",
+            "-sf",
+            "https://example.com/not-learned-path",
+        ])
         .output()
         .expect("failed to run sandlock run (deny)");
-    assert!(!run_deny.status.success(),
-        "run should have been blocked for non-learned path /not-learned-path");
+    assert!(
+        !run_deny.status.success(),
+        "run should have been blocked for non-learned path /not-learned-path"
+    );
 }
 
 /// --merge carries [http].allow and [http].ports from the observed run into the
@@ -594,53 +929,115 @@ fn test_learn_then_run_merge_http() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
     let port = spawn_http_server();
-    let url_a     = format!("http://127.0.0.1:{port}/path_a");
-    let url_b     = format!("http://127.0.0.1:{port}/path_b");
+    let url_a = format!("http://127.0.0.1:{port}/path_a");
+    let url_b = format!("http://127.0.0.1:{port}/path_b");
     let url_other = format!("http://127.0.0.1:{port}/other");
-    let port_str  = port.to_string();
+    let port_str = port.to_string();
 
     // Run 1: learn /path_a.
     let learn1 = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--http-port", &port_str,
-               "--", "curl", "-sf", &url_a])
+        .args([
+            "learn",
+            "-o",
+            &profile_path,
+            "--http-port",
+            &port_str,
+            "--",
+            "curl",
+            "-sf",
+            &url_a,
+        ])
         .output()
         .expect("failed to run sandlock learn (run 1)");
-    assert!(learn1.status.success(),
-        "learn run 1 failed: {}", String::from_utf8_lossy(&learn1.stderr));
+    assert!(
+        learn1.status.success(),
+        "learn run 1 failed: {}",
+        String::from_utf8_lossy(&learn1.stderr)
+    );
 
     // Run 2: merge, learn /path_b.
     let learn2 = sandlock_bin()
-        .args(["learn", "--merge", &profile_path, "--http-port", &port_str,
-               "--", "curl", "-sf", &url_b])
+        .args([
+            "learn",
+            "--merge",
+            &profile_path,
+            "--http-port",
+            &port_str,
+            "--",
+            "curl",
+            "-sf",
+            &url_b,
+        ])
         .output()
         .expect("failed to run sandlock learn --merge (run 2)");
-    assert!(learn2.status.success(),
-        "learn run 2 (merge) failed: {}", String::from_utf8_lossy(&learn2.stderr));
+    assert!(
+        learn2.status.success(),
+        "learn run 2 (merge) failed: {}",
+        String::from_utf8_lossy(&learn2.stderr)
+    );
 
     let merged = std::fs::read_to_string(&profile_path).expect("read merged profile");
-    assert!(merged.contains("/path_a"), "merged profile must contain /path_a: {merged}");
-    assert!(merged.contains("/path_b"), "merged profile must contain /path_b: {merged}");
+    assert!(
+        merged.contains("/path_a"),
+        "merged profile must contain /path_a: {merged}"
+    );
+    assert!(
+        merged.contains("/path_b"),
+        "merged profile must contain /path_b: {merged}"
+    );
 
     // Both learned paths are allowed.
     let run_a = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "curl", "-s", &url_a])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "curl",
+            "-s",
+            &url_a,
+        ])
         .output()
         .expect("failed to run sandlock run (path_a)");
-    assert!(run_a.status.success(),
-        "run failed for /path_a: {}", String::from_utf8_lossy(&run_a.stderr));
+    assert!(
+        run_a.status.success(),
+        "run failed for /path_a: {}",
+        String::from_utf8_lossy(&run_a.stderr)
+    );
 
     let run_b = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "curl", "-s", &url_b])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "curl",
+            "-s",
+            &url_b,
+        ])
         .output()
         .expect("failed to run sandlock run (path_b)");
-    assert!(run_b.status.success(),
-        "run failed for /path_b: {}", String::from_utf8_lossy(&run_b.stderr));
+    assert!(
+        run_b.status.success(),
+        "run failed for /path_b: {}",
+        String::from_utf8_lossy(&run_b.stderr)
+    );
 
     // Unlearned path is blocked.
     let run_deny = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "curl", "-sf", &url_other])
+        .args([
+            "run",
+            "--profile-file",
+            &profile_path,
+            "--",
+            "curl",
+            "-sf",
+            &url_other,
+        ])
         .output()
         .expect("failed to run sandlock run (deny)");
-    assert!(!run_deny.status.success(),
-        "run should have been blocked for non-learned path /other");
+    assert!(
+        !run_deny.status.success(),
+        "run should have been blocked for non-learned path /other"
+    );
 }

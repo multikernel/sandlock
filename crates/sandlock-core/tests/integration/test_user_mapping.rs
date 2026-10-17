@@ -1,4 +1,4 @@
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 
 /// Check if user namespaces with uid mapping actually work in this environment.
 /// Some CI environments (containers, restricted kernels) allow unshare but block
@@ -50,7 +50,12 @@ async fn test_uid_zero() {
     let result = policy.clone().run(&["id", "-u"]).await.unwrap();
     assert!(result.success(), "id -u failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "0", "Expected uid 0, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        "0",
+        "Expected uid 0, got: {:?}",
+        stdout.trim()
+    );
 }
 
 /// Test that --user 0:0 makes the child appear as gid 0.
@@ -75,7 +80,12 @@ async fn test_uid_zero_gid_zero() {
     let result = policy.clone().run(&["id", "-g"]).await.unwrap();
     assert!(result.success(), "id -g failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "0", "Expected gid 0, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        "0",
+        "Expected gid 0, got: {:?}",
+        stdout.trim()
+    );
 }
 
 /// Test that without --user, uid is NOT 0 (assuming tests don't run as root).
@@ -141,7 +151,12 @@ async fn test_uid_custom() {
     let result = policy.clone().run(&["id", "-u"]).await.unwrap();
     assert!(result.success(), "id -u failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "1000", "Expected uid 1000, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        "1000",
+        "Expected uid 1000, got: {:?}",
+        stdout.trim()
+    );
 }
 
 /// Requesting the identity the process already has must NOT create a user

@@ -30,20 +30,29 @@ fn build_with(setter: Setter, raw: u8) -> Sandbox {
 #[test]
 fn on_exit_discriminants_match_rust_enum() {
     for (raw, action) in DISCRIMINANTS {
-        assert_eq!(build_with(sandlock_sandbox_builder_on_exit, raw).on_exit, action);
+        assert_eq!(
+            build_with(sandlock_sandbox_builder_on_exit, raw).on_exit,
+            action
+        );
     }
 }
 
 #[test]
 fn on_error_discriminants_match_rust_enum() {
     for (raw, action) in DISCRIMINANTS {
-        assert_eq!(build_with(sandlock_sandbox_builder_on_error, raw).on_error, action);
+        assert_eq!(
+            build_with(sandlock_sandbox_builder_on_error, raw).on_error,
+            action
+        );
     }
 }
 
 #[test]
 fn unrecognized_discriminant_fails_the_build() {
-    let setters: [Setter; 2] = [sandlock_sandbox_builder_on_exit, sandlock_sandbox_builder_on_error];
+    let setters: [Setter; 2] = [
+        sandlock_sandbox_builder_on_exit,
+        sandlock_sandbox_builder_on_error,
+    ];
     for setter in setters {
         for raw in [4u8, 99, u8::MAX] {
             let b = unsafe { setter(sandlock_sandbox_builder_new(), raw) };

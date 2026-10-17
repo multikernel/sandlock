@@ -13,13 +13,10 @@
 use std::os::unix::io::{FromRawFd, OwnedFd};
 
 use crate::sys::structs::{
-    BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W,
-    EPERM,
-    OFFSET_ARCH, OFFSET_NR,
-    SECCOMP_FILTER_FLAG_NEW_LISTENER, SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
-    SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_USER_NOTIF,
-    SECCOMP_SET_MODE_FILTER,
-    SockFilter, SockFprog,
+    SockFilter, SockFprog, BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W, EPERM,
+    OFFSET_ARCH, OFFSET_NR, SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
+    SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_USER_NOTIF, SECCOMP_SET_MODE_FILTER,
 };
 use crate::sys::syscall::seccomp;
 
@@ -29,7 +26,12 @@ use crate::sys::syscall::seccomp;
 
 #[inline]
 pub(crate) fn stmt(code: u16, k: u32) -> SockFilter {
-    SockFilter { code, jt: 0, jf: 0, k }
+    SockFilter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 
 #[inline]
@@ -95,7 +97,7 @@ pub fn assemble_filter(
     let load_nr = 1usize;
     let notif_jmps = notif_syscalls.len();
     let deny_jmps = block_syscalls.len();
-    let ret_section = 3usize;                      // ALLOW, USER_NOTIF, ERRNO
+    let ret_section = 3usize; // ALLOW, USER_NOTIF, ERRNO
 
     let total = abi_block_len + arg_block_len + load_nr + notif_jmps + deny_jmps + ret_section;
 
@@ -104,7 +106,10 @@ pub fn assemble_filter(
     if total > MAX_BPF_INSNS {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("BPF program too large: {} instructions (max {})", total, MAX_BPF_INSNS),
+            format!(
+                "BPF program too large: {} instructions (max {})",
+                total, MAX_BPF_INSNS
+            ),
         ));
     }
 
@@ -135,9 +140,9 @@ pub fn assemble_filter(
     }
 
     // ---- 6. Return instructions ----
-    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));                      // ret_allow_idx
-    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF));                 // ret_notif_idx
-    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM as u32));       // ret_errno_idx
+    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)); // ret_allow_idx
+    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF)); // ret_notif_idx
+    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM as u32)); // ret_errno_idx
 
     debug_assert_eq!(prog.len(), total, "BPF program length mismatch");
     Ok(prog)
@@ -368,11 +373,8 @@ mod tests {
 
     #[test]
     fn test_rejects_notif_deny_overlap() {
-        let err = match assemble_filter(
-            &[libc::SYS_openat as u32],
-            &[libc::SYS_openat as u32],
-            &[],
-        ) {
+        let err = match assemble_filter(&[libc::SYS_openat as u32], &[libc::SYS_openat as u32], &[])
+        {
             Ok(_) => panic!("expected notif/deny overlap to be rejected"),
             Err(err) => err,
         };
@@ -397,7 +399,8 @@ mod tests {
 
     #[test]
     fn test_default_allow_is_before_returns() {
-        let prog = assemble_filter(&[libc::SYS_openat as u32], &[libc::SYS_mount as u32], &[]).unwrap();
+        let prog =
+            assemble_filter(&[libc::SYS_openat as u32], &[libc::SYS_mount as u32], &[]).unwrap();
         // RET section is last 3 instructions; first of them is ALLOW.
         let allow_instr = &prog[prog.len() - 3];
         assert_eq!(allow_instr.code, BPF_RET | BPF_K);

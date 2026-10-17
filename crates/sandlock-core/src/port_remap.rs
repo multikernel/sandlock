@@ -58,7 +58,9 @@ impl PortMap {
         }
         if let Some(ref cb) = self.on_bind {
             // Report all bound ports: identity + remapped
-            let mut all: HashMap<u16, u16> = self.bound_ports.iter()
+            let mut all: HashMap<u16, u16> = self
+                .bound_ports
+                .iter()
                 .map(|&p| (self.real_to_virtual.get(&p).copied().unwrap_or(p), p))
                 .collect();
             all.extend(self.virtual_to_real.iter().map(|(&v, &r)| (v, r)));
@@ -140,16 +142,11 @@ pub(crate) async fn handle_bind(
         return NotifAction::Continue;
     }
 
-    let mut bytes = match crate::network::read_sockaddr(
-        notif_fd,
-        notif.id,
-        notif.pid,
-        addr_ptr,
-        addr_len,
-    ) {
-        Ok(b) => b,
-        Err(e) => return NotifAction::Errno(e),
-    };
+    let mut bytes =
+        match crate::network::read_sockaddr(notif_fd, notif.id, notif.pid, addr_ptr, addr_len) {
+            Ok(b) => b,
+            Err(e) => return NotifAction::Errno(e),
+        };
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
@@ -168,13 +165,13 @@ pub(crate) async fn handle_bind(
         let ns = network.lock().await;
         let udp_deny_all = protocol == Some(crate::network::Protocol::Udp)
             && ns
-                .effective_network_policy(
-                    notif.pid,
-                    crate::network::Protocol::Udp,
-                    None,
-                )
+                .effective_network_policy(notif.pid, crate::network::Protocol::Udp, None)
                 .denies_everything();
-        (udp_deny_all, ns.bind_allow_ports.clone(), ns.bind_deny_ports.clone())
+        (
+            udp_deny_all,
+            ns.bind_allow_ports.clone(),
+            ns.bind_deny_ports.clone(),
+        )
     };
     if udp_deny_all {
         return NotifAction::Errno(libc::EACCES);
@@ -235,7 +232,11 @@ pub(crate) async fn handle_bind(
         // The cached mapping (if any) is already correct. Record only
         // when this is a first-time identity bind.
         if cached_real.is_none() {
-            network.lock().await.port_map.record_bind(virtual_port, virtual_port);
+            network
+                .lock()
+                .await
+                .port_map
+                .record_bind(virtual_port, virtual_port);
         }
         return NotifAction::ReturnValue(0);
     }
@@ -265,7 +266,11 @@ pub(crate) async fn handle_bind(
         Some(p) => p,
         None => return NotifAction::Errno(libc::EIO),
     };
-    network.lock().await.port_map.record_bind(virtual_port, real_port);
+    network
+        .lock()
+        .await
+        .port_map
+        .record_bind(virtual_port, real_port);
     NotifAction::ReturnValue(0)
 }
 
@@ -299,9 +304,8 @@ fn query_local_port(fd: &OwnedFd) -> Option<u16> {
     if ret != 0 {
         return None;
     }
-    let bytes = unsafe {
-        std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
     extract_port(bytes)
 }
 
@@ -360,12 +364,8 @@ pub(crate) async fn handle_getsockname(
     let mut bytes = if to_write == 0 {
         Vec::new()
     } else {
-        let storage_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &storage as *const _ as *const u8,
-                storage_len,
-            )
-        };
+        let storage_bytes =
+            unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, storage_len) };
         storage_bytes[..to_write].to_vec()
     };
 
@@ -459,5 +459,4 @@ mod tests {
         assert_eq!(buf[2], 0x01);
         assert_eq!(buf[3], 0xBB);
     }
-
 }

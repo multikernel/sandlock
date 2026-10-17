@@ -29,9 +29,11 @@ pub(crate) fn path_matches(resolved: &Path, inject_paths: &[PathBuf]) -> bool {
     }
     // Try canonicalized form to handle symlinks on either side.
     let canonical = std::fs::canonicalize(resolved).ok();
-    canonical.map_or(false, |c| inject_paths.iter().any(|p| {
-        p == &c || std::fs::canonicalize(p).ok().map_or(false, |cp| cp == c)
-    }))
+    canonical.map_or(false, |c| {
+        inject_paths
+            .iter()
+            .any(|p| p == &c || std::fs::canonicalize(p).ok().map_or(false, |cp| cp == c))
+    })
 }
 
 /// Intercept an open-family syscall targeting a declared trust bundle and
@@ -83,7 +85,10 @@ mod tests {
     #[test]
     fn path_matches_exact_only() {
         let paths = vec![PathBuf::from("/etc/ssl/certs/ca-certificates.crt")];
-        assert!(path_matches(Path::new("/etc/ssl/certs/ca-certificates.crt"), &paths));
+        assert!(path_matches(
+            Path::new("/etc/ssl/certs/ca-certificates.crt"),
+            &paths
+        ));
         assert!(!path_matches(Path::new("/etc/ssl/certs/other.crt"), &paths));
     }
 }

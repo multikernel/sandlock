@@ -1,4 +1,4 @@
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 use std::time::{Duration, SystemTime};
 
 /// Test that random_seed produces deterministic output from /dev/urandom.
@@ -18,10 +18,14 @@ async fn test_random_seed_deterministic() {
         .unwrap();
 
     // Read 16 bytes from /dev/urandom via od — exercises the openat interception path.
-    let r1 = policy.clone().run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
+    let r1 = policy
+        .clone()
+        .run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
         .await
         .unwrap();
-    let r2 = policy.clone().run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
+    let r2 = policy
+        .clone()
+        .run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
         .await
         .unwrap();
 
@@ -73,10 +77,7 @@ async fn test_random_seed_different_seeds() {
 
     let out1 = String::from_utf8_lossy(r1.stdout.as_deref().unwrap_or_default());
     let out2 = String::from_utf8_lossy(r2.stdout.as_deref().unwrap_or_default());
-    assert!(
-        !out1.trim().is_empty(),
-        "Expected non-empty output"
-    );
+    assert!(!out1.trim().is_empty(), "Expected non-empty output");
     assert_ne!(
         out1.trim(),
         out2.trim(),
@@ -104,7 +105,12 @@ async fn test_time_start_frozen() {
     let result = policy.clone().run(&["date", "+%Y"]).await.unwrap();
     assert!(result.success(), "date command failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "2000", "Expected year 2000, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        "2000",
+        "Expected year 2000, got: {:?}",
+        stdout.trim()
+    );
 }
 
 /// Test that time_start doesn't break basic command execution.
@@ -141,7 +147,11 @@ async fn test_combined_determinism() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["echo", "deterministic"]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["echo", "deterministic"])
+        .await
+        .unwrap();
     assert!(result.success());
 }
 
@@ -163,7 +173,8 @@ async fn test_deterministic_dirs() {
     // Read directory entries without userland sorting so the assertion covers
     // the sandbox's getdents virtualization. Some minimal ls implementations
     // do not support `-f`, so avoid depending on ls option support here.
-    let scan = "python3 - <<'PY'\nimport os\nprint('\\n'.join(e.name for e in os.scandir('/etc')))\nPY";
+    let scan =
+        "python3 - <<'PY'\nimport os\nprint('\\n'.join(e.name for e in os.scandir('/etc')))\nPY";
     let r1 = policy.clone().run(&["sh", "-c", scan]).await.unwrap();
     let r2 = policy.clone().run(&["sh", "-c", scan]).await.unwrap();
     assert!(
@@ -179,10 +190,7 @@ async fn test_deterministic_dirs() {
 
     let out1 = String::from_utf8_lossy(r1.stdout.as_deref().unwrap_or_default());
     let out2 = String::from_utf8_lossy(r2.stdout.as_deref().unwrap_or_default());
-    assert!(
-        !out1.trim().is_empty(),
-        "Expected non-empty ls output"
-    );
+    assert!(!out1.trim().is_empty(), "Expected non-empty ls output");
     assert_eq!(
         out1, out2,
         "Two directory scans should produce identical output with deterministic_dirs"
@@ -190,12 +198,13 @@ async fn test_deterministic_dirs() {
 
     // Verify the output is actually sorted (skip dot entries when the runtime
     // exposes them).
-    let lines: Vec<&str> = out1.lines()
-        .filter(|l| *l != "." && *l != "..")
-        .collect();
+    let lines: Vec<&str> = out1.lines().filter(|l| *l != "." && *l != "..").collect();
     let mut sorted = lines.clone();
     sorted.sort();
-    assert_eq!(lines, sorted, "getdents output should be lexicographically sorted");
+    assert_eq!(
+        lines, sorted,
+        "getdents output should be lexicographically sorted"
+    );
 }
 
 /// Test that hostname virtualizes both uname() and /etc/hostname.
@@ -215,16 +224,36 @@ async fn test_hostname_virtualization() {
     let name = format!("mybox-{}", std::process::id());
 
     // Verify uname() returns the virtual hostname.
-    let result = policy.clone().with_name(&name).run(&["hostname"]).await.unwrap();
+    let result = policy
+        .clone()
+        .with_name(&name)
+        .run(&["hostname"])
+        .await
+        .unwrap();
     assert!(result.success(), "hostname command failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), name, "Expected hostname {name:?}, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        name,
+        "Expected hostname {name:?}, got: {:?}",
+        stdout.trim()
+    );
 
     // Verify /etc/hostname also returns the virtual hostname.
-    let result = policy.clone().with_name(&name).run(&["cat", "/etc/hostname"]).await.unwrap();
+    let result = policy
+        .clone()
+        .with_name(&name)
+        .run(&["cat", "/etc/hostname"])
+        .await
+        .unwrap();
     assert!(result.success(), "cat /etc/hostname failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), name, "Expected /etc/hostname {name:?}, got: {:?}", stdout.trim());
+    assert_eq!(
+        stdout.trim(),
+        name,
+        "Expected /etc/hostname {name:?}, got: {:?}",
+        stdout.trim()
+    );
 }
 
 /// The /etc/hostname shim used to do a literal `path == "/etc/hostname"`
@@ -258,7 +287,12 @@ async fn test_hostname_virtualization_resists_path_bypasses() {
     // Unique per process and distinct from test_hostname_virtualization's
     // name; both tests run concurrently in this binary.
     let name = format!("mybox-bypass-{}", std::process::id());
-    let result = policy.clone().with_name(&name).run(&["python3", "-c", script]).await.unwrap();
+    let result = policy
+        .clone()
+        .with_name(&name)
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     for label in ["dirfd", "dotdot", "curdir", "slash2"] {
         let needle = format!("'{label}': '{name}'");

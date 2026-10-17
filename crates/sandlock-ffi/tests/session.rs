@@ -18,7 +18,9 @@ const INHERIT: u32 = 0;
 fn build_policy() -> *mut sandlock_sandbox_t {
     let mut b = sandlock_sandbox_builder_new();
     for p in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"] {
-        if p == "/lib64" && !std::path::Path::new("/lib64").exists() { continue; }
+        if p == "/lib64" && !std::path::Path::new("/lib64").exists() {
+            continue;
+        }
         let c = CString::new(p).unwrap();
         b = unsafe { sandlock_sandbox_builder_fs_read(b, c.as_ptr()) };
     }
@@ -33,8 +35,18 @@ fn popen(policy: *mut sandlock_sandbox_t, cmd: &[&str]) -> *mut sandlock_handle_
     let av: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
     let (mut fd_in, mut fd_out, mut fd_err): (c_int, c_int, c_int) = (-1, -1, -1);
     let h = unsafe {
-        sandlock_popen(policy, ptr::null(), av.as_ptr(), av.len() as c_uint, INHERIT, INHERIT, INHERIT,
-            &mut fd_in, &mut fd_out, &mut fd_err)
+        sandlock_popen(
+            policy,
+            ptr::null(),
+            av.as_ptr(),
+            av.len() as c_uint,
+            INHERIT,
+            INHERIT,
+            INHERIT,
+            &mut fd_in,
+            &mut fd_out,
+            &mut fd_err,
+        )
     };
     assert!(!h.is_null(), "sandlock_popen returned null");
     h
@@ -70,7 +82,9 @@ fn wait_timeout_leaves_the_session_alive() {
     assert!(status.is_null());
     let groups = unsafe { sandlock_handle_process_groups(h) };
     assert!(!groups.is_null());
-    let listed = unsafe { CStr::from_ptr(groups) }.to_string_lossy().into_owned();
+    let listed = unsafe { CStr::from_ptr(groups) }
+        .to_string_lossy()
+        .into_owned();
     assert_ne!(listed, "[]", "the session is still running");
     unsafe {
         sandlock_string_free(groups);

@@ -10,14 +10,13 @@ use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::error::NotifError;
 use crate::arch;
+use crate::error::NotifError;
 use crate::sys::structs::{
-    SeccompNotif, SeccompNotifAddfd, SeccompNotifResp,
-    SECCOMP_ADDFD_FLAG_SEND, SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV,
-    SECCOMP_IOCTL_NOTIF_SEND, SECCOMP_IOCTL_NOTIF_SET_FLAGS,
-    SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-    ENOMEM,
+    SeccompNotif, SeccompNotifAddfd, SeccompNotifResp, ENOMEM, SECCOMP_ADDFD_FLAG_SEND,
+    SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV,
+    SECCOMP_IOCTL_NOTIF_SEND, SECCOMP_IOCTL_NOTIF_SET_FLAGS, SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP,
+    SECCOMP_USER_NOTIF_FLAG_CONTINUE,
 };
 
 // ============================================================
@@ -84,13 +83,19 @@ impl std::fmt::Debug for Deferred {
 
 impl Deferred {
     pub fn new<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
-        Self { future: Box::pin(f), patient: false }
+        Self {
+            future: Box::pin(f),
+            patient: false,
+        }
     }
 
     /// A deferral with no deadline, for a syscall that natively waits as long
     /// as it takes. The future has to end by itself once the child is gone.
     pub(crate) fn patient<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
-        Self { future: Box::pin(f), patient: true }
+        Self {
+            future: Box::pin(f),
+            patient: true,
+        }
     }
 
     /// Drive the deferred future to its terminal action.  Consumes `self`
@@ -178,11 +183,14 @@ impl NotifAction {
         Self::Prepared(PreparedOperation {
             host: parse_ip_from_sockaddr(addr),
             port: parse_port_from_sockaddr(addr),
-            protocol: query_socket_protocol(socket).map(|p| match p {
-                Protocol::Tcp => "tcp",
-                Protocol::Udp => "udp",
-                Protocol::Icmp => "icmp",
-            }.to_string()),
+            protocol: query_socket_protocol(socket).map(|p| {
+                match p {
+                    Protocol::Tcp => "tcp",
+                    Protocol::Udp => "udp",
+                    Protocol::Icmp => "icmp",
+                }
+                .to_string()
+            }),
             extra_destinations: Vec::new(),
             execute: Box::new(execute),
         })
@@ -344,9 +352,11 @@ impl NetworkPolicy {
     /// wildcard was used.
     pub fn denies_everything(&self) -> bool {
         match self {
-            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
-                per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty()
-            }
+            NetworkPolicy::AllowList {
+                per_ip,
+                cidrs,
+                any_ip_ports,
+            } => per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty(),
             NetworkPolicy::DenyList { deny_all, .. } => *deny_all,
             NetworkPolicy::Unrestricted => false,
         }
@@ -361,7 +371,11 @@ impl NetworkPolicy {
         let ip = ip.to_canonical();
         match self {
             NetworkPolicy::Unrestricted => true,
-            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
+            NetworkPolicy::AllowList {
+                per_ip,
+                cidrs,
+                any_ip_ports,
+            } => {
                 if any_ip_ports.contains(&port) {
                     return true;
                 }
@@ -384,7 +398,11 @@ impl NetworkPolicy {
                 }
                 false
             }
-            NetworkPolicy::DenyList { cidrs, any_ip_ports, deny_all } => {
+            NetworkPolicy::DenyList {
+                cidrs,
+                any_ip_ports,
+                deny_all,
+            } => {
                 if *deny_all {
                     return false;
                 }
@@ -488,15 +506,25 @@ struct OpenHow {
 }
 
 fn last_errno(fallback: i32) -> i32 {
-    io::Error::last_os_error().raw_os_error().unwrap_or(fallback)
+    io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(fallback)
 }
 
 /// `openat2` relative to `dirfd`. Returns an owned fd or the errno.
-pub(crate) fn openat2_at(dirfd: RawFd, path: &std::ffi::CStr, flags: u64, mode: u64, resolve: u64)
-    -> Result<OwnedFd, i32>
-{
+pub(crate) fn openat2_at(
+    dirfd: RawFd,
+    path: &std::ffi::CStr,
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+) -> Result<OwnedFd, i32> {
     use std::os::unix::io::FromRawFd;
-    let how = OpenHow { flags, mode, resolve };
+    let how = OpenHow {
+        flags,
+        mode,
+        resolve,
+    };
     let fd = unsafe {
         libc::syscall(
             arch::SYS_OPENAT2,
@@ -521,7 +549,10 @@ pub(crate) fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
     if dirfd as i32 == libc::AT_FDCWD {
         let cwd = std::ffi::CString::new(format!("/proc/{}/cwd", pid)).map_err(|_| libc::EINVAL)?;
         let fd = unsafe {
-            libc::open(cwd.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            libc::open(
+                cwd.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
         };
         if fd < 0 {
             return Err(last_errno(libc::EACCES));
@@ -536,7 +567,6 @@ pub(crate) fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
 fn realpath_of_fd(fd: RawFd) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()
 }
-
 
 /// Decide whether `realpath` may be opened with `flags` under the deny set
 /// and the (conservative) grant lists. Returns `Some(errno)` to refuse,
@@ -579,12 +609,21 @@ fn deny_open_verdict(
     }
     let is_write = crate::procfs::proc_open_is_write(flags);
     let grants = || {
-        let reads = (!is_write).then_some(policy.chroot_readable.iter()).into_iter().flatten();
+        let reads = (!is_write)
+            .then_some(policy.chroot_readable.iter())
+            .into_iter()
+            .flatten();
         policy.chroot_writable.iter().chain(reads)
     };
     let granted = grants().any(|grant| realpath.starts_with(grant))
-        || self_forms.iter().any(|form| grants().any(|grant| crate::procfs::own_grant_covers(form, grant)));
-    if granted { None } else { Some(libc::EACCES) }
+        || self_forms
+            .iter()
+            .any(|form| grants().any(|grant| crate::procfs::own_grant_covers(form, grant)));
+    if granted {
+        None
+    } else {
+        Some(libc::EACCES)
+    }
 }
 
 /// Resolve again, inside the caller's /proc directory, a probe that landed in
@@ -609,7 +648,10 @@ pub(crate) fn reprobe_in_callers_proc(
     let caller_tgid = processes.tgid_of(caller_tid as i32)?;
     let (rest, callers) = match real.strip_prefix(&own_thread) {
         Ok(rest) => (rest, format!("/proc/{}/task/{}", caller_tgid, caller_tid)),
-        Err(_) => (real.strip_prefix(&own).ok()?, format!("/proc/{}", caller_tgid)),
+        Err(_) => (
+            real.strip_prefix(&own).ok()?,
+            format!("/proc/{}", caller_tgid),
+        ),
     };
     let callers_real = std::path::Path::new(&callers).join(rest);
     let c_base = std::ffi::CString::new(callers).ok()?;
@@ -618,12 +660,25 @@ pub(crate) fn reprobe_in_callers_proc(
         false => std::ffi::CString::new(rest.as_os_str().as_encoded_bytes()).ok()?,
     };
     Some(
-        openat2_at(libc::AT_FDCWD, &c_base, (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64, 0, 0)
-            .and_then(|base| {
-                let flags = libc::O_PATH | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
-                openat2_at(base.as_raw_fd(), &c_rest, flags as u64, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
-            })
-            .map(|fd| (fd, callers_real)),
+        openat2_at(
+            libc::AT_FDCWD,
+            &c_base,
+            (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            0,
+            0,
+        )
+        .and_then(|base| {
+            let flags =
+                libc::O_PATH | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
+            openat2_at(
+                base.as_raw_fd(),
+                &c_rest,
+                flags as u64,
+                0,
+                RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+            )
+        })
+        .map(|fd| (fd, callers_real)),
     )
 }
 
@@ -646,7 +701,13 @@ pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<
     let a = &notif.data.args;
     let nr = notif.data.nr as i64;
     if nr == libc::SYS_openat {
-        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags: a[2], mode: a[3], resolve: 0 })
+        Some(OpenArgs {
+            dirfd: a[0] as i64,
+            path_ptr: a[1],
+            flags: a[2],
+            mode: a[3],
+            resolve: 0,
+        })
     } else if nr == arch::SYS_OPENAT2 {
         // openat2(dirfd, pathname, struct open_how *how, size_t size),
         // open_how = { u64 flags, u64 mode, u64 resolve }.
@@ -666,10 +727,22 @@ pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<
         } else {
             0
         };
-        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags, mode, resolve })
+        Some(OpenArgs {
+            dirfd: a[0] as i64,
+            path_ptr: a[1],
+            flags,
+            mode,
+            resolve,
+        })
     } else {
         // legacy open(path, flags, mode) — AT_FDCWD implied.
-        Some(OpenArgs { dirfd: libc::AT_FDCWD as i64, path_ptr: a[0], flags: a[1], mode: a[2], resolve: 0 })
+        Some(OpenArgs {
+            dirfd: libc::AT_FDCWD as i64,
+            path_ptr: a[0],
+            flags: a[1],
+            mode: a[2],
+            resolve: 0,
+        })
     }
 }
 
@@ -723,7 +796,10 @@ pub(crate) fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
     } else {
         0
     };
-    NotifAction::InjectFdSend { srcfd: owned, newfd_flags }
+    NotifAction::InjectFdSend {
+        srcfd: owned,
+        newfd_flags,
+    }
 }
 
 /// Existing-file branch: vet the pinned inode behind `probe`, then reopen it
@@ -756,7 +832,9 @@ async fn reopen_existing_on_behalf(
             return NotifAction::Errno(libc::EACCES);
         }
     }
-    let net_entry = crate::procfs::net::lookup(&crate::procfs::canon_proc_namespace(&realpath.to_string_lossy()));
+    let net_entry = crate::procfs::net::lookup(&crate::procfs::canon_proc_namespace(
+        &realpath.to_string_lossy(),
+    ));
     if net_entry != crate::procfs::net::NetEntry::Outside {
         return crate::procfs::net_dispatch::serve_entry(net_entry, flags, notif, ctx).await;
     }
@@ -822,10 +900,17 @@ fn fifo_has_writer(reader: &OwnedFd) -> Result<bool, i32> {
             std::sync::Mutex::new((OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])))
         })
     });
-    let Some(scratch) = scratch else { return Err(libc::EMFILE) };
+    let Some(scratch) = scratch else {
+        return Err(libc::EMFILE);
+    };
     let scratch = scratch.lock().unwrap_or_else(|e| e.into_inner());
     let copied = unsafe {
-        libc::tee(reader.as_raw_fd(), scratch.1.as_raw_fd(), 1, libc::SPLICE_F_NONBLOCK)
+        libc::tee(
+            reader.as_raw_fd(),
+            scratch.1.as_raw_fd(),
+            1,
+            libc::SPLICE_F_NONBLOCK,
+        )
     };
     match copied {
         0 => Ok(false),
@@ -881,7 +966,9 @@ fn reopen_fifo_when_partnered(
                 FIFO_END_OPENED.notify_waiters();
             }
             let partnered = match &held_reader {
-                Some(reader) => fifo_has_writer(reader).map(|has| has.then(|| held_reader.take()).flatten()),
+                Some(reader) => {
+                    fifo_has_writer(reader).map(|has| has.then(|| held_reader.take()).flatten())
+                }
                 None => match reopen_pinned(&pinned, reopen_flags | libc::O_NONBLOCK) {
                     Ok(writer) => Ok(Some(writer)),
                     Err(libc::ENXIO) => Ok(None),
@@ -951,7 +1038,14 @@ fn create_new_on_behalf(
         Some(p) => p,
         None => return NotifAction::Errno(libc::EACCES),
     };
-    if let Some(errno) = deny_open_verdict(&parent_real.join(file_name), flags, policy, pfs, processes, caller_tid) {
+    if let Some(errno) = deny_open_verdict(
+        &parent_real.join(file_name),
+        flags,
+        policy,
+        pfs,
+        processes,
+        caller_tid,
+    ) {
         return NotifAction::Errno(errno);
     }
     let c_name = match std::ffi::CString::new(file_name.as_encoded_bytes()) {
@@ -989,7 +1083,13 @@ async fn on_behalf_open(
         return NotifAction::Continue;
     }
 
-    let OpenArgs { dirfd, flags, mode, resolve, .. } = open.args;
+    let OpenArgs {
+        dirfd,
+        flags,
+        mode,
+        resolve,
+        ..
+    } = open.args;
     let path = &open.path;
     let c_path = match std::ffi::CString::new(path.as_str()) {
         Ok(c) => c,
@@ -1022,7 +1122,9 @@ async fn on_behalf_open(
     if let Some(own_fd) = own_fd {
         return match dup_fd_from_pid(notif.pid, own_fd) {
             Ok(dup) => match realpath_of_fd(dup.as_raw_fd()) {
-                Some(real) => reopen_existing_on_behalf(dup, real, flags, ctx, pfs, notif, notif_fd).await,
+                Some(real) => {
+                    reopen_existing_on_behalf(dup, real, flags, ctx, pfs, notif, notif_fd).await
+                }
                 None => NotifAction::Errno(libc::EACCES),
             },
             Err(_) => NotifAction::Errno(libc::ENOENT),
@@ -1032,10 +1134,20 @@ async fn on_behalf_open(
     // Side-effect-free probe; mirror the child's no-follow intent for the
     // final component and any `openat2` RESOLVE_* flags it requested.
     let probe_flags = (libc::O_PATH | libc::O_CLOEXEC) as u64 | (flags & libc::O_NOFOLLOW as u64);
-    match openat2_at(base_fd, &c_path, probe_flags, 0, RESOLVE_NO_MAGICLINKS | resolve) {
+    match openat2_at(
+        base_fd,
+        &c_path,
+        probe_flags,
+        0,
+        RESOLVE_NO_MAGICLINKS | resolve,
+    ) {
         Ok(probe) => {
             let Some(real) = realpath_of_fd(probe.as_raw_fd()) else {
-                return if has_denied { NotifAction::Errno(libc::EACCES) } else { NotifAction::Continue };
+                return if has_denied {
+                    NotifAction::Errno(libc::EACCES)
+                } else {
+                    NotifAction::Continue
+                };
             };
             match reprobe_in_callers_proc(&real, notif.pid, nofollow, processes) {
                 Some(Ok((callers, real))) => {
@@ -1050,7 +1162,8 @@ async fn on_behalf_open(
                         || real.starts_with("/proc")
                         || crate::procfs::virtual_file(&real.to_string_lossy(), policy).is_some();
                     if served_here {
-                        reopen_existing_on_behalf(probe, real, flags, ctx, pfs, notif, notif_fd).await
+                        reopen_existing_on_behalf(probe, real, flags, ctx, pfs, notif, notif_fd)
+                            .await
                     } else {
                         NotifAction::Continue
                     }
@@ -1059,7 +1172,9 @@ async fn on_behalf_open(
         }
         Err(_) if !has_denied => NotifAction::Continue,
         Err(errno) if errno == libc::ENOENT && (flags & libc::O_CREAT as u64) != 0 => {
-            create_new_on_behalf(base_fd, path, flags, mode, resolve, policy, pfs, processes, notif.pid)
+            create_new_on_behalf(
+                base_fd, path, flags, mode, resolve, policy, pfs, processes, notif.pid,
+            )
         }
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -1165,9 +1280,16 @@ impl NotifPolicy {
     /// whatever the spelling: procfs, which is never a Landlock rule while a
     /// supervisor runs, or a virtualized file inside a read grant.
     pub(crate) fn resolves_opens(&self) -> bool {
-        let granted = |path: &str| self.chroot_readable.iter().any(|g| std::path::Path::new(path).starts_with(g));
+        let granted = |path: &str| {
+            self.chroot_readable
+                .iter()
+                .any(|g| std::path::Path::new(path).starts_with(g))
+        };
         self.chroot_root.is_none()
-            && (self.chroot_readable.iter().chain(&self.chroot_writable)
+            && (self
+                .chroot_readable
+                .iter()
+                .chain(&self.chroot_writable)
                 .any(|p| crate::procfs::is_supervised_proc_grant(p))
                 || crate::procfs::SHADOWED_ETC_FILES
                     .iter()
@@ -1203,7 +1325,11 @@ impl NotifPolicy {
 fn recv_notif(fd: RawFd) -> io::Result<SeccompNotif> {
     let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as libc::Ioctl, &mut notif as *mut _)
+        libc::ioctl(
+            fd,
+            SECCOMP_IOCTL_NOTIF_RECV as libc::Ioctl,
+            &mut notif as *mut _,
+        )
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -1312,11 +1438,15 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
         id,
         flags: SECCOMP_ADDFD_FLAG_SEND,
         srcfd: srcfd as u32,
-        newfd: 0,   // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
+        newfd: 0, // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
         newfd_flags,
     };
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl, &addfd as *const _)
+        libc::ioctl(
+            fd,
+            SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl,
+            &addfd as *const _,
+        )
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -1336,7 +1466,11 @@ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> 
         newfd_flags: 0,
     };
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl, &addfd as *const _)
+        libc::ioctl(
+            fd,
+            SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl,
+            &addfd as *const _,
+        )
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -1348,7 +1482,11 @@ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> 
 /// Raw ioctl to send a notification response.
 fn send_resp_raw(fd: RawFd, resp: &SeccompNotifResp) -> io::Result<()> {
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as libc::Ioctl, resp as *const _)
+        libc::ioctl(
+            fd,
+            SECCOMP_IOCTL_NOTIF_SEND as libc::Ioctl,
+            resp as *const _,
+        )
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -1361,7 +1499,11 @@ fn send_resp_raw(fd: RawFd, resp: &SeccompNotifResp) -> io::Result<()> {
 /// ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id)
 pub(crate) fn id_valid(fd: RawFd, id: u64) -> io::Result<()> {
     let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID as libc::Ioctl, &id as *const _)
+        libc::ioctl(
+            fd,
+            SECCOMP_IOCTL_NOTIF_ID_VALID as libc::Ioctl,
+            &id as *const _,
+        )
     };
     if ret < 0 {
         Err(io::Error::last_os_error())
@@ -1374,7 +1516,11 @@ pub(crate) fn id_valid(fd: RawFd, id: u64) -> io::Result<()> {
 fn try_set_sync_wakeup(fd: RawFd) {
     let flags: u64 = SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP as u64;
     unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SET_FLAGS as libc::Ioctl, &flags as *const _);
+        libc::ioctl(
+            fd,
+            SECCOMP_IOCTL_NOTIF_SET_FLAGS as libc::Ioctl,
+            &flags as *const _,
+        );
     }
 }
 
@@ -1393,9 +1539,7 @@ fn read_child_mem_vm(pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, NotifEr
         iov_base: addr as *mut libc::c_void,
         iov_len: len,
     };
-    let ret = unsafe {
-        libc::process_vm_readv(pid as i32, &local_iov, 1, &remote_iov, 1, 0)
-    };
+    let ret = unsafe { libc::process_vm_readv(pid as i32, &local_iov, 1, &remote_iov, 1, 0) };
     if ret < 0 {
         Err(NotifError::ChildMemoryRead(io::Error::last_os_error()))
     } else {
@@ -1414,9 +1558,7 @@ fn write_child_mem_vm(pid: u32, addr: u64, data: &[u8]) -> Result<(), NotifError
         iov_base: addr as *mut libc::c_void,
         iov_len: data.len(),
     };
-    let ret = unsafe {
-        libc::process_vm_writev(pid as i32, &local_iov, 1, &remote_iov, 1, 0)
-    };
+    let ret = unsafe { libc::process_vm_writev(pid as i32, &local_iov, 1, &remote_iov, 1, 0) };
     if ret < 0 {
         Err(NotifError::ChildMemoryRead(io::Error::last_os_error()))
     } else if (ret as usize) < data.len() {
@@ -1704,15 +1846,19 @@ fn plan_exec_rewrite(
         .iter()
         .enumerate()
         .map(|(i, &p)| (argv_ptr + 8 * i as u64, p))
-        .chain(envp.iter().enumerate().map(|(i, &p)| (envp_ptr + 8 * i as u64, p)))
+        .chain(
+            envp.iter()
+                .enumerate()
+                .map(|(i, &p)| (envp_ptr + 8 * i as u64, p)),
+        )
         .collect();
 
     let mut buf = fd_path.to_vec();
     let mut relocated: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     let relocate = |buf: &mut Vec<u8>,
-                        relocated: &mut std::collections::BTreeMap<u64, u64>,
-                        read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
-                        ptr: u64|
+                    relocated: &mut std::collections::BTreeMap<u64, u64>,
+                    read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
+                    ptr: u64|
      -> Result<(), NotifError> {
         let s = read_exec_cstr(&mut |a, l| read(a, l), ptr)?;
         relocated.insert(ptr, path_ptr + buf.len() as u64);
@@ -1842,15 +1988,17 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
                 Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
             }
         }
-        NotifAction::InjectFdSendTracked { srcfd, newfd_flags, on_success } => {
-            match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
-                Ok(new_fd) => {
-                    (on_success.0)(new_fd);
-                    Ok(())
-                }
-                Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
+        NotifAction::InjectFdSendTracked {
+            srcfd,
+            newfd_flags,
+            on_success,
+        } => match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
+            Ok(new_fd) => {
+                (on_success.0)(new_fd);
+                Ok(())
             }
-        }
+            Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
+        },
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
         NotifAction::Defer(_) | NotifAction::Prepared(_) => {
@@ -1884,7 +2032,11 @@ fn maybe_patch_vdso(pid: i32, procfs: &mut super::state::ProcfsState, policy: &N
     if base == procfs.vdso_patched_addr {
         return; // already patched this vDSO
     }
-    let time_offset = if policy.has_time_start { Some(policy.time_offset) } else { None };
+    let time_offset = if policy.has_time_start {
+        Some(policy.time_offset)
+    } else {
+        None
+    };
     if crate::vdso::patch(pid, time_offset, policy.has_random_seed).is_ok() {
         procfs.vdso_patched_addr = base;
     }
@@ -1939,39 +2091,73 @@ fn syscall_name(nr: i64) -> &'static str {
 fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
     use crate::policy_fn::SyscallCategory;
     match nr {
-        n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 || n == libc::SYS_unlinkat
-            || n == libc::SYS_mkdirat || n == libc::SYS_mknodat || n == libc::SYS_renameat2
-            || n == libc::SYS_symlinkat || n == libc::SYS_linkat
-            || n == libc::SYS_fchmodat || n == arch::SYS_FCHMODAT2 || n == libc::SYS_fchownat
-            || n == libc::SYS_truncate || n == libc::SYS_readlinkat
-            || n == libc::SYS_newfstatat || n == libc::SYS_statx
-            || n == libc::SYS_faccessat || n == libc::SYS_getdents64
+        n if n == libc::SYS_openat
+            || n == arch::SYS_OPENAT2
+            || n == libc::SYS_unlinkat
+            || n == libc::SYS_mkdirat
+            || n == libc::SYS_mknodat
+            || n == libc::SYS_renameat2
+            || n == libc::SYS_symlinkat
+            || n == libc::SYS_linkat
+            || n == libc::SYS_fchmodat
+            || n == arch::SYS_FCHMODAT2
+            || n == libc::SYS_fchownat
+            || n == libc::SYS_truncate
+            || n == libc::SYS_readlinkat
+            || n == libc::SYS_newfstatat
+            || n == libc::SYS_statx
+            || n == libc::SYS_faccessat
+            || n == libc::SYS_getdents64
             || Some(n) == arch::sys_getdents()
-            || Some(n) == arch::sys_open() || Some(n) == arch::sys_mkdir()
+            || Some(n) == arch::sys_open()
+            || Some(n) == arch::sys_mkdir()
             || Some(n) == arch::sys_mknod()
-            || Some(n) == arch::sys_rmdir() || Some(n) == arch::sys_unlink()
-            || Some(n) == arch::sys_symlink() || Some(n) == arch::sys_link()
-            || Some(n) == arch::sys_rename() || Some(n) == arch::sys_renameat()
-            => SyscallCategory::File,
-        n if n == libc::SYS_connect || n == libc::SYS_sendto
-            || n == libc::SYS_sendmsg || n == libc::SYS_sendmmsg
+            || Some(n) == arch::sys_rmdir()
+            || Some(n) == arch::sys_unlink()
+            || Some(n) == arch::sys_symlink()
+            || Some(n) == arch::sys_link()
+            || Some(n) == arch::sys_rename()
+            || Some(n) == arch::sys_renameat() =>
+        {
+            SyscallCategory::File
+        }
+        n if n == libc::SYS_connect
+            || n == libc::SYS_sendto
+            || n == libc::SYS_sendmsg
+            || n == libc::SYS_sendmmsg
             || n == libc::SYS_bind
-            || n == libc::SYS_getsockname => SyscallCategory::Network,
-        n if n == libc::SYS_clone || n == libc::SYS_clone3
-            || Some(n) == arch::sys_vfork() || Some(n) == arch::sys_fork()
-            || n == libc::SYS_execve || n == libc::SYS_execveat => SyscallCategory::Process,
-        n if n == libc::SYS_mmap || n == libc::SYS_munmap
-            || n == libc::SYS_brk || n == libc::SYS_mremap
-            || n == libc::SYS_mprotect
-            => SyscallCategory::Memory,
+            || n == libc::SYS_getsockname =>
+        {
+            SyscallCategory::Network
+        }
+        n if n == libc::SYS_clone
+            || n == libc::SYS_clone3
+            || Some(n) == arch::sys_vfork()
+            || Some(n) == arch::sys_fork()
+            || n == libc::SYS_execve
+            || n == libc::SYS_execveat =>
+        {
+            SyscallCategory::Process
+        }
+        n if n == libc::SYS_mmap
+            || n == libc::SYS_munmap
+            || n == libc::SYS_brk
+            || n == libc::SYS_mremap
+            || n == libc::SYS_mprotect =>
+        {
+            SyscallCategory::Memory
+        }
         _ => SyscallCategory::File, // default
     }
 }
 
 /// Read a NUL-terminated path from child memory (up to PATH_MAX bytes).
 fn read_path_for_event(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
-    if addr == 0 { return None; }
-    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, addr, libc::PATH_MAX as usize).ok()?;
+    if addr == 0 {
+        return None;
+    }
+    let bytes =
+        read_child_mem(notif_fd, notif.id, notif.pid, addr, libc::PATH_MAX as usize).ok()?;
     let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8(bytes[..nul].to_vec()).ok()
 }
@@ -1997,7 +2183,11 @@ fn normalize_path(path: &std::path::Path) -> String {
     }
 
     if normalized.as_os_str().is_empty() {
-        if absolute { "/".into() } else { ".".into() }
+        if absolute {
+            "/".into()
+        } else {
+            ".".into()
+        }
     } else {
         normalized.to_string_lossy().into_owned()
     }
@@ -2088,7 +2278,8 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
         // Legacy single-path variants: mkdir, rmdir, unlink share args[0]=path.
-        n if Some(n) == arch::sys_mkdir() || Some(n) == arch::sys_rmdir()
+        n if Some(n) == arch::sys_mkdir()
+            || Some(n) == arch::sys_rmdir()
             || Some(n) == arch::sys_unlink() =>
         {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
@@ -2146,12 +2337,15 @@ fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Optio
 }
 
 /// Extract the `sun_path` from an `AF_UNIX` sockaddr in child memory.
-fn read_unix_bind_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd)
-    -> Option<std::path::PathBuf>
-{
+fn read_unix_bind_path_for_notif(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+) -> Option<std::path::PathBuf> {
     let addr = notif.data.args[1];
-    let len  = notif.data.args[2] as usize;
-    if addr == 0 || len < 3 { return None; }
+    let len = notif.data.args[2] as usize;
+    if addr == 0 || len < 3 {
+        return None;
+    }
     let bytes = read_child_mem(notif_fd, notif.id, notif.pid, addr, len.min(110)).ok()?;
     crate::network::materialize::named_unix_socket_path(&bytes)
 }
@@ -2159,10 +2353,15 @@ fn read_unix_bind_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd)
 /// Extract IP and port from a sockaddr in child memory. Parsing (including
 /// v4-mapped canonicalization) is shared with the enforcement path so the
 /// policy_fn callback judges the same address the policy layer does.
-fn read_sockaddr_for_event(notif: &SeccompNotif, addr: u64, len: usize, notif_fd: RawFd)
-    -> (Option<std::net::IpAddr>, Option<u16>)
-{
-    if addr == 0 || len < 4 { return (None, None); }
+fn read_sockaddr_for_event(
+    notif: &SeccompNotif,
+    addr: u64,
+    len: usize,
+    notif_fd: RawFd,
+) -> (Option<std::net::IpAddr>, Option<u16>) {
+    if addr == 0 || len < 4 {
+        return (None, None);
+    }
     let bytes = match read_child_mem(notif_fd, notif.id, notif.pid, addr, len.min(128)) {
         Ok(b) => b,
         Err(_) => return (None, None),
@@ -2174,8 +2373,14 @@ fn read_sockaddr_for_event(notif: &SeccompNotif, addr: u64, len: usize, notif_fd
 
 /// Read argv (NULL-terminated array of char* in child memory) for execve.
 /// Capped at 64 entries × 256 bytes/entry as a safety bound.
-fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) -> Option<Vec<String>> {
-    if argv_ptr == 0 { return None; }
+fn read_argv_for_event(
+    notif: &SeccompNotif,
+    argv_ptr: u64,
+    notif_fd: RawFd,
+) -> Option<Vec<String>> {
+    if argv_ptr == 0 {
+        return None;
+    }
     let mut args = Vec::new();
     let ptr_size = std::mem::size_of::<u64>();
 
@@ -2183,7 +2388,9 @@ fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) -> 
         let ptr_addr = argv_ptr + i * ptr_size as u64;
         let ptr_bytes = read_child_mem(notif_fd, notif.id, notif.pid, ptr_addr, ptr_size).ok()?;
         let str_ptr = u64::from_ne_bytes(ptr_bytes[..8].try_into().ok()?);
-        if str_ptr == 0 { break; } // NULL terminator
+        if str_ptr == 0 {
+            break;
+        } // NULL terminator
 
         if let Some(s) = read_path_for_event(notif, str_ptr, notif_fd) {
             args.push(s);
@@ -2192,7 +2399,11 @@ fn read_argv_for_event(notif: &SeccompNotif, argv_ptr: u64, notif_fd: RawFd) -> 
         }
     }
 
-    if args.is_empty() { None } else { Some(args) }
+    if args.is_empty() {
+        None
+    } else {
+        Some(args)
+    }
 }
 
 /// Decode sendmmsg entries 1..vlen into observation-only `SyscallEvent`s.
@@ -2209,17 +2420,25 @@ fn decode_sendmmsg_extras(
     protocol: &Option<String>,
 ) -> Vec<crate::policy_fn::SyscallEvent> {
     let mut extras = Vec::new();
-    if nr != libc::SYS_sendmmsg { return extras; }
+    if nr != libc::SYS_sendmmsg {
+        return extras;
+    }
     let vlen = notif.data.args[2] as usize;
     let base_ptr = notif.data.args[1];
     for i in 1..vlen {
         let entry_ptr = crate::network::materialize::mmsg_entry_ptr(base_ptr, i);
-        let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, entry_ptr, 12) else { continue };
-        if hdr.len() < 12 { continue; }
+        let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, entry_ptr, 12) else {
+            continue;
+        };
+        if hdr.len() < 12 {
+            continue;
+        }
         let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
         let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
         let (host, port) = read_sockaddr_for_event(notif, name_ptr, name_len, notif_fd);
-        if host.is_none() { continue; }
+        if host.is_none() {
+            continue;
+        }
         extras.push(crate::policy_fn::SyscallEvent {
             syscall: name.to_string(),
             category,
@@ -2263,8 +2482,8 @@ async fn emit_policy_event(
         .ok()
         .and_then(crate::seccomp::state::read_ppid)
         .and_then(|p| u32::try_from(p).ok());
-    let event_pid = crate::seccomp::state::read_tgid_of_tid(notif.pid as i32)
-        .map_or(notif.pid, |t| t as u32);
+    let event_pid =
+        crate::seccomp::state::read_tgid_of_tid(notif.pid as i32).map_or(notif.pid, |t| t as u32);
 
     // Extract metadata based on syscall type.
     //
@@ -2299,8 +2518,7 @@ async fn emit_policy_event(
             notif.data.args[1]
         };
         argv = read_argv_for_event(notif, argv_ptr, notif_fd);
-        path = resolve_path_for_notif(notif, notif_fd)
-            .map(std::path::PathBuf::from);
+        path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
     }
 
     let mut protocol = None;
@@ -2311,7 +2529,12 @@ async fn emit_policy_event(
     } else {
         // connect(fd, addr, addrlen) and bind(fd, addr, addrlen): sockaddr in args[1]/args[2].
         if nr == libc::SYS_connect || nr == libc::SYS_bind {
-            let (h, p) = read_sockaddr_for_event(notif, notif.data.args[1], notif.data.args[2] as usize, notif_fd);
+            let (h, p) = read_sockaddr_for_event(
+                notif,
+                notif.data.args[1],
+                notif.data.args[2] as usize,
+                notif_fd,
+            );
             host = h;
             port = p;
         }
@@ -2323,7 +2546,12 @@ async fn emit_policy_event(
 
         // sendto(fd, buf, len, flags, addr, addrlen): sockaddr in args[4]/args[5].
         if nr == libc::SYS_sendto {
-            let (h, p) = read_sockaddr_for_event(notif, notif.data.args[4], notif.data.args[5] as usize, notif_fd);
+            let (h, p) = read_sockaddr_for_event(
+                notif,
+                notif.data.args[4],
+                notif.data.args[5] as usize,
+                notif_fd,
+            );
             host = h;
             port = p;
         }
@@ -2346,17 +2574,21 @@ async fn emit_policy_event(
 
         // Resolve the real socket protocol via SO_PROTOCOL on a dup'd fd.
         // args[0] is the socket fd for connect, sendto, sendmsg, sendmmsg.
-        if nr == libc::SYS_connect || nr == libc::SYS_sendto
-            || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
+        if nr == libc::SYS_connect
+            || nr == libc::SYS_sendto
+            || nr == libc::SYS_sendmsg
+            || nr == libc::SYS_sendmmsg
         {
             if let Ok(sock) = dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
                 use std::os::unix::io::AsRawFd;
-                protocol = crate::network::query_socket_protocol(sock.as_raw_fd())
-                    .map(|p| match p {
+                protocol = crate::network::query_socket_protocol(sock.as_raw_fd()).map(|p| {
+                    match p {
                         crate::network::Protocol::Tcp => "tcp",
                         crate::network::Protocol::Udp => "udp",
                         crate::network::Protocol::Icmp => "icmp",
-                    }.to_string());
+                    }
+                    .to_string()
+                });
             }
         }
     }
@@ -2369,30 +2601,37 @@ async fn emit_policy_event(
     // openat/openat2/open: resolved path + flags.
     if nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open() {
         if let Some(open_args) = decode_open_args(notif, notif_fd) {
-            path = resolve_path_for_notif(notif, notif_fd)
-                .map(std::path::PathBuf::from);
+            path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
             flags = Some(open_args.flags);
         }
     }
 
     // mkdirat, unlinkat, symlinkat, truncate, mknodat: single resolved path.
     // renameat2, linkat (and their legacy equivalents): src path + dst path2.
-    let is_fs_mutating = nr == libc::SYS_mkdirat || nr == libc::SYS_mknodat
+    let is_fs_mutating = nr == libc::SYS_mkdirat
+        || nr == libc::SYS_mknodat
         || nr == libc::SYS_unlinkat
-        || nr == libc::SYS_symlinkat || nr == libc::SYS_truncate
-        || nr == libc::SYS_renameat2 || nr == libc::SYS_linkat
-        || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_mknod()
+        || nr == libc::SYS_symlinkat
+        || nr == libc::SYS_truncate
+        || nr == libc::SYS_renameat2
+        || nr == libc::SYS_linkat
+        || Some(nr) == arch::sys_mkdir()
+        || Some(nr) == arch::sys_mknod()
         || Some(nr) == arch::sys_rmdir()
-        || Some(nr) == arch::sys_unlink() || Some(nr) == arch::sys_symlink()
-        || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename()
+        || Some(nr) == arch::sys_unlink()
+        || Some(nr) == arch::sys_symlink()
+        || Some(nr) == arch::sys_link()
+        || Some(nr) == arch::sys_rename()
         || Some(nr) == arch::sys_renameat();
     if is_fs_mutating {
         path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
         path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
     }
 
-    let sock_fd = if nr == libc::SYS_connect || nr == libc::SYS_sendto
-        || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
+    let sock_fd = if nr == libc::SYS_connect
+        || nr == libc::SYS_sendto
+        || nr == libc::SYS_sendmsg
+        || nr == libc::SYS_sendmmsg
         || nr == libc::SYS_bind
     {
         Some(notif.data.args[0] as i64)
@@ -2418,15 +2657,27 @@ async fn emit_policy_event(
     };
 
     let sendmmsg_extras = if let NotifAction::Prepared(operation) = action {
-        operation.extra_destinations.iter().map(|&(host, port)| {
-            let mut extra = event.clone();
-            extra.host = host;
-            extra.port = port;
-            extra
-        }).collect()
+        operation
+            .extra_destinations
+            .iter()
+            .map(|&(host, port)| {
+                let mut extra = event.clone();
+                extra.host = host;
+                extra.port = port;
+                extra
+            })
+            .collect()
     } else {
         decode_sendmmsg_extras(
-            notif, notif_fd, nr, name, category, event_pid, parent_pid, denied, &event.protocol,
+            notif,
+            notif_fd,
+            nr,
+            name,
+            category,
+            event_pid,
+            parent_pid,
+            denied,
+            &event.protocol,
         )
     };
 
@@ -2437,32 +2688,40 @@ async fn emit_policy_event(
     // The child is blocked until the callback returns. Filesystem-mutation
     // events (mkdir/unlink/symlink/link/rename/truncate) are observation-only
     // per the `PolicyCallback` contract; use `fs_deny` to block paths.
-    let is_held = nr == libc::SYS_execve || nr == libc::SYS_execveat
-        || nr == libc::SYS_openat || nr == arch::SYS_OPENAT2
+    let is_held = nr == libc::SYS_execve
+        || nr == libc::SYS_execveat
+        || nr == libc::SYS_openat
+        || nr == arch::SYS_OPENAT2
         || Some(nr) == arch::sys_open()
-        || nr == libc::SYS_connect || nr == libc::SYS_bind
-        || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg
+        || nr == libc::SYS_connect
+        || nr == libc::SYS_bind
+        || nr == libc::SYS_sendto
+        || nr == libc::SYS_sendmsg
         || nr == libc::SYS_sendmmsg;
 
     let verdict = if is_held {
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
-            event,
-            gate: Some(gate_tx),
-        }));
+        let _ = tx.send(crate::policy_fn::PolicyMsg::Event(
+            crate::policy_fn::PolicyEvent {
+                event,
+                gate: Some(gate_tx),
+            },
+        ));
         Some(crate::policy_fn::wait_for_verdict(gate_rx, timeout, &cancellation).await)
     } else {
-        let _ = tx.send(crate::policy_fn::PolicyMsg::Event(crate::policy_fn::PolicyEvent {
-            event,
-            gate: None,
-        }));
+        let _ = tx.send(crate::policy_fn::PolicyMsg::Event(
+            crate::policy_fn::PolicyEvent { event, gate: None },
+        ));
         None
     };
     // Emit the remaining sendmmsg destinations as observation-only events.
     // The verdict above already covers the whole syscall; gate: None is correct.
     for extra in sendmmsg_extras {
         let _ = tx.send(crate::policy_fn::PolicyMsg::Event(
-            crate::policy_fn::PolicyEvent { event: extra, gate: None },
+            crate::policy_fn::PolicyEvent {
+                event: extra,
+                gate: None,
+            },
         ));
     }
 
@@ -2610,10 +2869,7 @@ async fn handle_notification(
         && policy.argv_safety_required
         && crate::freeze::requires_freeze_on_continue(nr)
     {
-        match crate::freeze::freeze_sandbox_for_execve(
-            &ctx.processes,
-            notif.pid as i32,
-        ) {
+        match crate::freeze::freeze_sandbox_for_execve(&ctx.processes, notif.pid as i32) {
             Ok(outcome) => {
                 exec_freeze = Some(outcome);
             }
@@ -2642,8 +2898,12 @@ async fn handle_notification(
     if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
         use crate::policy_fn::Verdict;
         match verdict {
-            Verdict::Deny => { action = NotifAction::Errno(libc::EPERM); }
-            Verdict::DenyWith(errno) => { action = NotifAction::Errno(errno); }
+            Verdict::Deny => {
+                action = NotifAction::Errno(libc::EPERM);
+            }
+            Verdict::DenyWith(errno) => {
+                action = NotifAction::Errno(errno);
+            }
             Verdict::Audit => { /* allow, but could log here */ }
             Verdict::Allow => {}
         }
@@ -2768,16 +3028,14 @@ pub async fn supervisor(
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
-    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-        notif_fd,
-        tokio::io::Interest::READABLE,
-    ) {
-        Ok(fd) => fd,
-        Err(err) => {
-            let _ = startup.send(Err(err));
-            return;
-        }
-    };
+    let async_fd =
+        match tokio::io::unix::AsyncFd::with_interest(notif_fd, tokio::io::Interest::READABLE) {
+            Ok(fd) => fd,
+            Err(err) => {
+                let _ = startup.send(Err(err));
+                return;
+            }
+        };
     let fd = async_fd.get_ref().as_raw_fd();
 
     // Build the dispatch table once at startup.
@@ -2882,20 +3140,18 @@ pub(crate) fn spawn_pid_watcher(
     pidfd: Arc<std::os::unix::io::OwnedFd>,
 ) {
     tokio::spawn(async move {
-        let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-            pidfd,
-            tokio::io::Interest::READABLE,
-        ) {
-            Ok(f) => f,
-            Err(_) => {
-                // AsyncFd registration failed (extremely unusual);
-                // fall back to immediate cleanup so we don't leak the
-                // index entry. The process is still alive, so its slot
-                // stays held until `release_exited_slots` sees it die.
-                cleanup_pid(&ctx, key).await;
-                return;
-            }
-        };
+        let async_fd =
+            match tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE) {
+                Ok(f) => f,
+                Err(_) => {
+                    // AsyncFd registration failed (extremely unusual);
+                    // fall back to immediate cleanup so we don't leak the
+                    // index entry. The process is still alive, so its slot
+                    // stays held until `release_exited_slots` sees it die.
+                    cleanup_pid(&ctx, key).await;
+                    return;
+                }
+            };
         // pidfd becomes readable when the process exits; we don't
         // read any data, so `readable()` is just an await point.
         let _ = async_fd.readable().await;
@@ -2940,29 +3196,47 @@ mod tests {
     fn fifo_writer_probe_sees_a_writer_and_consumes_nothing() {
         use std::os::unix::io::FromRawFd;
         let dir = tempfile::TempDir::new().unwrap();
-        let fifo = std::ffi::CString::new(dir.path().join("f").as_os_str().as_encoded_bytes()).unwrap();
+        let fifo =
+            std::ffi::CString::new(dir.path().join("f").as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let raw = unsafe { libc::open(fifo.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         let pinned = unsafe { OwnedFd::from_raw_fd(raw) };
 
         assert!(blocks_until_a_partner_opens(&pinned, libc::O_RDONLY));
         assert!(blocks_until_a_partner_opens(&pinned, libc::O_WRONLY));
-        assert!(!blocks_until_a_partner_opens(&pinned, libc::O_RDONLY | libc::O_NONBLOCK));
+        assert!(!blocks_until_a_partner_opens(
+            &pinned,
+            libc::O_RDONLY | libc::O_NONBLOCK
+        ));
         assert!(!blocks_until_a_partner_opens(&pinned, libc::O_RDWR));
 
-        assert_eq!(reopen_pinned(&pinned, libc::O_WRONLY | libc::O_NONBLOCK).err(), Some(libc::ENXIO));
+        assert_eq!(
+            reopen_pinned(&pinned, libc::O_WRONLY | libc::O_NONBLOCK).err(),
+            Some(libc::ENXIO)
+        );
         let reader = reopen_pinned(&pinned, libc::O_RDONLY | libc::O_NONBLOCK).unwrap();
         assert_eq!(fifo_has_writer(&reader), Ok(false));
 
         let writer = reopen_pinned(&pinned, libc::O_WRONLY | libc::O_NONBLOCK).unwrap();
-        assert_eq!(fifo_has_writer(&reader), Ok(true), "an empty FIFO with a writer");
+        assert_eq!(
+            fifo_has_writer(&reader),
+            Ok(true),
+            "an empty FIFO with a writer"
+        );
 
-        assert_eq!(unsafe { libc::write(writer.as_raw_fd(), b"data".as_ptr().cast(), 4) }, 4);
+        assert_eq!(
+            unsafe { libc::write(writer.as_raw_fd(), b"data".as_ptr().cast(), 4) },
+            4
+        );
         assert_eq!(fifo_has_writer(&reader), Ok(true));
         clear_nonblock(&reader);
         let mut buf = [0u8; 8];
         let n = unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        assert_eq!(&buf[..n as usize], b"data", "the probe should leave the data in the FIFO");
+        assert_eq!(
+            &buf[..n as usize],
+            b"data",
+            "the probe should leave the data in the FIFO"
+        );
 
         drop(writer);
         assert_eq!(fifo_has_writer(&reader), Ok(false));
@@ -3181,7 +3455,11 @@ mod tests {
         let dup = dup_fd_from_pid(worker_tid, fd);
         done_tx.send(()).ok();
         h.join().unwrap();
-        assert!(dup.is_ok(), "dup_fd_from_pid for a worker-thread fd failed: {:?}", dup.err());
+        assert!(
+            dup.is_ok(),
+            "dup_fd_from_pid for a worker-thread fd failed: {:?}",
+            dup.err()
+        );
     }
 
     #[test]
@@ -3197,10 +3475,22 @@ mod tests {
         // Ensure all variants implement Debug.
         let _ = format!("{:?}", NotifAction::Continue);
         let _ = format!("{:?}", NotifAction::Errno(1));
-        let _ = format!("{:?}", NotifAction::InjectFd { srcfd: 3, targetfd: 4 });
+        let _ = format!(
+            "{:?}",
+            NotifAction::InjectFd {
+                srcfd: 3,
+                targetfd: 4
+            }
+        );
         // Use a real fd (dup'd from stderr) so OwnedFd can safely close it.
         let test_fd = unsafe { OwnedFd::from_raw_fd(libc::dup(2)) };
-        let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: test_fd, newfd_flags: 0 });
+        let _ = format!(
+            "{:?}",
+            NotifAction::InjectFdSend {
+                srcfd: test_fd,
+                newfd_flags: 0
+            }
+        );
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
         let _ = format!("{:?}", NotifAction::KillGroup { sig: 9, pgid: 1 });
@@ -3220,7 +3510,9 @@ mod tests {
             tokio::task::yield_now().await; // hold the !Sync Cell across await
             NotifAction::ReturnValue(counter.get() + 1)
         });
-        let NotifAction::Defer(d) = action else { panic!("expected Defer") };
+        let NotifAction::Defer(d) = action else {
+            panic!("expected Defer")
+        };
         assert!(matches!(d.run().await, NotifAction::ReturnValue(42)));
     }
 
@@ -3262,7 +3554,10 @@ mod tests {
         let nested = NotifAction::defer(async { NotifAction::Continue });
         assert!(matches!(finalize_deferred(nested), NotifAction::Errno(e) if e == libc::EIO));
         // Non-nested terminal actions pass through unchanged.
-        assert!(matches!(finalize_deferred(NotifAction::Continue), NotifAction::Continue));
+        assert!(matches!(
+            finalize_deferred(NotifAction::Continue),
+            NotifAction::Continue
+        ));
         assert!(matches!(
             finalize_deferred(NotifAction::ReturnValue(3)),
             NotifAction::ReturnValue(3)
@@ -3415,7 +3710,10 @@ mod tests {
         // The write landed at the target address (page is still RO-mapped, so a
         // plain read is fine and reflects the COW'd contents).
         let got = unsafe { std::slice::from_raw_parts(addr as *const u8, newb.len()) };
-        assert_eq!(got, newb, "forced write must be visible at the target address");
+        assert_eq!(
+            got, newb,
+            "forced write must be visible at the target address"
+        );
 
         unsafe { libc::munmap(addr, PAGE) };
     }
@@ -3429,7 +3727,7 @@ mod tests {
             deny_all: false,
         };
         assert!(!policy.allows("10.1.2.3".parse().unwrap(), 443)); // denied
-        assert!(policy.allows("8.8.8.8".parse().unwrap(), 443));   // allowed
+        assert!(policy.allows("8.8.8.8".parse().unwrap(), 443)); // allowed
     }
 
     #[test]
@@ -3442,7 +3740,7 @@ mod tests {
             deny_all: false,
         };
         assert!(!policy.allows("8.8.8.8".parse().unwrap(), 25)); // denied
-        assert!(policy.allows("8.8.8.8".parse().unwrap(), 80));  // allowed
+        assert!(policy.allows("8.8.8.8".parse().unwrap(), 80)); // allowed
     }
 
     #[test]
@@ -3451,12 +3749,15 @@ mod tests {
         let mut ports = HashSet::new();
         ports.insert(443u16);
         let policy = NetworkPolicy::DenyList {
-            cidrs: vec![(IpCidr::parse("1.2.3.4/32").unwrap(), PortAllow::Specific(ports))],
+            cidrs: vec![(
+                IpCidr::parse("1.2.3.4/32").unwrap(),
+                PortAllow::Specific(ports),
+            )],
             any_ip_ports: HashSet::new(),
             deny_all: false,
         };
         assert!(!policy.allows("1.2.3.4".parse().unwrap(), 443)); // denied
-        assert!(policy.allows("1.2.3.4".parse().unwrap(), 80));   // allowed
+        assert!(policy.allows("1.2.3.4".parse().unwrap(), 80)); // allowed
     }
 
     #[test]
@@ -3466,12 +3767,15 @@ mod tests {
         ports.insert(80u16);
         let policy = NetworkPolicy::AllowList {
             per_ip: HashMap::new(),
-            cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Specific(ports))],
+            cidrs: vec![(
+                IpCidr::parse("10.0.0.0/8").unwrap(),
+                PortAllow::Specific(ports),
+            )],
             any_ip_ports: HashSet::new(),
         };
-        assert!(policy.allows("10.1.2.3".parse().unwrap(), 80));   // in range, port ok
+        assert!(policy.allows("10.1.2.3".parse().unwrap(), 80)); // in range, port ok
         assert!(!policy.allows("10.1.2.3".parse().unwrap(), 443)); // in range, wrong port
-        assert!(!policy.allows("8.8.8.8".parse().unwrap(), 80));   // out of range
+        assert!(!policy.allows("8.8.8.8".parse().unwrap(), 80)); // out of range
     }
 
     #[test]
@@ -3483,7 +3787,7 @@ mod tests {
             any_ip_ports: HashSet::new(),
         };
         assert!(policy.allows("192.168.5.5".parse().unwrap(), 9999)); // any port in range
-        assert!(!policy.allows("10.0.0.1".parse().unwrap(), 9999));   // out of range
+        assert!(!policy.allows("10.0.0.1".parse().unwrap(), 9999)); // out of range
     }
 
     #[test]

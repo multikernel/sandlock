@@ -21,13 +21,13 @@
 //     supervisor opened from its own copy of the path, so a later swap of
 //     the string in child memory changes nothing.
 
-pub(crate) mod net;
-mod sock_diag;
-pub(crate) mod net_dispatch;
 mod metadata;
+pub(crate) mod net;
+pub(crate) mod net_dispatch;
 mod net_metadata;
-pub(crate) use net_dispatch::{handle_net_open, handle_net_directory};
+mod sock_diag;
 pub(crate) use metadata::handle_pinned_metadata;
+pub(crate) use net_dispatch::{handle_net_directory, handle_net_open};
 pub(crate) use net_metadata::handle_net_metadata;
 
 use std::collections::HashSet;
@@ -210,9 +210,11 @@ pub(crate) async fn render_virtual_file(
         // The real file names the host's slice and scope. This is what a
         // task sees from inside a cgroup namespace of its own.
         VirtualFile::Cgroup => b"0::/\n".to_vec(),
-        VirtualFile::Hostname => {
-            format!("{}\n", policy.virtual_hostname.as_deref().unwrap_or_default()).into_bytes()
-        }
+        VirtualFile::Hostname => format!(
+            "{}\n",
+            policy.virtual_hostname.as_deref().unwrap_or_default()
+        )
+        .into_bytes(),
         VirtualFile::EtcHosts => policy.virtual_etc_hosts.clone().into_bytes(),
     }
 }
@@ -267,7 +269,11 @@ const EXP_15: f64 = 0.9944598480048967; // e^(-1/180)
 
 impl LoadAvg {
     pub fn new() -> Self {
-        Self { avg_1: 0.0, avg_5: 0.0, avg_15: 0.0 }
+        Self {
+            avg_1: 0.0,
+            avg_5: 0.0,
+            avg_15: 0.0,
+        }
     }
 
     /// Update averages with current runnable process count.
@@ -285,8 +291,11 @@ impl LoadAvg {
 pub(crate) fn generate_loadavg(load: &LoadAvg, running: u32, total: u32, last_pid: i32) -> Vec<u8> {
     format!(
         "{:.2} {:.2} {:.2} {}/{} {}\n",
-        load.avg_1, load.avg_5, load.avg_15,
-        running.max(1).min(total), total,
+        load.avg_1,
+        load.avg_5,
+        load.avg_15,
+        running.max(1).min(total),
+        total,
         last_pid.max(0),
     )
     .into_bytes()
@@ -329,29 +338,29 @@ fn detect_fstype(path: &std::path::Path) -> &'static str {
     // Map f_type magic to filesystem name.
     // Values from linux/magic.h and statfs(2).
     match buf.f_type {
-        0xEF53 => "ext4",            // EXT2/3/4_SUPER_MAGIC
-        0x9123683E => "btrfs",        // BTRFS_SUPER_MAGIC
-        0x58465342 => "xfs",          // XFS_SUPER_MAGIC
-        0x01021994 => "tmpfs",        // TMPFS_MAGIC
-        0x6969 => "nfs",              // NFS_SUPER_MAGIC
-        0x5346544E => "ntfs",         // NTFS_SB_MAGIC
-        0x65735546 => "fuse",         // FUSE_SUPER_MAGIC
-        0x28cd3d45 => "cramfs",       // CRAMFS_MAGIC
-        0x3153464A => "jfs",          // JFS_SUPER_MAGIC
-        0x52654973 => "reiserfs",     // REISERFS_SUPER_MAGIC
-        0xF2F52010 => "f2fs",         // F2FS_SUPER_MAGIC
-        0x4244 => "hfs",              // HFS_SUPER_MAGIC
-        0x482B => "hfsplus",          // HFSPLUS_SUPER_MAGIC
-        0x1021997 => "v9fs",          // V9FS_MAGIC
-        0xFF534D42 => "cifs",         // CIFS_SUPER_MAGIC
-        0x73717368 => "squashfs",     // SQUASHFS_MAGIC
-        0x62656572 => "sysfs",        // SYSFS_MAGIC
-        0x9FA0 => "proc",            // PROC_SUPER_MAGIC
-        0x61756673 => "aufs",         // AUFS_SUPER_MAGIC
-        0x794C7630 => "overlayfs",    // OVERLAYFS_SUPER_MAGIC
-        0x01161970 => "gfs2",         // GFS2_MAGIC
-        0x5A4F4653 => "zonefs",       // ZONEFS_MAGIC
-        0xCAFE001 => "bcachefs",      // BCACHEFS_SUPER_MAGIC (approximation)
+        0xEF53 => "ext4",          // EXT2/3/4_SUPER_MAGIC
+        0x9123683E => "btrfs",     // BTRFS_SUPER_MAGIC
+        0x58465342 => "xfs",       // XFS_SUPER_MAGIC
+        0x01021994 => "tmpfs",     // TMPFS_MAGIC
+        0x6969 => "nfs",           // NFS_SUPER_MAGIC
+        0x5346544E => "ntfs",      // NTFS_SB_MAGIC
+        0x65735546 => "fuse",      // FUSE_SUPER_MAGIC
+        0x28cd3d45 => "cramfs",    // CRAMFS_MAGIC
+        0x3153464A => "jfs",       // JFS_SUPER_MAGIC
+        0x52654973 => "reiserfs",  // REISERFS_SUPER_MAGIC
+        0xF2F52010 => "f2fs",      // F2FS_SUPER_MAGIC
+        0x4244 => "hfs",           // HFS_SUPER_MAGIC
+        0x482B => "hfsplus",       // HFSPLUS_SUPER_MAGIC
+        0x1021997 => "v9fs",       // V9FS_MAGIC
+        0xFF534D42 => "cifs",      // CIFS_SUPER_MAGIC
+        0x73717368 => "squashfs",  // SQUASHFS_MAGIC
+        0x62656572 => "sysfs",     // SYSFS_MAGIC
+        0x9FA0 => "proc",          // PROC_SUPER_MAGIC
+        0x61756673 => "aufs",      // AUFS_SUPER_MAGIC
+        0x794C7630 => "overlayfs", // OVERLAYFS_SUPER_MAGIC
+        0x01161970 => "gfs2",      // GFS2_MAGIC
+        0x5A4F4653 => "zonefs",    // ZONEFS_MAGIC
+        0xCAFE001 => "bcachefs",   // BCACHEFS_SUPER_MAGIC (approximation)
         _ => "unknown",
     }
 }
@@ -384,10 +393,17 @@ pub(crate) fn generate_proc_mounts(
 
     if let Some(root) = chroot_root {
         let fstype = detect_fstype(root);
-        let opts = if root_ro { "ro,relatime" } else { "rw,relatime" };
+        let opts = if root_ro {
+            "ro,relatime"
+        } else {
+            "rw,relatime"
+        };
         buf.push_str(&format!("sandlock / {} {} 0 0\n", fstype, opts));
     } else {
-        buf.push_str(&format!("rootfs / rootfs {} 0 0\n", if root_ro { "ro" } else { "rw" }));
+        buf.push_str(&format!(
+            "rootfs / rootfs {} 0 0\n",
+            if root_ro { "ro" } else { "rw" }
+        ));
     }
 
     for (virtual_path, host_path) in chroot_mounts {
@@ -416,16 +432,22 @@ pub(crate) fn generate_proc_mountinfo(
 ) -> Vec<u8> {
     let mut buf = String::new();
     let mut mount_id: u32 = 20;
-    let (root_opts, root_super) = if root_ro { ("ro,relatime", "ro") } else { ("rw,relatime", "rw") };
+    let (root_opts, root_super) = if root_ro {
+        ("ro,relatime", "ro")
+    } else {
+        ("rw,relatime", "rw")
+    };
 
     if let Some(root) = chroot_root {
         let fstype = detect_fstype(root);
         buf.push_str(&format!(
-            "{} 1 8:1 / / {} - {} sandlock {}\n", mount_id, root_opts, fstype, root_super
+            "{} 1 8:1 / / {} - {} sandlock {}\n",
+            mount_id, root_opts, fstype, root_super
         ));
     } else {
         buf.push_str(&format!(
-            "{} 1 0:1 / / {} - rootfs rootfs {}\n", mount_id, root_super, root_super
+            "{} 1 0:1 / / {} - rootfs rootfs {}\n",
+            mount_id, root_super, root_super
         ));
     }
     mount_id += 1;
@@ -439,7 +461,8 @@ pub(crate) fn generate_proc_mountinfo(
             ("rw,relatime", "rw")
         };
         buf.push_str(&format!(
-            "{} 20 8:1 / {} {} - {} sandlock {}\n", mount_id, vp, opts, fstype, sup
+            "{} 20 8:1 / {} {} - {} sandlock {}\n",
+            mount_id, vp, opts, fstype, sup
         ));
         mount_id += 1;
     }
@@ -457,7 +480,8 @@ pub(crate) fn generate_proc_mountstats(
 
     match chroot_root {
         Some(root) => buf.push_str(&format!(
-            "device sandlock mounted on / with fstype {}\n", detect_fstype(root)
+            "device sandlock mounted on / with fstype {}\n",
+            detect_fstype(root)
         )),
         None => buf.push_str("device rootfs mounted on / with fstype rootfs\n"),
     }
@@ -475,7 +499,10 @@ pub(crate) fn generate_proc_mountstats(
 
 fn inject_memfd(content: &[u8]) -> NotifAction {
     match content_memfd(content, true) {
-        Ok(fd) => NotifAction::InjectFdSend { srcfd: fd, newfd_flags: libc::O_CLOEXEC as u32 },
+        Ok(fd) => NotifAction::InjectFdSend {
+            srcfd: fd,
+            newfd_flags: libc::O_CLOEXEC as u32,
+        },
         Err(_) => NotifAction::Continue, // fallback: let real open proceed
     }
 }
@@ -497,7 +524,9 @@ pub(crate) async fn handle_proc_open(
     resource: &Arc<Mutex<crate::seccomp::state::ResourceState>>,
     policy: &NotifPolicy,
 ) -> NotifAction {
-    let Some(path) = open.target_str() else { return NotifAction::Continue };
+    let Some(path) = open.target_str() else {
+        return NotifAction::Continue;
+    };
 
     if is_hidden_proc_path(path, processes) {
         return NotifAction::Errno(EACCES);
@@ -550,26 +579,41 @@ pub(crate) fn proc_open_is_write(flags: u64) -> bool {
 
 /// These opens cannot safely borrow the supervisor's credentials.
 pub(crate) fn is_opener_sensitive_proc(path: &std::path::Path, flags: u64) -> bool {
-    let Ok(relative) = path.strip_prefix("/proc") else { return false };
-    if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| OPENER_PRIVILEGED_FILES.contains(&name)) {
+    let Ok(relative) = path.strip_prefix("/proc") else {
+        return false;
+    };
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| OPENER_PRIVILEGED_FILES.contains(&name))
+    {
         return true;
     }
     if !proc_open_is_write(flags) {
         return false;
     }
     let mut parts = relative.iter().filter_map(|part| part.to_str());
-    let Some(task) = parts.next() else { return false };
+    let Some(task) = parts.next() else {
+        return false;
+    };
     if task != "self" && task != "thread-self" && task.parse::<u32>().is_err() {
         return false;
     }
     let mut entry = parts.next();
     if entry == Some("task") {
-        if parts.next().and_then(|tid| tid.parse::<u32>().ok()).is_none() {
+        if parts
+            .next()
+            .and_then(|tid| tid.parse::<u32>().ok())
+            .is_none()
+        {
             return false;
         }
         entry = parts.next();
     }
-    matches!(entry, Some("mem" | "attr" | "uid_map" | "gid_map" | "setgroups" | "projid_map"))
+    matches!(
+        entry,
+        Some("mem" | "attr" | "uid_map" | "gid_map" | "setgroups" | "projid_map")
+    )
 }
 
 /// True for a grant the supervisor serves instead of Landlock. A rule
@@ -590,9 +634,10 @@ struct OwnProcTarget<'a> {
 
 impl OwnProcTarget<'_> {
     fn is_under_any(&self, list: &[std::path::PathBuf]) -> bool {
-        self.self_forms
-            .iter()
-            .any(|form| list.iter().any(|entry| std::path::Path::new(form).starts_with(entry)))
+        self.self_forms.iter().any(|form| {
+            list.iter()
+                .any(|entry| std::path::Path::new(form).starts_with(entry))
+        })
     }
 }
 
@@ -622,13 +667,19 @@ fn own_proc_target(path: &str, tid: i32, tgid: i32) -> Option<OwnProcTarget<'_>>
     if let Some(thread_rest) = strip_dir_prefix(rest, &format!("/task/{}", tid)) {
         self_forms.push(format!("{}{}", PROC_THREAD_SELF, thread_rest));
     }
-    Some(OwnProcTarget { base: own, rest, self_forms })
+    Some(OwnProcTarget {
+        base: own,
+        rest,
+        self_forms,
+    })
 }
 
 /// The pid-free spellings of a path inside the caller's own /proc directory,
 /// which are the only ones a grant or a deny can name. Empty for any other path.
 pub(crate) fn own_proc_self_forms(path: &str, tid: i32, tgid: i32) -> Vec<String> {
-    let mut forms = own_proc_target(path, tid, tgid).map(|target| target.self_forms).unwrap_or_default();
+    let mut forms = own_proc_target(path, tid, tgid)
+        .map(|target| target.self_forms)
+        .unwrap_or_default();
     // /proc/net is a link into the caller's directory, and a policy may name it.
     if let Some(("net", tail)) = proc_namespace_entry(path) {
         forms.push(format!("/proc/net{}", tail));
@@ -683,7 +734,10 @@ pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
         None => target.rest.strip_prefix('/')?,
     };
     let fd = rest.strip_prefix("fd/")?;
-    fd.bytes().all(|b| b.is_ascii_digit()).then(|| fd.parse().ok()).flatten()
+    fd.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| fd.parse().ok())
+        .flatten()
 }
 
 /// Serve a policy-listed open inside the caller's own /proc directory.
@@ -735,7 +789,10 @@ fn open_own_proc_on_behalf(
 
     let base = CString::new(target.base).ok()?;
     let base_fd = unsafe {
-        libc::open(base.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        libc::open(
+            base.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
     };
     if base_fd < 0 {
         return None;
@@ -808,11 +865,7 @@ pub(crate) fn handle_sched_getaffinity(
 /// uname(buf) writes a `struct utsname` to buf. We call the real uname()
 /// in the supervisor, patch the nodename field, and write the result to
 /// the child's buffer.
-pub(crate) fn handle_uname(
-    notif: &SeccompNotif,
-    hostname: &str,
-    notif_fd: RawFd,
-) -> NotifAction {
+pub(crate) fn handle_uname(notif: &SeccompNotif, hostname: &str, notif_fd: RawFd) -> NotifAction {
     let buf_addr = notif.data.args[0];
     if buf_addr == 0 {
         return NotifAction::Continue;
@@ -857,7 +910,10 @@ pub(crate) fn handle_hostname_open(open: &OpenRequest, hostname: &str) -> Option
 /// Answer an open of /etc/hosts with the virtual file: a fixed loopback view
 /// plus the hostnames pre-resolved from `net_allow`, so the host's own file
 /// never leaks in and glibc's `files` backend resolves allowed names.
-pub(crate) fn handle_etc_hosts_open(open: &OpenRequest, etc_hosts_content: &str) -> Option<NotifAction> {
+pub(crate) fn handle_etc_hosts_open(
+    open: &OpenRequest,
+    etc_hosts_content: &str,
+) -> Option<NotifAction> {
     if open.target.as_deref() != Some(std::path::Path::new("/etc/hosts")) {
         return None;
     }
@@ -944,7 +1000,10 @@ pub(crate) fn joined_absolute(
         // and it is already virtual. Falling back to the kernel's is right
         // only for a task that has never moved, which is when nothing is
         // tracked.
-        let base = match i32::try_from(pid).ok().and_then(|p| processes.virtual_cwd(p)) {
+        let base = match i32::try_from(pid)
+            .ok()
+            .and_then(|p| processes.virtual_cwd(p))
+        {
             Some(tracked) => tracked,
             None => to_virtual(std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()?),
         };
@@ -964,7 +1023,10 @@ fn through_task_root_and_cwd(
     processes: &ProcessIndex,
 ) -> std::path::PathBuf {
     for _ in 0..8 {
-        let Some((task, rest)) = path.to_str().and_then(|p| p.strip_prefix("/proc/")?.split_once('/')) else {
+        let Some((task, rest)) = path
+            .to_str()
+            .and_then(|p| p.strip_prefix("/proc/")?.split_once('/'))
+        else {
             break;
         };
         let pid = match task {
@@ -1039,7 +1101,9 @@ pub(crate) async fn handle_sorted_getdents(
         let mut names: Vec<_> = Vec::new();
         {
             use std::os::unix::fs::MetadataExt;
-            let dot_ino = std::fs::symlink_metadata(&dir_path).map(|m| m.ino()).unwrap_or(0);
+            let dot_ino = std::fs::symlink_metadata(&dir_path)
+                .map(|m| m.ino())
+                .unwrap_or(0);
             let dotdot_ino = dir_path
                 .parent()
                 .and_then(|p| std::fs::symlink_metadata(p).ok())
@@ -1049,21 +1113,19 @@ pub(crate) async fn handle_sorted_getdents(
             names.push(("..".to_string(), DT_DIR, dotdot_ino));
         }
 
-        names.extend(dir
-            .filter_map(|e| e.ok())
-            .map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let d_type = match e.file_type() {
-                    Ok(ft) if ft.is_dir() => DT_DIR,
-                    Ok(ft) if ft.is_symlink() => DT_LNK,
-                    _ => DT_REG,
-                };
-                let d_ino = {
-                    use std::os::linux::fs::MetadataExt;
-                    e.metadata().map(|m| m.st_ino()).unwrap_or(0)
-                };
-                (name, d_type, d_ino)
-            }));
+        names.extend(dir.filter_map(|e| e.ok()).map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let d_type = match e.file_type() {
+                Ok(ft) if ft.is_dir() => DT_DIR,
+                Ok(ft) if ft.is_symlink() => DT_LNK,
+                _ => DT_REG,
+            };
+            let d_ino = {
+                use std::os::linux::fs::MetadataExt;
+                e.metadata().map(|m| m.st_ino()).unwrap_or(0)
+            };
+            (name, d_type, d_ino)
+        }));
 
         names.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1323,15 +1385,24 @@ mod tests {
         assert_eq!(target.self_forms, ["/proc/self/maps"]);
 
         let target = own_proc_target("/proc/thread-self/stat", 12, 10).unwrap();
-        assert_eq!((target.base.as_str(), target.rest), ("/proc/10/task/12", "/stat"));
-        assert_eq!(target.self_forms, ["/proc/thread-self/stat", "/proc/self/task/12/stat"]);
+        assert_eq!(
+            (target.base.as_str(), target.rest),
+            ("/proc/10/task/12", "/stat")
+        );
+        assert_eq!(
+            target.self_forms,
+            ["/proc/thread-self/stat", "/proc/self/task/12/stat"]
+        );
 
         // What a dirfd on /proc/self reads back as.
         let target = own_proc_target("/proc/10/maps", 12, 10).unwrap();
         assert_eq!(target.self_forms, ["/proc/self/maps"]);
 
         let target = own_proc_target("/proc/self", 10, 10).unwrap();
-        assert_eq!((target.rest, target.self_forms[0].as_str()), ("", "/proc/self"));
+        assert_eq!(
+            (target.rest, target.self_forms[0].as_str()),
+            ("", "/proc/self")
+        );
 
         assert_eq!(own_proc_target("/proc/11/maps", 12, 10), None);
         assert_eq!(own_proc_target("/proc/100/maps", 12, 10), None);
@@ -1366,7 +1437,9 @@ mod tests {
         assert_eq!(own_fd_request("/proc/self/fd/-1", 12, 10), None);
         assert_eq!(own_fd_request("/proc/self/fdinfo/0", 12, 10), None);
         assert_eq!(own_fd_request("/tmp/fd/0", 12, 10), None);
-        if std::fs::read_link("/dev/stdin").is_ok_and(|l| l == std::path::Path::new("/proc/self/fd/0")) {
+        if std::fs::read_link("/dev/stdin")
+            .is_ok_and(|l| l == std::path::Path::new("/proc/self/fd/0"))
+        {
             assert_eq!(own_fd_request("/dev/stdin", 12, 10), Some(0));
         }
         if std::fs::read_link("/dev/fd").is_ok_and(|l| l == std::path::Path::new("/proc/self/fd")) {
@@ -1378,22 +1451,46 @@ mod tests {
     #[test]
     fn test_own_grant_covers() {
         use std::path::Path;
-        assert!(own_grant_covers("/proc/self/status", Path::new("/proc/self")));
+        assert!(own_grant_covers(
+            "/proc/self/status",
+            Path::new("/proc/self")
+        ));
         assert!(own_grant_covers("/proc/self/status", Path::new("/proc")));
-        assert!(!own_grant_covers("/proc/self/net/arp", Path::new("/proc/self")));
-        assert!(!own_grant_covers("/proc/thread-self/net/arp", Path::new("/proc/thread-self")));
-        assert!(!own_grant_covers("/proc/self/task/7/net/arp", Path::new("/proc/self")));
-        assert!(own_grant_covers("/proc/self/net/arp", Path::new("/proc/self/net")));
-        assert!(own_grant_covers("/proc/self/net/arp", Path::new("/proc/self/net/arp")));
+        assert!(!own_grant_covers(
+            "/proc/self/net/arp",
+            Path::new("/proc/self")
+        ));
+        assert!(!own_grant_covers(
+            "/proc/thread-self/net/arp",
+            Path::new("/proc/thread-self")
+        ));
+        assert!(!own_grant_covers(
+            "/proc/self/task/7/net/arp",
+            Path::new("/proc/self")
+        ));
+        assert!(own_grant_covers(
+            "/proc/self/net/arp",
+            Path::new("/proc/self/net")
+        ));
+        assert!(own_grant_covers(
+            "/proc/self/net/arp",
+            Path::new("/proc/self/net/arp")
+        ));
         assert!(!own_grant_covers("/proc/self/net/arp", Path::new("/proc")));
         assert!(own_grant_covers("/proc/net/arp", Path::new("/proc")));
         assert!(own_grant_covers("/proc/net/arp", Path::new("/proc/net")));
-        assert!(!own_grant_covers("/proc/self/status", Path::new("/proc/self/status/x")));
+        assert!(!own_grant_covers(
+            "/proc/self/status",
+            Path::new("/proc/self/status/x")
+        ));
     }
 
     #[test]
     fn test_own_proc_self_forms() {
-        assert_eq!(own_proc_self_forms("/proc/10/maps", 12, 10), ["/proc/self/maps"]);
+        assert_eq!(
+            own_proc_self_forms("/proc/10/maps", 12, 10),
+            ["/proc/self/maps"]
+        );
         assert!(own_proc_self_forms("/proc/11/maps", 12, 10).is_empty());
         assert!(own_proc_self_forms("/etc/passwd", 12, 10).is_empty());
     }
@@ -1403,7 +1500,9 @@ mod tests {
         use std::path::Path;
         assert!(is_supervised_proc_grant(Path::new("/proc")));
         assert!(is_supervised_proc_grant(Path::new("/proc/self/maps")));
-        assert!(is_supervised_proc_grant(Path::new("/proc/thread-self/net/arp")));
+        assert!(is_supervised_proc_grant(Path::new(
+            "/proc/thread-self/net/arp"
+        )));
         assert!(is_supervised_proc_grant(Path::new("/proc/1/maps")));
         assert!(!is_supervised_proc_grant(Path::new("/procfs")));
         assert!(!is_supervised_proc_grant(Path::new("/etc")));
@@ -1412,24 +1511,63 @@ mod tests {
     #[test]
     fn test_canon_proc_namespace() {
         assert_eq!(canon_proc_namespace("/proc/self/net/dev"), "/proc/net/dev");
-        assert_eq!(canon_proc_namespace("/proc/thread-self/net/tcp6"), "/proc/net/tcp6");
+        assert_eq!(
+            canon_proc_namespace("/proc/thread-self/net/tcp6"),
+            "/proc/net/tcp6"
+        );
         assert_eq!(canon_proc_namespace("/proc/42/net"), "/proc/net");
-        assert_eq!(canon_proc_namespace("/proc/42/task/43/net/dev"), "/proc/net/dev");
+        assert_eq!(
+            canon_proc_namespace("/proc/42/task/43/net/dev"),
+            "/proc/net/dev"
+        );
         assert_eq!(canon_proc_namespace("/proc/net/dev"), "/proc/net/dev");
-        assert_eq!(canon_proc_namespace("/proc/self/network"), "/proc/self/network");
-        assert_eq!(canon_proc_namespace("/proc/self/task/net/dev"), "/proc/self/task/net/dev");
-        assert_eq!(canon_proc_namespace("/proc/sys/net/core"), "/proc/sys/net/core");
+        assert_eq!(
+            canon_proc_namespace("/proc/self/network"),
+            "/proc/self/network"
+        );
+        assert_eq!(
+            canon_proc_namespace("/proc/self/task/net/dev"),
+            "/proc/self/task/net/dev"
+        );
+        assert_eq!(
+            canon_proc_namespace("/proc/sys/net/core"),
+            "/proc/sys/net/core"
+        );
 
-        assert_eq!(canon_proc_namespace("/proc/thread-self/mounts"), "/proc/self/mounts");
-        assert_eq!(canon_proc_namespace("/proc/42/mountinfo"), "/proc/self/mountinfo");
-        assert_eq!(canon_proc_namespace("/proc/self/task/43/mounts"), "/proc/self/mounts");
-        assert_eq!(canon_proc_namespace("/proc/42/mountstats"), "/proc/self/mountstats");
-        assert_eq!(canon_proc_namespace("/proc/self/mountinfo"), "/proc/self/mountinfo");
+        assert_eq!(
+            canon_proc_namespace("/proc/thread-self/mounts"),
+            "/proc/self/mounts"
+        );
+        assert_eq!(
+            canon_proc_namespace("/proc/42/mountinfo"),
+            "/proc/self/mountinfo"
+        );
+        assert_eq!(
+            canon_proc_namespace("/proc/self/task/43/mounts"),
+            "/proc/self/mounts"
+        );
+        assert_eq!(
+            canon_proc_namespace("/proc/42/mountstats"),
+            "/proc/self/mountstats"
+        );
+        assert_eq!(
+            canon_proc_namespace("/proc/self/mountinfo"),
+            "/proc/self/mountinfo"
+        );
         assert_eq!(canon_proc_namespace("/proc/mounts"), "/proc/mounts");
-        assert_eq!(canon_proc_namespace("/proc/thread-self/cgroup"), "/proc/self/cgroup");
-        assert_eq!(canon_proc_namespace("/proc/42/task/43/cgroup"), "/proc/self/cgroup");
+        assert_eq!(
+            canon_proc_namespace("/proc/thread-self/cgroup"),
+            "/proc/self/cgroup"
+        );
+        assert_eq!(
+            canon_proc_namespace("/proc/42/task/43/cgroup"),
+            "/proc/self/cgroup"
+        );
         assert_eq!(canon_proc_namespace("/proc/cgroups"), "/proc/cgroups");
-        assert_eq!(canon_proc_namespace("/proc/self/mountsx"), "/proc/self/mountsx");
+        assert_eq!(
+            canon_proc_namespace("/proc/self/mountsx"),
+            "/proc/self/mountsx"
+        );
     }
 
     #[test]
@@ -1547,7 +1685,11 @@ mod tests {
 
     #[test]
     fn test_generate_loadavg() {
-        let la = LoadAvg { avg_1: 1.23, avg_5: 0.45, avg_15: 0.12 };
+        let la = LoadAvg {
+            avg_1: 1.23,
+            avg_5: 0.45,
+            avg_15: 0.12,
+        };
         let info = generate_loadavg(&la, 3, 10, 42);
         let text = String::from_utf8(info).unwrap();
         assert!(text.contains("1.23"));
@@ -1591,18 +1733,32 @@ mod tests {
         let content = generate_proc_mounts(Some(tmp.as_path()), &mounts, &ro, false);
         let text = String::from_utf8(content).unwrap();
         // Root entry with detected fstype (not hardcoded ext4)
-        assert!(text.starts_with("sandlock / "), "Should start with root entry, got: {}", text);
+        assert!(
+            text.starts_with("sandlock / "),
+            "Should start with root entry, got: {}",
+            text
+        );
         assert!(text.contains("sandlock /work "));
         assert!(text.contains("sandlock /data "));
         // Should NOT contain host paths
         assert!(!text.contains(tmp.to_str().unwrap()));
         // Fstype should be detected, not "unknown" (tmp is on a real fs)
         let root_line = text.lines().next().unwrap();
-        assert!(!root_line.contains("unknown"), "root fstype should be detected, got: {}", root_line);
+        assert!(
+            !root_line.contains("unknown"),
+            "root fstype should be detected, got: {}",
+            root_line
+        );
         // Options reflect read-only: /data is ro, /work and root are rw.
-        assert!(text.lines().any(|l| l.starts_with("sandlock / ") && l.contains(" rw,relatime ")));
-        assert!(text.lines().any(|l| l.starts_with("sandlock /work ") && l.contains(" rw,relatime ")));
-        assert!(text.lines().any(|l| l.starts_with("sandlock /data ") && l.contains(" ro,relatime ")));
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("sandlock / ") && l.contains(" rw,relatime ")));
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("sandlock /work ") && l.contains(" rw,relatime ")));
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("sandlock /data ") && l.contains(" ro,relatime ")));
     }
 
     #[test]
@@ -1610,7 +1766,11 @@ mod tests {
         let tmp = std::env::temp_dir();
         let content = generate_proc_mounts(Some(tmp.as_path()), &[], &[], true);
         let text = String::from_utf8(content).unwrap();
-        assert!(text.lines().next().unwrap().contains(" ro,relatime "), "got: {}", text);
+        assert!(
+            text.lines().next().unwrap().contains(" ro,relatime "),
+            "got: {}",
+            text
+        );
     }
 
     #[test]
@@ -1629,20 +1789,27 @@ mod tests {
 
         let tmp = std::env::temp_dir();
         let mounts = vec![(std::path::PathBuf::from("/work"), tmp.clone())];
-        let text = String::from_utf8(generate_proc_mountstats(Some(tmp.as_path()), &mounts)).unwrap();
+        let text =
+            String::from_utf8(generate_proc_mountstats(Some(tmp.as_path()), &mounts)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("device sandlock mounted on / with fstype "), "got: {}", text);
-        assert!(lines[1].starts_with("device sandlock mounted on /work with fstype "), "got: {}", text);
+        assert!(
+            lines[0].starts_with("device sandlock mounted on / with fstype "),
+            "got: {}",
+            text
+        );
+        assert!(
+            lines[1].starts_with("device sandlock mounted on /work with fstype "),
+            "got: {}",
+            text
+        );
         assert!(!text.contains(tmp.to_str().unwrap()));
     }
 
     #[test]
     fn test_generate_proc_mountinfo_chroot() {
         let tmp = std::env::temp_dir();
-        let mounts = vec![
-            (std::path::PathBuf::from("/work"), tmp.clone()),
-        ];
+        let mounts = vec![(std::path::PathBuf::from("/work"), tmp.clone())];
         let content = generate_proc_mountinfo(Some(tmp.as_path()), &mounts, &[], false);
         let text = String::from_utf8(content).unwrap();
         assert!(text.contains("/ / rw,relatime -"));

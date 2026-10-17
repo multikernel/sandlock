@@ -13,8 +13,8 @@ use crate::seccomp::bpf;
 use crate::arch;
 #[cfg(test)]
 use crate::sys::structs::{
-    AF_INET, AF_INET6, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, PR_SET_DUMPABLE,
-    SIOCGIFCONF, SIOCETHTOOL, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
+    AF_INET, AF_INET6, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, PR_SET_DUMPABLE, SIOCETHTOOL,
+    SIOCGIFCONF, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
 };
 
 // ============================================================
@@ -195,9 +195,15 @@ fn write_id_maps(
     target_uid: u32,
     target_gid: u32,
 ) -> std::io::Result<()> {
-    std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid))?;
+    std::fs::write(
+        "/proc/self/uid_map",
+        format!("{} {} 1\n", target_uid, real_uid),
+    )?;
     std::fs::write("/proc/self/setgroups", "deny\n")?;
-    std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid))?;
+    std::fs::write(
+        "/proc/self/gid_map",
+        format!("{} {} 1\n", target_gid, real_gid),
+    )?;
     Ok(())
 }
 
@@ -279,7 +285,9 @@ fn set_proc_name(name: &CStr) {
 /// (`prlimit`, systemd `LimitNOFILE=`); the guest then inherits the higher soft
 /// limit and this clamp stops constraining.
 fn effective_nofile(requested: u32, inherited: &libc::rlimit) -> libc::rlim_t {
-    (requested as libc::rlim_t).min(inherited.rlim_cur).min(inherited.rlim_max)
+    (requested as libc::rlim_t)
+        .min(inherited.rlim_cur)
+        .min(inherited.rlim_max)
 }
 
 /// Apply irreversible confinement (Landlock + seccomp), then either `execve` the
@@ -352,13 +360,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             for &core in cores {
                 unsafe { libc::CPU_SET(core as usize, &mut set) };
             }
-            if unsafe {
-                libc::sched_setaffinity(
-                    0,
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &set,
-                )
-            } != 0
+            if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) }
+                != 0
             {
                 fail!("sched_setaffinity");
             }
@@ -379,7 +382,10 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // that would break pidfd_getfd which the supervisor needs.
         // The seccomp filter already blocks the child from calling
         // prctl(PR_SET_DUMPABLE, ...) so it can't re-enable it.
-        let rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) } != 0 {
             fail!("setrlimit(RLIMIT_CORE, 0)");
         }
@@ -567,7 +573,11 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // 13b. GPU device visibility
     if let Some(ref devices) = sandbox.gpu_devices {
         if !devices.is_empty() {
-            let vis = devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+            let vis = devices
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             std::env::set_var("CUDA_VISIBLE_DEVICES", &vis);
             std::env::set_var("ROCR_VISIBLE_DEVICES", &vis);
         }
@@ -590,12 +600,18 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // can setrlimit the cap straight back up. Treat the limit as a resource
         // budget, not as confinement, unlike Landlock (step 8) and seccomp
         // (step 9), which stay irreversible for root too.
-        let mut inherited = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut inherited = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {
             fail!("getrlimit(RLIMIT_NOFILE)");
         }
         let target = effective_nofile(n, &inherited);
-        let rlim = libc::rlimit { rlim_cur: target, rlim_max: target };
+        let rlim = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: target,
+        };
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
             fail!(format!("setrlimit(RLIMIT_NOFILE, {})", target));
         }
@@ -671,7 +687,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     let exec_err = io::Error::last_os_error();
     mark_exec(exec_w, EXEC_FAILED);
-    let _ = write!(std::io::stderr(), "sandlock child: exec '{}': {}\n", cmd[0].to_string_lossy(), exec_err);
+    let _ = write!(
+        std::io::stderr(),
+        "sandlock child: exec '{}': {}\n",
+        cmd[0].to_string_lossy(),
+        exec_err
+    );
     unsafe { libc::_exit(127) };
 }
 

@@ -35,11 +35,24 @@ fn sandlock_bin() -> Command {
 fn start_sleep_sandbox(name: &str) -> std::process::Child {
     let has_lib64 = std::path::Path::new("/lib64").exists();
     let mut args: Vec<String> = vec![
-        "run".into(), "--name".into(), name.into(),
-        "-r".into(), "/usr".into(), "-r".into(), "/lib".into(),
-        "-r".into(), "/bin".into(), "-r".into(), "/etc".into(),
-        "-r".into(), "/proc".into(), "-r".into(), "/dev".into(),
-        "--".into(), "/bin/sleep".into(), "30".into(),
+        "run".into(),
+        "--name".into(),
+        name.into(),
+        "-r".into(),
+        "/usr".into(),
+        "-r".into(),
+        "/lib".into(),
+        "-r".into(),
+        "/bin".into(),
+        "-r".into(),
+        "/etc".into(),
+        "-r".into(),
+        "/proc".into(),
+        "-r".into(),
+        "/dev".into(),
+        "--".into(),
+        "/bin/sleep".into(),
+        "30".into(),
     ];
     if has_lib64 {
         // Insert -r /lib64 before -r /bin.  Find the -r before /bin.
@@ -69,10 +82,7 @@ fn child_stderr(child: &mut std::process::Child) -> String {
 /// Poll `sandlock ps` until `name` appears, or timeout.
 fn wait_for_sandbox(name: &str) -> Result<(), String> {
     for _ in 0..20 {
-        let out = sandlock_bin()
-            .args(["ps"])
-            .output()
-            .expect("sandlock ps");
+        let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
         let stdout = String::from_utf8_lossy(&out.stdout);
         if stdout.contains(name) {
             return Ok(());
@@ -89,15 +99,13 @@ fn test_control_list_sandboxes_via_cli() {
 
     match wait_for_sandbox(&name) {
         Ok(()) => {
-            let out = sandlock_bin()
-                .args(["ps"])
-                .output()
-                .expect("sandlock ps");
+            let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
                 stdout.contains(&name),
                 "ps should contain sandbox name '{}':\n{}",
-                name, stdout
+                name,
+                stdout
             );
             assert!(
                 stdout.contains("NAME") && stdout.contains("PID") && stdout.contains("UPTIME"),
@@ -161,7 +169,10 @@ fn test_control_inspect_nonexistent_sandbox() {
         .args(["inspect", "nonexistent-sandbox-xyz-99999"])
         .output()
         .expect("sandlock inspect");
-    assert!(!out.status.success(), "inspect for nonexistent sandbox should fail");
+    assert!(
+        !out.status.success(),
+        "inspect for nonexistent sandbox should fail"
+    );
 }
 
 #[test]
@@ -212,7 +223,10 @@ fn test_control_mode_stays_out_of_profile() {
         .unwrap();
 
     let toml_str = sandlock_core::profile::sandbox_to_toml(&sb, &[]).unwrap();
-    assert!(!toml_str.contains("mode"), "mode leaked into profile: {toml_str}");
+    assert!(
+        !toml_str.contains("mode"),
+        "mode leaked into profile: {toml_str}"
+    );
 }
 
 #[test]
@@ -229,7 +243,11 @@ fn test_control_sandbox_to_profile_dedups_net_rules() {
     let profile = sandlock_core::profile::sandbox_to_profile(&sb, &[]);
     let allow = &profile.network.allow;
     let unique: std::collections::HashSet<&String> = allow.iter().collect();
-    assert_eq!(allow.len(), unique.len(), "duplicate net rules in {allow:?}");
+    assert_eq!(
+        allow.len(),
+        unique.len(),
+        "duplicate net rules in {allow:?}"
+    );
     assert!(allow.contains(&"udp://*".to_string()));
     assert!(allow.contains(&"icmp://*".to_string()));
 }
@@ -263,13 +281,19 @@ fn test_control_sandbox_to_toml_roundtrip() {
 
     let toml_str = sandlock_core::profile::sandbox_to_toml(&sb, &[]).unwrap();
     assert!(!toml_str.is_empty(), "TOML output should not be empty");
-    assert!(toml_str.contains("[filesystem]"), "TOML should have [filesystem] section");
+    assert!(
+        toml_str.contains("[filesystem]"),
+        "TOML should have [filesystem] section"
+    );
     assert!(toml_str.contains("/usr"), "TOML should contain /usr");
 
-    let reparsed: sandlock_core::ProfileInput = toml::from_str(&toml_str)
-        .expect("TOML should re-parse");
+    let reparsed: sandlock_core::ProfileInput =
+        toml::from_str(&toml_str).expect("TOML should re-parse");
     assert!(
-        reparsed.filesystem.read.contains(&std::path::PathBuf::from("/usr")),
+        reparsed
+            .filesystem
+            .read
+            .contains(&std::path::PathBuf::from("/usr")),
         "re-parsed profile should contain /usr in read"
     );
 }
@@ -285,10 +309,11 @@ fn test_control_sandbox_to_json() {
     let json_str = sandlock_core::profile::sandbox_to_json(&sb, &[]).unwrap();
     assert!(!json_str.is_empty(), "JSON output should not be empty");
 
-    let parsed: serde_json::Value = serde_json::from_str(&json_str)
-        .expect("JSON should parse");
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("JSON should parse");
     let fs = parsed.get("filesystem").expect("should have filesystem");
-    let read = fs.get("read").and_then(|r| r.as_array())
+    let read = fs
+        .get("read")
+        .and_then(|r| r.as_array())
         .expect("filesystem.read should be an array");
     assert!(
         read.iter().any(|v| v.as_str() == Some("/usr")),
@@ -309,10 +334,22 @@ fn test_control_name_collision() {
         Ok(()) => {
             let out = sandlock_bin()
                 .args([
-                    "run", "--name", &name,
-                    "-r", "/usr", "-r", "/bin", "-r", "/etc",
-                    "-r", "/proc", "-r", "/dev",
-                    "--", "/bin/sleep", "5",
+                    "run",
+                    "--name",
+                    &name,
+                    "-r",
+                    "/usr",
+                    "-r",
+                    "/bin",
+                    "-r",
+                    "/etc",
+                    "-r",
+                    "/proc",
+                    "-r",
+                    "/dev",
+                    "--",
+                    "/bin/sleep",
+                    "5",
                 ])
                 .output()
                 .expect("sandlock run (collision)");
@@ -349,10 +386,23 @@ fn test_control_name_collision_no_supervisor() {
         Ok(()) => {
             let out = sandlock_bin()
                 .args([
-                    "run", "--name", &name, "--no-supervisor",
-                    "-r", "/usr", "-r", "/bin", "-r", "/etc",
-                    "-r", "/proc", "-r", "/dev",
-                    "--", "/bin/sleep", "5",
+                    "run",
+                    "--name",
+                    &name,
+                    "--no-supervisor",
+                    "-r",
+                    "/usr",
+                    "-r",
+                    "/bin",
+                    "-r",
+                    "/etc",
+                    "-r",
+                    "/proc",
+                    "-r",
+                    "/dev",
+                    "--",
+                    "/bin/sleep",
+                    "5",
                 ])
                 .output()
                 .expect("sandlock run --no-supervisor (collision)");
@@ -383,9 +433,22 @@ fn test_control_no_supervisor() {
     let name = format!("test-ctrl-nosup-{}", std::process::id());
     let has_lib64 = std::path::Path::new("/lib64").exists();
     let mut args: Vec<&str> = vec![
-        "run", "--name", &name, "--no-supervisor",
-        "-r", "/usr", "-r", "/bin", "-r", "/lib",
-        "-r", "/etc", "-r", "/proc", "-r", "/dev",
+        "run",
+        "--name",
+        &name,
+        "--no-supervisor",
+        "-r",
+        "/usr",
+        "-r",
+        "/bin",
+        "-r",
+        "/lib",
+        "-r",
+        "/etc",
+        "-r",
+        "/proc",
+        "-r",
+        "/dev",
     ];
     if has_lib64 {
         args.push("-r");
@@ -418,17 +481,36 @@ fn test_control_no_supervisor() {
             );
 
             let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
-            assert_eq!(pids.supervisor, child.id() as i32, "supervisor pid: {:?}", pids);
-            assert_ne!(unsafe { libc::getpgid(pids.child) }, pids.child, "main runs in the reaper's group: {:?}", pids);
+            assert_eq!(
+                pids.supervisor,
+                child.id() as i32,
+                "supervisor pid: {:?}",
+                pids
+            );
+            assert_ne!(
+                unsafe { libc::getpgid(pids.child) },
+                pids.child,
+                "main runs in the reaper's group: {:?}",
+                pids
+            );
             let info = sandlock_core::control::sandbox_info(&name).expect("info");
             assert_eq!(info.mode, None);
 
-            let inspect = sandlock_bin().args(["inspect", &name]).output().expect("inspect");
-            assert!(inspect.status.success(), "inspect should answer without a supervisor");
+            let inspect = sandlock_bin()
+                .args(["inspect", &name])
+                .output()
+                .expect("inspect");
+            assert!(
+                inspect.status.success(),
+                "inspect should answer without a supervisor"
+            );
 
             let ports = sandlock_core::control::send_control_request(
-                &name, "ports", serde_json::Value::Object(Default::default()),
-            ).expect("ports");
+                &name,
+                "ports",
+                serde_json::Value::Object(Default::default()),
+            )
+            .expect("ports");
             assert_eq!(ports.data, Some(serde_json::json!({})));
         }
         Err(e) => {
@@ -497,11 +579,7 @@ fn test_control_ps_ports_column() {
                 "ps header should contain PORTS column: {}",
                 stdout
             );
-            assert!(
-                stdout.contains(&name),
-                "ps should list sandbox: {}",
-                stdout
-            );
+            assert!(stdout.contains(&name), "ps should list sandbox: {}", stdout);
         }
         Err(e) => {
             let stderr_output = child_stderr(&mut child);
@@ -517,7 +595,16 @@ fn test_control_ps_ports_column() {
 #[tokio::test]
 async fn test_control_invalid_names() {
     // Names that could not be listed back from /proc/net/unix, or that look like paths, are rejected at spawn time.
-    for bad in &["/", "..", ".", "a/b", "../etc", "a b", "tab\tname", "nl\nname"] {
+    for bad in &[
+        "/",
+        "..",
+        ".",
+        "a/b",
+        "../etc",
+        "a b",
+        "tab\tname",
+        "nl\nname",
+    ] {
         let result = sandlock_core::Sandbox::builder()
             .fs_read("/usr")
             .fs_read("/bin")
@@ -529,10 +616,7 @@ async fn test_control_invalid_names() {
             .with_name(*bad)
             .run(&["true"])
             .await;
-        assert!(
-            result.is_err(),
-            "sandbox name {:?} should be rejected", bad
-        );
+        assert!(result.is_err(), "sandbox name {:?} should be rejected", bad);
     }
 }
 
@@ -561,14 +645,19 @@ fn test_control_killed_supervisor_vanishes_and_name_is_reusable() {
         let _ = first.kill();
         panic!("{}; child stderr: {}", e, stderr_output);
     }
-    let child_pid = sandlock_core::control::sandbox_pids(&name).expect("pids").child;
+    let child_pid = sandlock_core::control::sandbox_pids(&name)
+        .expect("pids")
+        .child;
 
     // SIGKILL skips Drop entirely: nothing runs any cleanup.
     first.kill().expect("kill supervisor");
     first.wait().expect("wait supervisor");
     unsafe { libc::kill(child_pid, libc::SIGKILL) };
 
-    assert!(wait_for_gone(&name), "name should disappear with the supervisor");
+    assert!(
+        wait_for_gone(&name),
+        "name should disappear with the supervisor"
+    );
 
     let mut second = start_sleep_sandbox(&name);
     match wait_for_sandbox(&name) {
@@ -576,7 +665,10 @@ fn test_control_killed_supervisor_vanishes_and_name_is_reusable() {
         Err(e) => {
             let stderr_output = child_stderr(&mut second);
             let _ = second.kill();
-            panic!("name should be reusable immediately: {}; stderr: {}", e, stderr_output);
+            panic!(
+                "name should be reusable immediately: {}; stderr: {}",
+                e, stderr_output
+            );
         }
     }
     let _ = second.kill();
@@ -635,7 +727,10 @@ fn test_control_kill_terminates_a_stopped_supervisor() {
     assert_eq!(pids.supervisor, child.id() as i32);
 
     unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) };
-    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    let out = sandlock_bin()
+        .args(["kill", &name])
+        .output()
+        .expect("sandlock kill");
     let supervisor_gone = child.wait();
     unsafe { libc::kill(pids.child, libc::SIGCONT) };
 
@@ -644,8 +739,15 @@ fn test_control_kill_terminates_a_stopped_supervisor() {
         "kill should succeed against a stopped supervisor: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(supervisor_gone.is_ok_and(|s| !s.success()), "supervisor should be SIGKILLed");
-    assert!(wait_for_pid_gone(pids.child), "child {} should be dead", pids.child);
+    assert!(
+        supervisor_gone.is_ok_and(|s| !s.success()),
+        "supervisor should be SIGKILLed"
+    );
+    assert!(
+        wait_for_pid_gone(pids.child),
+        "child {} should be dead",
+        pids.child
+    );
     assert!(wait_for_gone(&name), "name should be free after kill");
 }
 
@@ -683,18 +785,37 @@ fn test_control_kill_reaches_a_process_outside_the_child_group() {
         })
         .expect("the setsid child never left the sandbox's group");
 
-    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    let out = sandlock_bin()
+        .args(["kill", &name])
+        .output()
+        .expect("sandlock kill");
     let _ = child.wait();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(wait_for_pid_gone(pids.child), "child {} should be dead", pids.child);
-    assert!(wait_for_pid_gone(leader), "session leader {} should be dead", leader);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_for_pid_gone(pids.child),
+        "child {} should be dead",
+        pids.child
+    );
+    assert!(
+        wait_for_pid_gone(leader),
+        "session leader {} should be dead",
+        leader
+    );
 }
 
 /// A child of `parent` that runs in a process group other than `parent`'s.
 fn child_outside_group(parent: i32) -> Option<i32> {
     for entry in std::fs::read_dir("/proc").ok()? {
-        let Ok(pid) = entry.ok()?.file_name().to_string_lossy().parse::<i32>() else { continue };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        let Ok(pid) = entry.ok()?.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
         let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
         let ppid: i32 = fields.nth(1)?.parse().ok()?;
         let pgid: i32 = fields.next()?.parse().ok()?;
@@ -722,7 +843,11 @@ async fn test_control_name_is_free_when_wait_returns() {
             .with_name(&name)
             .run(&["true"])
             .await;
-        assert!(result.is_ok(), "second run with the same name must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "second run with the same name must succeed: {:?}",
+            result.err()
+        );
     }
 }
 
@@ -748,7 +873,12 @@ async fn test_control_parked_child_does_not_pin_other_names() {
     parked.create(&["true"]).await.unwrap();
 
     first.start().unwrap();
-    async { first.wait().await?; first.shutdown().await }.await.unwrap();
+    async {
+        first.wait().await?;
+        first.shutdown().await
+    }
+    .await
+    .unwrap();
 
     let again = policy
         .clone()
@@ -756,16 +886,29 @@ async fn test_control_parked_child_does_not_pin_other_names() {
         .run(&["true"])
         .await;
     parked.start().unwrap();
-    let _ = async { parked.wait().await?; parked.shutdown().await }.await;
-    assert!(again.is_ok(), "a parked sibling must not pin the name: {:?}", again.err());
+    let _ = async {
+        parked.wait().await?;
+        parked.shutdown().await
+    }
+    .await;
+    assert!(
+        again.is_ok(),
+        "a parked sibling must not pin the name: {:?}",
+        again.err()
+    );
 }
 
 #[tokio::test]
 async fn test_control_child_pid_is_published_before_start() {
     let name = format!("test-ctrl-child-pid-{}", std::process::id());
     let mut sb = sandlock_core::Sandbox::builder()
-        .fs_read("/usr").fs_read("/bin").fs_read("/lib")
-        .fs_read_if_exists("/lib64").build().unwrap().with_name(&name);
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .build()
+        .unwrap()
+        .with_name(&name);
     sb.create(&["true"]).await.unwrap();
     for _ in 0..32 {
         let pids = sandlock_core::control::sandbox_pids(&name).unwrap();
@@ -773,7 +916,13 @@ async fn test_control_child_pid_is_published_before_start() {
         assert_eq!(pids.supervisor, std::process::id() as i32);
     }
     sb.start().unwrap();
-    assert!(async { sb.wait().await?; sb.shutdown().await }.await.unwrap().success());
+    assert!(async {
+        sb.wait().await?;
+        sb.shutdown().await
+    }
+    .await
+    .unwrap()
+    .success());
 }
 
 // ============================================================
@@ -787,15 +936,13 @@ fn test_control_cli_kill_rejects_bad_names() {
             .args(["kill", bad])
             .output()
             .expect("sandlock kill");
-        assert!(
-            !out.status.success(),
-            "sandlock kill {:?} should fail", bad
-        );
+        assert!(!out.status.success(), "sandlock kill {:?} should fail", bad);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("must not"),
             "kill {:?} should produce a validation error, got: {}",
-            bad, stderr
+            bad,
+            stderr
         );
     }
 }
@@ -809,13 +956,15 @@ fn test_control_cli_inspect_rejects_bad_names() {
             .expect("sandlock inspect");
         assert!(
             !out.status.success(),
-            "sandlock inspect {:?} should fail", bad
+            "sandlock inspect {:?} should fail",
+            bad
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("must not"),
             "inspect {:?} should produce a validation error, got: {}",
-            bad, stderr
+            bad,
+            stderr
         );
     }
 }
@@ -844,13 +993,22 @@ async fn test_control_failed_creation_releases_its_name() {
     let name = format!("test-ctrl-failed-create-{}", std::process::id());
     let mut failed = sandlock_core::Sandbox::builder()
         .cwd(root.path().join("missing"))
-        .build().unwrap().with_name(&name);
+        .build()
+        .unwrap()
+        .with_name(&name);
     assert!(failed.create(&["true"]).await.is_err());
-    assert!(!sandlock_core::control::list_sandboxes().unwrap().contains(&name));
+    assert!(!sandlock_core::control::list_sandboxes()
+        .unwrap()
+        .contains(&name));
 
     let mut replacement = sandlock_core::Sandbox::builder()
-        .fs_read("/usr").fs_read("/bin").fs_read("/lib")
-        .fs_read_if_exists("/lib64").build().unwrap().with_name(&name);
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .build()
+        .unwrap()
+        .with_name(&name);
     replacement.create(&["true"]).await.unwrap();
     drop(replacement);
     drop(failed);
@@ -863,16 +1021,26 @@ async fn test_control_cancelled_creation_releases_its_name() {
 
     let name = format!("test-ctrl-cancel-create-{}", std::process::id());
     let mut cancelled = sandlock_core::Sandbox::builder()
-        .fs_read("/usr").fs_read("/bin").fs_read("/lib")
-        .fs_read_if_exists("/lib64").build().unwrap().with_name(&name);
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .build()
+        .unwrap()
+        .with_name(&name);
     let mut creation = Box::pin(cancelled.create(&["true"]));
     std::future::poll_fn(|cx| {
         assert!(creation.as_mut().poll(cx).is_pending());
         Poll::Ready(())
-    }).await;
-    assert!(sandlock_core::control::list_sandboxes().unwrap().contains(&name));
+    })
+    .await;
+    assert!(sandlock_core::control::list_sandboxes()
+        .unwrap()
+        .contains(&name));
     drop(creation);
-    assert!(!sandlock_core::control::list_sandboxes().unwrap().contains(&name));
+    assert!(!sandlock_core::control::list_sandboxes()
+        .unwrap()
+        .contains(&name));
     drop(cancelled);
 }
 
@@ -893,11 +1061,22 @@ async fn test_control_ps_hides_the_pid_of_an_exited_main() {
         .with_name(&name);
     sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
     sb.wait().await.unwrap();
-    assert!(sandlock_core::control::sandbox_info(&name).expect("info").main_exited);
+    assert!(
+        sandlock_core::control::sandbox_info(&name)
+            .expect("info")
+            .main_exited
+    );
     let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
-    assert_eq!(row.split_whitespace().nth(1), Some("-"), "exited main has no pid: {row}");
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with(&name))
+        .expect("ps lists the session");
+    assert_eq!(
+        row.split_whitespace().nth(1),
+        Some("-"),
+        "exited main has no pid: {row}"
+    );
     assert!(row.ends_with("(main exited, 1 group)"), "{row}");
     sb.shutdown().await.unwrap();
 }
@@ -919,7 +1098,10 @@ async fn test_control_ps_reports_an_idle_session() {
     sb.wait().await.unwrap();
     let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with(&name))
+        .expect("ps lists the session");
     assert!(row.ends_with("(main exited, idle)"), "{row}");
     sb.shutdown().await.unwrap();
 }

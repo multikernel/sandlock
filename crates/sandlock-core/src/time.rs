@@ -47,11 +47,7 @@ fn epoch_secs(t: SystemTime) -> i64 {
 /// between our adjustment and the kernel's read, but the only effect is
 /// that virtual-time bookkeeping is bypassed for that one call. No
 /// security boundary depends on the value we read or wrote.
-pub(crate) fn handle_timer(
-    notif: &SeccompNotif,
-    time_offset: i64,
-    notif_fd: RawFd,
-) -> NotifAction {
+pub(crate) fn handle_timer(notif: &SeccompNotif, time_offset: i64, notif_fd: RawFd) -> NotifAction {
     if time_offset == 0 {
         return NotifAction::Continue;
     }
@@ -85,7 +81,13 @@ pub(crate) fn handle_timer(
         if itimerspec_addr == 0 {
             return NotifAction::Continue;
         }
-        adjust_tv_sec(notif_fd, notif.id, notif.pid, itimerspec_addr + 16, time_offset);
+        adjust_tv_sec(
+            notif_fd,
+            notif.id,
+            notif.pid,
+            itimerspec_addr + 16,
+            time_offset,
+        );
     }
 
     NotifAction::Continue
@@ -112,7 +114,11 @@ mod tests {
         // A time in the past should give a negative offset.
         let past = SystemTime::now() - Duration::from_secs(3600);
         let offset = calculate_time_offset(past);
-        assert!(offset < 0, "past time should give negative offset, got {}", offset);
+        assert!(
+            offset < 0,
+            "past time should give negative offset, got {}",
+            offset
+        );
     }
 
     #[test]
@@ -120,7 +126,11 @@ mod tests {
         // A time in the future should give a positive offset.
         let future = SystemTime::now() + Duration::from_secs(3600);
         let offset = calculate_time_offset(future);
-        assert!(offset > 0, "future time should give positive offset, got {}", offset);
+        assert!(
+            offset > 0,
+            "future time should give positive offset, got {}",
+            offset
+        );
     }
 
     #[test]
@@ -128,7 +138,11 @@ mod tests {
         // A time close to now should give an offset near zero.
         let now = SystemTime::now();
         let offset = calculate_time_offset(now);
-        assert!(offset.abs() <= 2, "offset for 'now' should be near zero, got {}", offset);
+        assert!(
+            offset.abs() <= 2,
+            "offset for 'now' should be near zero, got {}",
+            offset
+        );
     }
 
     #[test]

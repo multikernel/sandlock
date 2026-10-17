@@ -172,12 +172,12 @@ fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
     stub.push(0x5F); // pop rdi
     stub.extend_from_slice(&[0x83, 0xFF, 0x00]); // cmp edi, 0 (CLOCK_REALTIME)
     stub.push(0x74); // je (short jump) — if CLOCK_REALTIME, jump to movabs
-    // Skip second check: cmp edi,5 (3 bytes) + jne (2 bytes) = 5
+                     // Skip second check: cmp edi,5 (3 bytes) + jne (2 bytes) = 5
     let jump_to_movabs: u8 = 3 + 2;
     stub.push(jump_to_movabs);
     stub.extend_from_slice(&[0x83, 0xFF, 0x05]); // cmp edi, 5 (CLOCK_REALTIME_COARSE)
     stub.push(0x75); // jne (short jump) — if NOT CLOCK_REALTIME_COARSE, skip to ret
-    // Skip: movabs rcx (10) + add [rsi],rcx (3) = 13
+                     // Skip: movabs rcx (10) + add [rsi],rcx (3) = 13
     let jump_to_ret: u8 = 10 + 3;
     stub.push(jump_to_ret);
     stub.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, imm64
@@ -244,8 +244,16 @@ fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
     vec![
-        ("clock_gettime", "__vdso_clock_gettime", libc::SYS_clock_gettime as u32),
-        ("gettimeofday", "__vdso_gettimeofday", libc::SYS_gettimeofday as u32),
+        (
+            "clock_gettime",
+            "__vdso_clock_gettime",
+            libc::SYS_clock_gettime as u32,
+        ),
+        (
+            "gettimeofday",
+            "__vdso_gettimeofday",
+            libc::SYS_gettimeofday as u32,
+        ),
         ("time", "__vdso_time", libc::SYS_time as u32),
     ]
 }
@@ -253,8 +261,16 @@ fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
 #[cfg(target_arch = "aarch64")]
 fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
     vec![
-        ("clock_gettime", "__kernel_clock_gettime", libc::SYS_clock_gettime as u32),
-        ("gettimeofday", "__kernel_gettimeofday", libc::SYS_gettimeofday as u32),
+        (
+            "clock_gettime",
+            "__kernel_clock_gettime",
+            libc::SYS_clock_gettime as u32,
+        ),
+        (
+            "gettimeofday",
+            "__kernel_gettimeofday",
+            libc::SYS_gettimeofday as u32,
+        ),
     ]
 }
 
@@ -288,7 +304,8 @@ fn riscv_li_a7(stub: &mut Vec<u8>, value: u32) {
             (value >> 12) & 0xf_ffff
         };
         push_insn(stub, (hi20 << 12) | (A7 << 7) | 0x37); // lui a7, hi20
-        push_insn(stub, ((lo12 & 0xfff) << 20) | (A7 << 15) | (A7 << 7) | 0x1b); // addiw a7, a7, lo12
+        push_insn(stub, ((lo12 & 0xfff) << 20) | (A7 << 15) | (A7 << 7) | 0x1b);
+        // addiw a7, a7, lo12
     }
 }
 
@@ -416,11 +433,11 @@ fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
         lwu(T5, T2, DOFF),    // t5 = low 32 bits of offset (zero-extended)
         lw(T6, T2, DOFF + 4), // t6 = high 32 bits (sign-extended)
         slli(T6, T6, 32),
-        or(T2, T5, T6),       // t2 = full 64-bit offset
-        ld(T3, T4, 0),        // t3 = tv_sec
-        add(T3, T3, T2),      // t3 += offset
-        sd(T3, T4, 0),        // tv_sec = t3
-        RET,                  // end
+        or(T2, T5, T6),  // t2 = full 64-bit offset
+        ld(T3, T4, 0),   // t3 = tv_sec
+        add(T3, T3, T2), // t3 += offset
+        sd(T3, T4, 0),   // tv_sec = t3
+        RET,             // end
     ];
     let mut stub = Vec::with_capacity(insns.len() * 4 + 8);
     for insn in insns {
@@ -438,19 +455,19 @@ fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     const DOFF: i32 = 36;
     let nr = libc::SYS_gettimeofday as i32;
     let insns: [u32; 13] = [
-        mv(T4, A0),           // save timeval*
-        addi(A7, X0, nr),     // li a7, SYS_gettimeofday
+        mv(T4, A0),       // save timeval*
+        addi(A7, X0, nr), // li a7, SYS_gettimeofday
         ECALL,
-        beq(T4, X0, 36),      // timeval == NULL -> end
+        beq(T4, X0, 36), // timeval == NULL -> end
         auipc(T2, 0),
         lwu(T5, T2, DOFF),
         lw(T6, T2, DOFF + 4),
         slli(T6, T6, 32),
         or(T2, T5, T6),
-        ld(T3, T4, 0),        // t3 = tv_sec
+        ld(T3, T4, 0), // t3 = tv_sec
         add(T3, T3, T2),
         sd(T3, T4, 0),
-        RET,                  // end
+        RET, // end
     ];
     let mut stub = Vec::with_capacity(insns.len() * 4 + 8);
     for insn in insns {
@@ -463,8 +480,16 @@ fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
 #[cfg(target_arch = "riscv64")]
 fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
     vec![
-        ("clock_gettime", "__vdso_clock_gettime", libc::SYS_clock_gettime as u32),
-        ("gettimeofday", "__vdso_gettimeofday", libc::SYS_gettimeofday as u32),
+        (
+            "clock_gettime",
+            "__vdso_clock_gettime",
+            libc::SYS_clock_gettime as u32,
+        ),
+        (
+            "gettimeofday",
+            "__vdso_gettimeofday",
+            libc::SYS_gettimeofday as u32,
+        ),
     ]
 }
 
@@ -476,14 +501,12 @@ pub(crate) fn patch(
     time_offset_secs: Option<i64>,
     _patch_for_random: bool,
 ) -> Result<(), SandlockError> {
-    let (base, mapping_size) = find_vdso_range(pid).map_err(|e| {
-        SandlockError::MemoryProtect(format!("failed to find vDSO range: {}", e))
-    })?;
+    let (base, mapping_size) = find_vdso_range(pid)
+        .map_err(|e| SandlockError::MemoryProtect(format!("failed to find vDSO range: {}", e)))?;
 
     let read_size = std::cmp::min(mapping_size as usize, 0x4000);
-    let vdso_bytes = read_proc_mem(pid, base, read_size).map_err(|e| {
-        SandlockError::MemoryProtect(format!("failed to read vDSO memory: {}", e))
-    })?;
+    let vdso_bytes = read_proc_mem(pid, base, read_size)
+        .map_err(|e| SandlockError::MemoryProtect(format!("failed to read vDSO memory: {}", e)))?;
 
     let symbols = parse_vdso_symbols(&vdso_bytes);
 
@@ -699,10 +722,23 @@ mod tests {
             unsafe { std::mem::transmute(page) };
 
         // CLOCK_REALTIME (0): stub time must equal real time + OFFSET.
-        let mut real = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        let mut stubbed = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut real) }, 0);
-        assert_eq!(stub_fn(libc::CLOCK_REALTIME, &mut stubbed), 0, "stub returns 0");
+        let mut real = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut stubbed = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut real) },
+            0
+        );
+        assert_eq!(
+            stub_fn(libc::CLOCK_REALTIME, &mut stubbed),
+            0,
+            "stub returns 0"
+        );
         let shift = real.tv_sec - stubbed.tv_sec; // real - (real + OFFSET) = -OFFSET
         assert!(
             (shift - (-OFFSET)).abs() <= 2,
@@ -710,10 +746,19 @@ mod tests {
         );
 
         // CLOCK_MONOTONIC (1): not in {0,5}, so the stub must leave it unshifted.
-        let mut mono_stub = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        let mut mono_real = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut mono_stub = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut mono_real = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         assert_eq!(stub_fn(libc::CLOCK_MONOTONIC, &mut mono_stub), 0);
-        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_real) }, 0);
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_real) },
+            0
+        );
         assert!(
             (mono_real.tv_sec - mono_stub.tv_sec).abs() <= 2,
             "CLOCK_MONOTONIC must be unshifted, stub={} real={}",
@@ -739,10 +784,23 @@ mod tests {
             unsafe { std::mem::transmute(page) };
 
         // Non-NULL timeval: tv_sec must be shifted by OFFSET.
-        let mut real = libc::timeval { tv_sec: 0, tv_usec: 0 };
-        let mut stubbed = libc::timeval { tv_sec: 0, tv_usec: 0 };
-        assert_eq!(unsafe { libc::gettimeofday(&mut real, std::ptr::null_mut()) }, 0);
-        assert_eq!(stub_fn(&mut stubbed, std::ptr::null_mut()), 0, "stub returns 0");
+        let mut real = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut stubbed = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::gettimeofday(&mut real, std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            stub_fn(&mut stubbed, std::ptr::null_mut()),
+            0,
+            "stub returns 0"
+        );
         let shift = real.tv_sec - stubbed.tv_sec; // real - (real + OFFSET) = -OFFSET
         assert!(
             (shift - (-OFFSET)).abs() <= 2,
@@ -791,7 +849,11 @@ mod tests {
                 let word = u32::from_le_bytes(insn.try_into().unwrap());
                 ((word >> 5) & 0xFFFF) == chunk
             });
-            assert!(found, "chunk {:#06x} for shift {} not encoded in stub", chunk, shift);
+            assert!(
+                found,
+                "chunk {:#06x} for shift {} not encoded in stub",
+                chunk, shift
+            );
         }
     }
 }

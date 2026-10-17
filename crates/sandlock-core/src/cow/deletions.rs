@@ -75,11 +75,18 @@ impl DeletionSet {
     /// path that cannot be created, gives a RAM-only set.
     pub fn create(log_path: Option<&Path>) -> Self {
         let log = log_path.and_then(|p| {
-            let f = fs::OpenOptions::new().create(true).append(true).open(p).ok()?;
+            let f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()?;
             sync_parent_dir(p);
             Some(f)
         });
-        Self { entries: BTreeSet::new(), log }
+        Self {
+            entries: BTreeSet::new(),
+            log,
+        }
     }
 
     /// Rebuild a set from an existing log and reopen the log for append.

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 
 /// Helper: base policy with standard FS paths for running commands.
 fn base_policy() -> sandlock_core::SandboxBuilder {
@@ -35,7 +35,9 @@ async fn test_mount_blocked() {
         out.display()
     );
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["sh", "-c", &cmd_str])
+    let result = policy
+        .clone()
+        .run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -55,12 +57,11 @@ async fn test_mount_blocked() {
 #[tokio::test]
 async fn test_ptrace_blocked() {
     let out = temp_out("ptrace-blocked");
-    let cmd_str = format!(
-        "strace -p 1 2>/dev/null; echo $? > {}",
-        out.display()
-    );
+    let cmd_str = format!("strace -p 1 2>/dev/null; echo $? > {}", out.display());
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["sh", "-c", &cmd_str])
+    let result = policy
+        .clone()
+        .run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -77,22 +78,27 @@ async fn test_ptrace_blocked() {
 #[tokio::test]
 async fn test_personality_blocked() {
     let out = temp_out("personality-blocked");
-    let script = format!(concat!(
-        "import ctypes\n",
-        "libc = ctypes.CDLL(None)\n",
-        "ADDR_NO_RANDOMIZE = 0x0040000\n",
-        "current = libc.syscall(135, 0xffffffff)\n",
-        "ret = libc.syscall(135, current | ADDR_NO_RANDOMIZE)\n",
-        "if ret == -1:\n",
-        "  result = 'BLOCKED'\n",
-        "else:\n",
-        "  new = libc.syscall(135, 0xffffffff)\n",
-        "  result = 'ESCAPED' if new & ADDR_NO_RANDOMIZE else 'BLOCKED'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import ctypes\n",
+            "libc = ctypes.CDLL(None)\n",
+            "ADDR_NO_RANDOMIZE = 0x0040000\n",
+            "current = libc.syscall(135, 0xffffffff)\n",
+            "ret = libc.syscall(135, current | ADDR_NO_RANDOMIZE)\n",
+            "if ret == -1:\n",
+            "  result = 'BLOCKED'\n",
+            "else:\n",
+            "  new = libc.syscall(135, 0xffffffff)\n",
+            "  result = 'ESCAPED' if new & ADDR_NO_RANDOMIZE else 'BLOCKED'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -113,21 +119,26 @@ async fn test_personality_blocked() {
 #[tokio::test]
 async fn test_raw_socket_blocked() {
     let out = temp_out("raw-socket-blocked");
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except PermissionError:\n",
-        "  result = 'BLOCKED'\n",
-        "except OSError as e:\n",
-        "  result = f'ERROR:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except PermissionError:\n",
+            "  result = 'BLOCKED'\n",
+            "except OSError as e:\n",
+            "  result = f'ERROR:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -151,33 +162,36 @@ async fn test_raw_socket_blocked() {
 #[tokio::test]
 async fn test_raw_icmp_always_denied() {
     let out = temp_out("raw-icmp-denied");
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except PermissionError:\n",
-        "  result = 'BLOCKED'\n",
-        "except OSError as e:\n",
-        "  result = f'ERROR:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except PermissionError:\n",
+            "  result = 'BLOCKED'\n",
+            "except OSError as e:\n",
+            "  result = f'ERROR:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     // Even with an `icmp://*` rule (which permits the dgram path), raw
     // ICMP must still be blocked: SOCK_RAW is always in the deny list.
-    let policy = base_policy()
-        .net_allow("icmp://*")
-        .build()
-        .unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let policy = base_policy().net_allow("icmp://*").build().unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert_ne!(
-        contents.trim(), "ALLOWED",
+        contents.trim(),
+        "ALLOWED",
         "raw ICMP must be denied unconditionally; got: {}",
         contents.trim()
     );
@@ -192,24 +206,26 @@ async fn test_raw_icmp_always_denied() {
 #[tokio::test]
 async fn test_icmp_dgram_allowed_with_icmp_rule() {
     let out = temp_out("icmp-dgram-allowed");
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except PermissionError:\n",
-        "  result = 'BLOCKED'\n",
-        "except OSError as e:\n",
-        "  result = f'ERROR:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except PermissionError:\n",
+            "  result = 'BLOCKED'\n",
+            "except OSError as e:\n",
+            "  result = f'ERROR:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
-    let policy = base_policy()
-        .net_allow("icmp://*")
-        .build()
-        .unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let policy = base_policy().net_allow("icmp://*").build().unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -221,8 +237,10 @@ async fn test_icmp_dgram_allowed_with_icmp_rule() {
     // the test green across hosts.
     let trimmed = contents.trim();
     assert!(
-        trimmed == "ALLOWED" || trimmed == "BLOCKED"
-            || trimmed == "ERROR:1" || trimmed == "ERROR:13",
+        trimmed == "ALLOWED"
+            || trimmed == "BLOCKED"
+            || trimmed == "ERROR:1"
+            || trimmed == "ERROR:13",
         "kernel ping socket should be permitted by seccomp under icmp://*; got: {}",
         trimmed
     );
@@ -235,24 +253,26 @@ async fn test_icmp_dgram_allowed_with_icmp_rule() {
 #[tokio::test]
 async fn test_udp_allowed_when_opted_in() {
     let out = temp_out("udp-allowed");
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except PermissionError:\n",
-        "  result = 'BLOCKED'\n",
-        "except OSError as e:\n",
-        "  result = f'ERROR:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except PermissionError:\n",
+            "  result = 'BLOCKED'\n",
+            "except OSError as e:\n",
+            "  result = f'ERROR:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
-    let policy = base_policy()
-        .net_allow("udp://*:*")
-        .build()
-        .unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let policy = base_policy().net_allow("udp://*:*").build().unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -273,21 +293,26 @@ async fn test_udp_allowed_when_opted_in() {
 #[tokio::test]
 async fn test_udp_denied_by_default() {
     let out = temp_out("udp-denied");
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except PermissionError:\n",
-        "  result = 'BLOCKED'\n",
-        "except OSError as e:\n",
-        "  result = f'ERROR:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except PermissionError:\n",
+            "  result = 'BLOCKED'\n",
+            "except OSError as e:\n",
+            "  result = f'ERROR:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -312,53 +337,66 @@ async fn test_udp_denied_by_default() {
 #[tokio::test]
 async fn test_udp_send_time_gating_with_tcp_only_rules() {
     let out = temp_out("udp-send-gated");
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "  res['create'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['create'] = 'err:%d' % e.errno\n",
-        "  s = None\n",
-        "if s is not None:\n",
-        "  try:\n",
-        "    s.sendto(b'x', ('127.0.0.1', 53))\n",
-        "    res['sendto'] = 'ok'\n",
-        "  except OSError as e:\n",
-        "    res['sendto'] = 'err:%d' % e.errno\n",
-        "  try:\n",
-        "    s.connect(('127.0.0.1', 53))\n",
-        "    res['connect'] = 'ok'\n",
-        "  except OSError as e:\n",
-        "    res['connect'] = 'err:%d' % e.errno\n",
-        "  try:\n",
-        "    s.bind(('127.0.0.1', 0))\n",
-        "    res['bind'] = 'ok'\n",
-        "  except OSError as e:\n",
-        "    res['bind'] = 'err:%d' % e.errno\n",
-        "  s.close()\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "  res['create'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['create'] = 'err:%d' % e.errno\n",
+            "  s = None\n",
+            "if s is not None:\n",
+            "  try:\n",
+            "    s.sendto(b'x', ('127.0.0.1', 53))\n",
+            "    res['sendto'] = 'ok'\n",
+            "  except OSError as e:\n",
+            "    res['sendto'] = 'err:%d' % e.errno\n",
+            "  try:\n",
+            "    s.connect(('127.0.0.1', 53))\n",
+            "    res['connect'] = 'ok'\n",
+            "  except OSError as e:\n",
+            "    res['connect'] = 'err:%d' % e.errno\n",
+            "  try:\n",
+            "    s.bind(('127.0.0.1', 0))\n",
+            "    res['bind'] = 'ok'\n",
+            "  except OSError as e:\n",
+            "    res['bind'] = 'err:%d' % e.errno\n",
+            "  s.close()\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy()
         .net_allow("tcp://127.0.0.1:9")
         .build()
         .unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(contents.contains("\"create\": \"ok\""),
-        "UDP socket creation must succeed with net rules present; got: {contents}");
-    assert!(contents.contains("\"sendto\": \"err:111\""),
-        "UDP sendto must be denied with ECONNREFUSED; got: {contents}");
-    assert!(contents.contains("\"connect\": \"err:111\""),
-        "UDP connect must be denied with ECONNREFUSED; got: {contents}");
-    assert!(contents.contains("\"bind\": \"err:13\""),
-        "UDP bind must be denied with EACCES; got: {contents}");
+    assert!(
+        contents.contains("\"create\": \"ok\""),
+        "UDP socket creation must succeed with net rules present; got: {contents}"
+    );
+    assert!(
+        contents.contains("\"sendto\": \"err:111\""),
+        "UDP sendto must be denied with ECONNREFUSED; got: {contents}"
+    );
+    assert!(
+        contents.contains("\"connect\": \"err:111\""),
+        "UDP connect must be denied with ECONNREFUSED; got: {contents}"
+    );
+    assert!(
+        contents.contains("\"bind\": \"err:13\""),
+        "UDP bind must be denied with EACCES; got: {contents}"
+    );
     assert!(result.success());
 }
 
@@ -371,21 +409,26 @@ async fn test_udp_send_time_gating_with_tcp_only_rules() {
 async fn test_sysv_shmget_denied_by_default() {
     let out = temp_out("shmget-denied");
     // shmget(IPC_PRIVATE, 4096, IPC_CREAT|0600) — should return EPERM.
-    let script = format!(concat!(
-        "import ctypes, errno\n",
-        "libc = ctypes.CDLL(None)\n",
-        "ret = libc.shmget(0, 4096, 0o1000 | 0o600)\n",
-        "if ret == -1:\n",
-        "  e = ctypes.get_errno()\n",
-        "  result = 'EPERM' if e == errno.EPERM else f'ERROR:{{e}}'\n",
-        "else:\n",
-        "  libc.shmctl(ret, 0, None)\n",
-        "  result = 'ALLOWED'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import ctypes, errno\n",
+            "libc = ctypes.CDLL(None)\n",
+            "ret = libc.shmget(0, 4096, 0o1000 | 0o600)\n",
+            "if ret == -1:\n",
+            "  e = ctypes.get_errno()\n",
+            "  result = 'EPERM' if e == errno.EPERM else f'ERROR:{{e}}'\n",
+            "else:\n",
+            "  libc.shmctl(ret, 0, None)\n",
+            "  result = 'ALLOWED'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -408,23 +451,28 @@ async fn test_sysv_shmget_denied_by_default() {
 #[tokio::test]
 async fn test_sysv_shmget_allowed_when_opted_in() {
     let out = temp_out("shmget-allowed");
-    let script = format!(concat!(
-        "import ctypes\n",
-        "libc = ctypes.CDLL(None)\n",
-        "ret = libc.shmget(0, 4096, 0o1000 | 0o600)\n",
-        "if ret == -1:\n",
-        "  result = 'BLOCKED'\n",
-        "else:\n",
-        "  libc.shmctl(ret, 0, None)\n",
-        "  result = 'ALLOWED'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import ctypes\n",
+            "libc = ctypes.CDLL(None)\n",
+            "ret = libc.shmget(0, 4096, 0o1000 | 0o600)\n",
+            "if ret == -1:\n",
+            "  result = 'BLOCKED'\n",
+            "else:\n",
+            "  libc.shmctl(ret, 0, None)\n",
+            "  result = 'ALLOWED'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
     let policy = base_policy()
         .extra_allow_syscalls(vec!["sysv_ipc".into()])
         .build()
         .unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -445,23 +493,26 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
 #[tokio::test]
 async fn test_tcp_always_allowed() {
     let out = temp_out("tcp-allowed");
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "  s.close()\n",
-        "  result = 'ALLOWED'\n",
-        "except PermissionError:\n",
-        "  result = 'BLOCKED'\n",
-        "except OSError as e:\n",
-        "  result = f'ERROR:{{e.errno}}'\n",
-        "open('{out}', 'w').write(result)\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "  s.close()\n",
+            "  result = 'ALLOWED'\n",
+            "except PermissionError:\n",
+            "  result = 'BLOCKED'\n",
+            "except OSError as e:\n",
+            "  result = f'ERROR:{{e.errno}}'\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        out = out.display()
+    );
 
-    let policy = base_policy()
-        .build()
-        .unwrap();
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+    let policy = base_policy().build().unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -491,7 +542,10 @@ async fn check_control_semaphore_is_inaccessible(no_supervisor: bool) {
     let shared_canary = unsafe { libc::shmget(libc::IPC_PRIVATE, 4096, 0o600) };
     assert!(shared_canary >= 0);
     let canary = Canary(id, shared_canary);
-    assert_eq!(unsafe { libc::semctl(id, 0, libc::SETVAL, 7 as libc::c_int) }, 0);
+    assert_eq!(
+        unsafe { libc::semctl(id, 0, libc::SETVAL, 7 as libc::c_int) },
+        0
+    );
 
     let mut holder = base_policy().build().unwrap();
     holder.create(&["true"]).await.unwrap();
@@ -514,7 +568,8 @@ async fn check_control_semaphore_is_inaccessible(no_supervisor: bool) {
     let segment_metadata = unsafe { libc::shmget(segment_key, 0, 0o600) };
     assert!(segment_registry >= 0 && segment_metadata >= 0);
 
-    let script = format!(r#"
+    let script = format!(
+        r#"
 import ctypes, errno
 c = ctypes.CDLL(None, use_errno=True)
 class Op(ctypes.Structure):
@@ -547,16 +602,34 @@ for name, call in checks:
 with open('/proc/self/maps') as maps:
     assert '/SYSV{key:08x}' not in maps.read()
 print('all semaphore access denied')
-"#);
-    let result = base_policy().no_supervisor(no_supervisor).build().unwrap()
-        .run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "semaphore access escaped policy: {result:?}");
-    assert!(result.stdout_str().unwrap_or("").contains("all semaphore access denied"));
+"#
+    );
+    let result = base_policy()
+        .no_supervisor(no_supervisor)
+        .build()
+        .unwrap()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "semaphore access escaped policy: {result:?}"
+    );
+    assert!(result
+        .stdout_str()
+        .unwrap_or("")
+        .contains("all semaphore access denied"));
     assert_eq!(unsafe { libc::semctl(id, 0, libc::GETVAL) }, 7);
     assert!(unsafe { libc::semctl(registry, 0, libc::GETVAL) } >= 0);
     let mut stat: libc::shmid_ds = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::shmctl(shared_canary, libc::IPC_STAT, &mut stat) }, 0);
-    assert_eq!(unsafe { libc::shmctl(metadata, libc::IPC_STAT, &mut stat) }, 0);
+    assert_eq!(
+        unsafe { libc::shmctl(shared_canary, libc::IPC_STAT, &mut stat) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::shmctl(metadata, libc::IPC_STAT, &mut stat) },
+        0
+    );
     drop(holder);
     drop(canary);
 }
@@ -593,10 +666,17 @@ async fn test_clone3_is_refused_so_namespace_flags_cannot_hide_in_it() {
         "print(subprocess.run(['true']).returncode)\n",
     ), clone3 = libc::SYS_clone3, clone = libc::SYS_clone);
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines, ["ENOSYS ENOSYS", "EPERM", "0"],
+    assert_eq!(
+        lines,
+        ["ENOSYS ENOSYS", "EPERM", "0"],
         "clone3 refused, clone(CLONE_NEWUSER) refused, ordinary spawning still works; stderr: {}",
-        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()));
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
 }

@@ -55,7 +55,13 @@ mod tests {
     fn minimal_spec() -> Spec {
         SpecBuilder::default()
             .version("1.0.2")
-            .root(RootBuilder::default().path("rootfs").readonly(false).build().unwrap())
+            .root(
+                RootBuilder::default()
+                    .path("rootfs")
+                    .readonly(false)
+                    .build()
+                    .unwrap(),
+            )
             .process(
                 ProcessBuilder::default()
                     .cwd("/app")

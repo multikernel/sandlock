@@ -50,7 +50,11 @@ fn main() {
         let (ccs, fail_msg) = if is_riscv64 {
             if host.starts_with("riscv64") {
                 (
-                    &["cc", "riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
+                    &[
+                        "cc",
+                        "riscv64-linux-gnu-gcc",
+                        "riscv64-unknown-linux-gnu-gcc",
+                    ][..],
                     "failed to compile restore-stub for riscv64: no working C compiler \
                      (install gcc); checkpoint restore is unavailable",
                 )
@@ -110,7 +114,6 @@ fn main() {
         // Emit the path every run (rustc-env is not cached across build-script runs),
         // whether or not the binary was just (re)built.
         println!("cargo:rustc-env=RESTORE_STUB_PATH={}", stub_bin.display());
-
     }
 
     // shebang-trampoline: runs a chroot script's #! interpreter (see the
@@ -119,7 +122,10 @@ fn main() {
     let tramp_bin = out_dir.join("shebang-trampoline");
     let arch = target.split('-').next().unwrap_or_default();
     let arch = if is_riscv64 { "riscv64" } else { arch };
-    let mut tramp_ccs = vec![format!("{arch}-linux-gnu-gcc"), format!("{arch}-unknown-linux-gnu-gcc")];
+    let mut tramp_ccs = vec![
+        format!("{arch}-linux-gnu-gcc"),
+        format!("{arch}-unknown-linux-gnu-gcc"),
+    ];
     if host.starts_with(arch) {
         tramp_ccs.insert(0, "cc".to_string());
     }
@@ -151,7 +157,10 @@ fn main() {
     if !tramp_bin.exists() {
         std::fs::write(&tramp_bin, b"").unwrap();
     }
-    println!("cargo:rustc-env=SHEBANG_TRAMPOLINE_PATH={}", tramp_bin.display());
+    println!(
+        "cargo:rustc-env=SHEBANG_TRAMPOLINE_PATH={}",
+        tramp_bin.display()
+    );
 }
 
 /// Compile `src` to `bin` with the first working compiler in `ccs`, skipping the

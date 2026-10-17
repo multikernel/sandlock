@@ -11,10 +11,10 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr;
 
 use sandlock_ffi::{
-    sandlock_handle_free, sandlock_handle_kill, sandlock_popen,
-    sandlock_result_exit_code, sandlock_result_free, sandlock_result_success,
-    sandlock_sandbox_build, sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_new,
-    sandlock_sandbox_free, sandlock_sandbox_t,
+    sandlock_handle_free, sandlock_handle_kill, sandlock_popen, sandlock_result_exit_code,
+    sandlock_result_free, sandlock_result_success, sandlock_sandbox_build,
+    sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_new, sandlock_sandbox_free,
+    sandlock_sandbox_t,
 };
 
 const INHERIT: u32 = 0;
@@ -26,7 +26,9 @@ fn build_policy() -> *mut sandlock_sandbox_t {
     let mut b = sandlock_sandbox_builder_new();
     for p in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"] {
         // `/lib64` is absent on RISC-V glibc / musl; fs_read is mandatory.
-        if p == "/lib64" && !std::path::Path::new("/lib64").exists() { continue; }
+        if p == "/lib64" && !std::path::Path::new("/lib64").exists() {
+            continue;
+        }
         let c = CString::new(p).unwrap();
         b = unsafe { sandlock_sandbox_builder_fs_read(b, c.as_ptr()) };
     }

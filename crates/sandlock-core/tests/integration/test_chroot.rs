@@ -1,6 +1,6 @@
 use sandlock_core::sandbox::BranchAction;
 #[allow(unused_imports)]
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -34,7 +34,11 @@ fn temp_dir(name: &str) -> PathBuf {
     let base = option_env!("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("sandlock-test-chroot-{}-{}", name, std::process::id()));
+    let dir = base.join(format!(
+        "sandlock-test-chroot-{}-{}",
+        name,
+        std::process::id()
+    ));
     let _ = fs::create_dir_all(&dir);
     dir
 }
@@ -76,7 +80,9 @@ fn build_test_rootfs(name: &str) -> PathBuf {
         .expect("failed to install rootfs-helper into rootfs");
 
     // Create busybox-style symlinks (relative, within rootfs)
-    for cmd in &["sh", "cat", "echo", "ls", "pwd", "readlink", "true", "write"] {
+    for cmd in &[
+        "sh", "cat", "echo", "ls", "pwd", "readlink", "true", "write",
+    ] {
         let link = rootfs.join(format!("usr/bin/{}", cmd));
         let _ = fs::remove_file(&link);
         std::os::unix::fs::symlink("rootfs-helper", &link)
@@ -151,7 +157,10 @@ async fn test_chroot_no_escape() {
 
     // Path traversal: /../../etc/sentinel should resolve to /etc/sentinel inside
     // the chroot (the sentinel file we created), not escape to the host.
-    let result = policy.clone().run(&["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/../../etc/sentinel"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -213,9 +222,16 @@ async fn test_chroot_getcwd() {
 async fn test_chroot_chdir_short_path() {
     let rootfs = build_test_rootfs("chdir-short");
 
-    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
 
-    match policy.clone().run(&["rootfs-helper", "chdir", "/tmp"]).await {
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "chdir", "/tmp"])
+        .await
+    {
         Ok(r) => {
             assert!(
                 r.success(),
@@ -261,7 +277,10 @@ async fn test_chroot_relative_open_follows_chdir() {
     let rootfs = build_test_rootfs("chdir-relative");
     fs::write(rootfs.join("tmp/marker.txt"), "marker-body\n").unwrap();
 
-    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
 
     match policy
         .clone()
@@ -351,7 +370,12 @@ async fn test_chroot_proc_self_cwd_link_follows_chdir() {
 
     match policy
         .clone()
-        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && readlink /proc/self/cwd"])
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "chdir /tmp && readlink /proc/self/cwd",
+        ])
         .await
     {
         Ok(r) => {
@@ -461,11 +485,22 @@ async fn test_chroot_unlink_removes_the_symlink_not_its_target() {
     fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
     std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
 
-    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
 
-    match policy.clone().run(&["rootfs-helper", "rm", "/tmp/link.txt"]).await {
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "rm", "/tmp/link.txt"])
+        .await
+    {
         Ok(r) => {
-            assert!(r.success(), "rm should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                r.success(),
+                "rm should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
             assert!(
                 rootfs.join("tmp/target.txt").exists(),
                 "rm of a symlink deleted its target"
@@ -490,7 +525,10 @@ async fn test_chroot_lstat_describes_the_symlink() {
     fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
     std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
 
-    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
 
     match policy
         .clone()
@@ -519,7 +557,10 @@ async fn test_chroot_rename_moves_the_symlink_not_its_target() {
     fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
     std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
 
-    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
 
     match policy
         .clone()
@@ -527,7 +568,11 @@ async fn test_chroot_rename_moves_the_symlink_not_its_target() {
         .await
     {
         Ok(r) => {
-            assert!(r.success(), "mv should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                r.success(),
+                "mv should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
             assert!(
                 rootfs.join("tmp/target.txt").exists(),
                 "rename of a symlink moved its target"
@@ -666,7 +711,10 @@ async fn test_chroot_openat2_resolves_inside_the_rootfs() {
     let rootfs = build_test_rootfs("openat2-absolute");
     fs::write(rootfs.join("etc/marker.txt"), "from-rootfs\n").unwrap();
 
-    let policy = minimal_exec_policy(&rootfs).fs_read("/etc").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .build()
+        .unwrap();
 
     match policy
         .clone()
@@ -698,11 +746,19 @@ async fn test_chroot_openat2_relative_follows_chdir() {
     let rootfs = build_test_rootfs("openat2-relative");
     fs::write(rootfs.join("tmp/marker.txt"), "from-tmp\n").unwrap();
 
-    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
 
     match policy
         .clone()
-        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && openat2 marker.txt"])
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "chdir /tmp && openat2 marker.txt",
+        ])
         .await
     {
         Ok(r) => {
@@ -734,7 +790,10 @@ async fn test_chroot_openat2_honors_resolve_no_symlinks() {
     fs::write(rootfs.join("etc/marker.txt"), "from-rootfs\n").unwrap();
     std::os::unix::fs::symlink("marker.txt", rootfs.join("etc/link.txt")).unwrap();
 
-    let policy = minimal_exec_policy(&rootfs).fs_read("/etc").build().unwrap();
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .build()
+        .unwrap();
 
     match policy
         .clone()
@@ -781,7 +840,6 @@ async fn test_chroot_chdir_proc_readonly_buffer() {
 
     let result = policy
         .clone()
-        
         .run(&["rootfs-helper", "chdir", "/proc"])
         .await;
     match result {
@@ -793,7 +851,12 @@ async fn test_chroot_chdir_proc_readonly_buffer() {
             );
             // cwd must be /proc (getcwd may render the mount root with a
             // trailing slash; the meaningful assertion is that we landed there).
-            let cwd = r.stdout_str().unwrap_or("").trim().trim_end_matches('/').to_string();
+            let cwd = r
+                .stdout_str()
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('/')
+                .to_string();
             assert_eq!(cwd, "OK /proc", "cwd after chdir should be /proc");
         }
         Err(e) => eprintln!("Chroot test skipped: {}", e),
@@ -820,7 +883,6 @@ async fn test_chroot_chdir_proc_self_resolves_to_child() {
 
     let result = policy
         .clone()
-        
         .run(&["rootfs-helper", "chdir-self", "/proc/self"])
         .await;
     match result {
@@ -867,7 +929,6 @@ async fn test_chroot_proc_dirfd_relative_is_virtualized() {
 
     let result = policy
         .clone()
-        
         .run(&["rootfs-helper", "proc-dirfd", "meminfo"])
         .await;
     match result {
@@ -878,7 +939,11 @@ async fn test_chroot_proc_dirfd_relative_is_virtualized() {
                 r.stderr_str().unwrap_or("")
             );
             let out = r.stdout_str().unwrap_or("");
-            assert!(out.contains("MemTotal"), "expected synthesized meminfo, got: {:?}", out);
+            assert!(
+                out.contains("MemTotal"),
+                "expected synthesized meminfo, got: {:?}",
+                out
+            );
             assert!(
                 out.contains("262144"),
                 "expected virtual 256MiB MemTotal (262144 kB), got: {:?}",
@@ -913,8 +978,12 @@ async fn test_chroot_magic_fd_symlink_resolves_to_child_fd() {
 
     let result = policy
         .clone()
-        
-        .run(&["rootfs-helper", "write-fd-link", "/tmp/errlog", "MAGIC_MARKER"])
+        .run(&[
+            "rootfs-helper",
+            "write-fd-link",
+            "/tmp/errlog",
+            "MAGIC_MARKER",
+        ])
         .await;
     match result {
         Ok(r) => {
@@ -952,9 +1021,15 @@ async fn test_chroot_write_file() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"],
-    )
-    .await;
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "echo hello > /tmp/test.txt && cat /tmp/test.txt",
+        ])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -987,10 +1062,8 @@ async fn test_chroot_cow_directory_open_stays_in_rootfs() {
 
     fs::write(rootfs.join("tmp/rootfs-only.txt"), "rootfs").unwrap();
 
-    let host_marker = std::env::temp_dir().join(format!(
-        "sandlock-host-marker-{}",
-        std::process::id()
-    ));
+    let host_marker =
+        std::env::temp_dir().join(format!("sandlock-host-marker-{}", std::process::id()));
     fs::write(&host_marker, "host").unwrap();
 
     let policy = Sandbox::builder()
@@ -1053,9 +1126,10 @@ async fn test_chroot_with_cow() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"],
-    )
-    .await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1114,8 +1188,12 @@ async fn test_chroot_cow_read_deleted_file_is_enoent() {
     // in-process, so `rm` and `cat` share one COW branch.)
     let result = policy
         .clone()
-        
-        .run(&["rootfs-helper", "sh", "-c", "rm /tmp/secret.txt; cat /tmp/secret.txt"])
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "rm /tmp/secret.txt; cat /tmp/secret.txt",
+        ])
         .await;
     match result {
         Ok(r) => {
@@ -1147,7 +1225,10 @@ async fn test_chroot_proc_self_root() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "readlink", "/proc/self/root"]).await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "readlink", "/proc/self/root"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1180,9 +1261,15 @@ async fn test_chroot_write_denied_without_fs_write() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "sh", "-c", "echo denied > /tmp/should-fail.txt"],
-    )
-    .await;
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "echo denied > /tmp/should-fail.txt",
+        ])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1210,7 +1297,10 @@ async fn test_chroot_exec_with_root_readable() {
         .unwrap();
 
     // Use /bin/rootfs-helper which goes through the bin -> usr/bin symlink
-    let result = policy.clone().run(&["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
+    let result = policy
+        .clone()
+        .run(&["/bin/rootfs-helper", "echo", "chroot-exec-ok"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1244,7 +1334,10 @@ async fn test_chroot_fs_deny_blocks_virtual_path() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/etc/hostname"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1273,7 +1366,10 @@ async fn test_chroot_read_denied_without_fs_read() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/etc/hostname"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1312,7 +1408,10 @@ async fn test_fs_mount_read_write() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "cat", "/work/input.txt"]).await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/work/input.txt"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1356,7 +1455,10 @@ async fn test_chroot_etc_hosts_seeded_from_image() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/etc/hosts"])
+        .await;
     match result {
         Ok(r) => {
             assert!(
@@ -1401,7 +1503,10 @@ async fn test_chroot_etc_hosts_no_duplicate_loopback() {
         .build()
         .unwrap();
 
-    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/etc/hosts"])
+        .await;
     match result {
         Ok(r) => {
             assert!(r.success(), "cat /etc/hosts should succeed");
@@ -1416,7 +1521,10 @@ async fn test_chroot_etc_hosts_no_duplicate_loopback() {
                 1,
                 "v6 loopback duplicated: {stdout}"
             );
-            assert!(stdout.contains("10.0.0.5 svc.local"), "image entry missing: {stdout}");
+            assert!(
+                stdout.contains("10.0.0.5 svc.local"),
+                "image entry missing: {stdout}"
+            );
         }
         Err(e) => eprintln!("Chroot test skipped: {}", e),
     }
@@ -1567,7 +1675,13 @@ async fn test_chroot_hardlink_follow_cannot_reach_a_host_file() {
 
     let followed = policy
         .clone()
-        .run(&["rootfs-helper", "linkat", "/work/bait", "/work/pwn", "follow"])
+        .run(&[
+            "rootfs-helper",
+            "linkat",
+            "/work/bait",
+            "/work/pwn",
+            "follow",
+        ])
         .await
         .expect("second run should launch once the first did");
     assert!(
@@ -1671,7 +1785,13 @@ async fn test_chroot_hardlink_follow_links_the_target_inode() {
 
     let linked = policy
         .clone()
-        .run(&["rootfs-helper", "linkat", "/work/link", "/work/alias.txt", "follow"])
+        .run(&[
+            "rootfs-helper",
+            "linkat",
+            "/work/link",
+            "/work/alias.txt",
+            "follow",
+        ])
         .await
         .expect("second run should launch once the first did");
     assert!(
@@ -1685,7 +1805,10 @@ async fn test_chroot_hardlink_follow_links_the_target_inode() {
     let target = rootfs.join("work/orig.txt");
     let alias = rootfs.join("work/alias.txt");
     assert!(
-        !fs::symlink_metadata(&alias).unwrap().file_type().is_symlink(),
+        !fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the flag was dropped: the new name copied the symlink instead of \
          linking its target"
     );
@@ -1914,7 +2037,12 @@ async fn test_chroot_hardlink_allowed_when_both_sides_writable() {
 
     let linked = policy
         .clone()
-        .run(&["rootfs-helper", "linkat", "/work/orig.txt", "/work/alias.txt"])
+        .run(&[
+            "rootfs-helper",
+            "linkat",
+            "/work/orig.txt",
+            "/work/alias.txt",
+        ])
         .await
         .expect("second run should launch once the probe did");
     assert!(
@@ -1982,7 +2110,13 @@ async fn test_chroot_hardlink_follow_cannot_alias_a_denied_path_under_a_mount() 
 
     let followed = policy
         .clone()
-        .run(&["rootfs-helper", "linkat", "/work/s", "/work/alias.txt", "follow"])
+        .run(&[
+            "rootfs-helper",
+            "linkat",
+            "/work/s",
+            "/work/alias.txt",
+            "follow",
+        ])
         .await
         .expect("second run should launch once the first did");
     assert!(
@@ -2244,7 +2378,9 @@ async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
                 r.stderr_str().unwrap_or("")
             );
             assert!(
-                r.stderr_str().unwrap_or("").contains("No such file or directory"),
+                r.stderr_str()
+                    .unwrap_or("")
+                    .contains("No such file or directory"),
                 "the deleted file should read as absent, stderr={}",
                 r.stderr_str().unwrap_or("")
             );
@@ -2297,9 +2433,16 @@ async fn test_chroot_fchmodat2_resolves_in_rootfs() {
     let _ = fs::remove_file(&decoy);
     cleanup_rootfs(&rootfs);
 
-    assert!(result.success(), "chmod2 should succeed, stderr: {}", result.stderr_str().unwrap_or(""));
+    assert!(
+        result.success(),
+        "chmod2 should succeed, stderr: {}",
+        result.stderr_str().unwrap_or("")
+    );
     assert_eq!(got_inside, 0o600, "the rootfs file must carry the new mode");
-    assert_eq!(got_decoy, 0o644, "the host file at the same path must be untouched");
+    assert_eq!(
+        got_decoy, 0o644,
+        "the host file at the same path must be untouched"
+    );
 }
 
 /// An absolute symlink inside the image names a path in the sandbox's root,
@@ -2329,15 +2472,30 @@ async fn test_chroot_cow_symlink_stays_inside_the_rootfs() {
         .build()
         .unwrap();
 
-    let read = policy.clone().run(&["rootfs-helper", "cat", "/tmp/l_secret"]).await;
-    let init = policy.clone().run(&["rootfs-helper", "cat", "/tmp/l_init"]).await;
-    let write = policy.clone().run(&["rootfs-helper", "write", "/tmp/l_written", "escaped"]).await;
+    let read = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/tmp/l_secret"])
+        .await;
+    let init = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/tmp/l_init"])
+        .await;
+    let write = policy
+        .clone()
+        .run(&["rootfs-helper", "write", "/tmp/l_written", "escaped"])
+        .await;
     match (read, init, write) {
         (Ok(read), Ok(init), Ok(write)) => {
             let out = read.stdout_str().unwrap_or("");
-            assert!(!out.contains("host secret"), "read a host file through an image symlink: {out:?}");
+            assert!(
+                !out.contains("host secret"),
+                "read a host file through an image symlink: {out:?}"
+            );
             let out = init.stdout_str().unwrap_or("");
-            assert!(!out.contains("Name:"), "read host /proc/1 through an image symlink: {out:?}");
+            assert!(
+                !out.contains("Name:"),
+                "read host /proc/1 through an image symlink: {out:?}"
+            );
             assert!(
                 !host_written.exists(),
                 "wrote a host file through an image symlink (write stderr: {})",
@@ -2370,8 +2528,13 @@ async fn test_chroot_fexecve_runs_an_image_held_by_fd() {
         let r = policy
             .clone()
             .run(&[
-                "/usr/bin/rootfs-helper", "fexecve", "/usr/bin/rootfs-helper", source,
-                "rootfs-helper", "echo", out.as_str(),
+                "/usr/bin/rootfs-helper",
+                "fexecve",
+                "/usr/bin/rootfs-helper",
+                source,
+                "rootfs-helper",
+                "echo",
+                out.as_str(),
             ])
             .await
             .unwrap();
@@ -2423,10 +2586,18 @@ async fn test_chroot_shebang_runs_the_image_interpreter() {
 async fn test_chroot_shebang_does_not_resolve_on_the_host() {
     let rootfs = build_test_rootfs("shebang-host");
     let host_helper = rootfs.join("usr/bin/rootfs-helper").canonicalize().unwrap();
-    install_script(&rootfs, "probe", &format!("#!{} echo\n", host_helper.display()));
+    install_script(
+        &rootfs,
+        "probe",
+        &format!("#!{} echo\n", host_helper.display()),
+    );
     let policy = minimal_exec_policy(&rootfs).build().unwrap();
 
-    let r = policy.clone().run(&["/usr/bin/probe", "escaped"]).await.unwrap();
+    let r = policy
+        .clone()
+        .run(&["/usr/bin/probe", "escaped"])
+        .await
+        .unwrap();
     assert!(
         !r.success() && !r.stdout_str().unwrap_or("").contains("escaped"),
         "host-path interpreter must not run, exit={:?} stdout: {}",

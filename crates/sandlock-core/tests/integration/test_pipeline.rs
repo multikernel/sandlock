@@ -1,11 +1,16 @@
+use sandlock_core::pipeline::{Gather, Pipeline, Stage};
 use sandlock_core::sandbox::Sandbox;
-use sandlock_core::pipeline::{Stage, Pipeline, Gather};
 use std::time::Duration;
 
 fn base_policy() -> Sandbox {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
         .build()
         .unwrap()
@@ -18,15 +23,17 @@ fn base_policy() -> Sandbox {
 #[tokio::test]
 async fn test_stage_run() {
     let policy = base_policy();
-    let result = Stage::new(&policy, &["echo", "hello"]).run(None).await.unwrap();
+    let result = Stage::new(&policy, &["echo", "hello"])
+        .run(None)
+        .await
+        .unwrap();
     assert!(result.success());
 }
 
 #[tokio::test]
 async fn test_stage_or_stage_returns_pipeline() {
     let policy = base_policy();
-    let pipeline = Stage::new(&policy, &["echo", "hello"])
-        | Stage::new(&policy, &["cat"]);
+    let pipeline = Stage::new(&policy, &["echo", "hello"]) | Stage::new(&policy, &["cat"]);
     assert_eq!(pipeline.len(), 2);
 }
 
@@ -46,10 +53,10 @@ async fn test_stage_chaining() {
 #[tokio::test]
 async fn test_two_stage_pipe() {
     let policy = base_policy();
-    let result = (
-        Stage::new(&policy, &["echo", "hello pipeline"])
-        | Stage::new(&policy, &["cat"])
-    ).run(None).await.unwrap();
+    let result = (Stage::new(&policy, &["echo", "hello pipeline"]) | Stage::new(&policy, &["cat"]))
+        .run(None)
+        .await
+        .unwrap();
 
     assert!(result.success());
     let stdout = result.stdout_str().unwrap_or("");
@@ -59,11 +66,12 @@ async fn test_two_stage_pipe() {
 #[tokio::test]
 async fn test_three_stage_pipe() {
     let policy = base_policy();
-    let result = (
-        Stage::new(&policy, &["echo", "hello"])
+    let result = (Stage::new(&policy, &["echo", "hello"])
         | Stage::new(&policy, &["tr", "a-z", "A-Z"])
-        | Stage::new(&policy, &["cat"])
-    ).run(None).await.unwrap();
+        | Stage::new(&policy, &["cat"]))
+    .run(None)
+    .await
+    .unwrap();
 
     assert!(result.success());
     let stdout = result.stdout_str().unwrap_or("");
@@ -72,15 +80,23 @@ async fn test_three_stage_pipe() {
 
 #[tokio::test]
 async fn test_disjoint_policies() {
-    let tmp = std::env::temp_dir().join(format!("sandlock-test-pipeline-disjoint-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!(
+        "sandlock-test-pipeline-disjoint-{}",
+        std::process::id()
+    ));
     let _ = std::fs::create_dir_all(&tmp);
     let secret = tmp.join("secret.txt");
     std::fs::write(&secret, "sensitive data").unwrap();
 
     // Stage 1: can read the temp dir
     let reader_policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_read(&tmp)
         .build()
         .unwrap();
@@ -88,10 +104,11 @@ async fn test_disjoint_policies() {
     // Stage 2: cannot read the temp dir (only standard paths)
     let processor_policy = base_policy();
 
-    let result = (
-        Stage::new(&reader_policy, &["cat", secret.to_str().unwrap()])
-        | Stage::new(&processor_policy, &["tr", "a-z", "A-Z"])
-    ).run(None).await.unwrap();
+    let result = (Stage::new(&reader_policy, &["cat", secret.to_str().unwrap()])
+        | Stage::new(&processor_policy, &["tr", "a-z", "A-Z"]))
+    .run(None)
+    .await
+    .unwrap();
 
     assert!(result.success());
     let stdout = result.stdout_str().unwrap_or("");
@@ -103,23 +120,29 @@ async fn test_disjoint_policies() {
 #[tokio::test]
 async fn test_pipeline_captures_last_stderr() {
     let policy = base_policy();
-    let result = (
-        Stage::new(&policy, &["echo", "hello"])
-        | Stage::new(&policy, &["sh", "-c", "cat >&2; echo stdout_line"])
-    ).run(None).await.unwrap();
+    let result = (Stage::new(&policy, &["echo", "hello"])
+        | Stage::new(&policy, &["sh", "-c", "cat >&2; echo stdout_line"]))
+    .run(None)
+    .await
+    .unwrap();
 
     assert!(result.success());
     let stderr = result.stderr_str().unwrap_or("");
-    assert!(stderr.contains("hello"), "stderr should contain piped input, got: {}", stderr);
+    assert!(
+        stderr.contains("hello"),
+        "stderr should contain piped input, got: {}",
+        stderr
+    );
 }
 
 #[tokio::test]
 async fn test_first_stage_failure() {
     let policy = base_policy();
-    let result = (
-        Stage::new(&policy, &["/nonexistent_binary_xyz"])
-        | Stage::new(&policy, &["cat"])
-    ).run(None).await.unwrap();
+    let result = (Stage::new(&policy, &["/nonexistent_binary_xyz"])
+        | Stage::new(&policy, &["cat"]))
+    .run(None)
+    .await
+    .unwrap();
 
     // Last stage (cat) reads EOF → exits 0
     // The pipeline returns last stage's exit code
@@ -130,10 +153,11 @@ async fn test_first_stage_failure() {
 #[tokio::test]
 async fn test_last_stage_failure() {
     let policy = base_policy();
-    let result = (
-        Stage::new(&policy, &["echo", "hello"])
-        | Stage::new(&policy, &["sh", "-c", "exit 42"])
-    ).run(None).await.unwrap();
+    let result = (Stage::new(&policy, &["echo", "hello"])
+        | Stage::new(&policy, &["sh", "-c", "exit 42"]))
+    .run(None)
+    .await
+    .unwrap();
 
     assert!(!result.success());
     assert_eq!(result.code(), Some(42));
@@ -149,10 +173,10 @@ async fn test_pipeline_requires_two_stages() {
 #[tokio::test]
 async fn test_pipeline_timeout() {
     let policy = base_policy();
-    let result = (
-        Stage::new(&policy, &["sleep", "60"])
-        | Stage::new(&policy, &["cat"])
-    ).run(Some(Duration::from_secs(1))).await.unwrap();
+    let result = (Stage::new(&policy, &["sleep", "60"]) | Stage::new(&policy, &["cat"]))
+        .run(Some(Duration::from_secs(1)))
+        .await
+        .unwrap();
 
     assert!(!result.success());
 }
@@ -173,8 +197,13 @@ async fn test_xoa_data_flow() {
 
     // Executor: can read workspace
     let executor_policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_read(&tmp)
         .build()
         .unwrap();
@@ -182,10 +211,11 @@ async fn test_xoa_data_flow() {
     // Planner emits a shell command that reads the data file
     let planner_cmd = format!("echo 'cat {}'", data_file.display());
 
-    let result = (
-        Stage::new(&planner_policy, &["sh", "-c", &planner_cmd])
-        | Stage::new(&executor_policy, &["sh"])
-    ).run(None).await.unwrap();
+    let result = (Stage::new(&planner_policy, &["sh", "-c", &planner_cmd])
+        | Stage::new(&executor_policy, &["sh"]))
+    .run(None)
+    .await
+    .unwrap();
 
     assert!(result.success(), "exit={:?}", result.code());
     let stdout = result.stdout_str().unwrap_or("");
@@ -207,15 +237,23 @@ async fn test_gather_two_sources() {
     let result = Gather::new()
         .source("greeting", Stage::new(&policy, &["echo", "hello"]))
         .source("name", Stage::new(&policy, &["echo", "world"]))
-        .consumer(Stage::new(&policy, &["sh", "-c",
-            "cat <&3; cat"
-        ]))
-        .run(None).await.unwrap();
+        .consumer(Stage::new(&policy, &["sh", "-c", "cat <&3; cat"]))
+        .run(None)
+        .await
+        .unwrap();
 
-    assert!(result.success(), "exit={:?} stderr={}", result.code(),
-            result.stderr_str().unwrap_or(""));
+    assert!(
+        result.success(),
+        "exit={:?} stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let stdout = result.stdout_str().unwrap_or("");
-    assert!(stdout.contains("hello"), "missing greeting, got: {}", stdout);
+    assert!(
+        stdout.contains("hello"),
+        "missing greeting, got: {}",
+        stdout
+    );
     assert!(stdout.contains("world"), "missing name, got: {}", stdout);
 }
 
@@ -225,10 +263,10 @@ async fn test_gather_env_var() {
     let result = Gather::new()
         .source("alpha", Stage::new(&policy, &["echo", "aaa"]))
         .source("beta", Stage::new(&policy, &["echo", "bbb"]))
-        .consumer(Stage::new(&policy, &["sh", "-c",
-            "echo $_SANDLOCK_GATHER"
-        ]))
-        .run(None).await.unwrap();
+        .consumer(Stage::new(&policy, &["sh", "-c", "echo $_SANDLOCK_GATHER"]))
+        .run(None)
+        .await
+        .unwrap();
 
     assert!(result.success());
     let stdout = result.stdout_str().unwrap_or("");
@@ -245,8 +283,13 @@ async fn test_gather_disjoint_policies() {
 
     // Data source: can read the file
     let data_policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_read(&tmp)
         .build()
         .unwrap();
@@ -258,20 +301,33 @@ async fn test_gather_disjoint_policies() {
     let consumer_policy = base_policy();
 
     let result = Gather::new()
-        .source("data", Stage::new(&data_policy, &[
-            "cat", secret.to_str().unwrap()
-        ]))
-        .source("code", Stage::new(&code_policy, &[
-            "echo", "tr a-z A-Z <&3"
-        ]))
-        .consumer(Stage::new(&consumer_policy, &[
-            // code is on stdin, data is on fd 3
-            "sh", "-c", "code=$(cat); eval \"$code\""
-        ]))
-        .run(None).await.unwrap();
+        .source(
+            "data",
+            Stage::new(&data_policy, &["cat", secret.to_str().unwrap()]),
+        )
+        .source(
+            "code",
+            Stage::new(&code_policy, &["echo", "tr a-z A-Z <&3"]),
+        )
+        .consumer(Stage::new(
+            &consumer_policy,
+            &[
+                // code is on stdin, data is on fd 3
+                "sh",
+                "-c",
+                "code=$(cat); eval \"$code\"",
+            ],
+        ))
+        .run(None)
+        .await
+        .unwrap();
 
-    assert!(result.success(), "exit={:?} stderr={}", result.code(),
-            result.stderr_str().unwrap_or(""));
+    assert!(
+        result.success(),
+        "exit={:?} stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     let stdout = result.stdout_str().unwrap_or("");
     assert!(stdout.contains("SECRET DATA"), "got: {}", stdout);
 
@@ -283,7 +339,8 @@ async fn test_gather_requires_consumer() {
     let policy = base_policy();
     let result = Gather::new()
         .source("a", Stage::new(&policy, &["echo", "hello"]))
-        .run(None).await;
+        .run(None)
+        .await;
 
     assert!(result.is_err());
 }
@@ -293,7 +350,8 @@ async fn test_gather_requires_sources() {
     let policy = base_policy();
     let result = Gather::new()
         .consumer(Stage::new(&policy, &["cat"]))
-        .run(None).await;
+        .run(None)
+        .await;
 
     assert!(result.is_err());
 }

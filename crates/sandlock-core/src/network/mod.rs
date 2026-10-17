@@ -194,4 +194,3 @@ pub(crate) async fn handle_net(
         NotifAction::Continue
     }
 }
-

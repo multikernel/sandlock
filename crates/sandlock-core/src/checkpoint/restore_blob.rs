@@ -200,9 +200,20 @@ pub(crate) fn verify_special_mappings(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RestoreRegion {
     /// mmap MAP_FIXED from `path` at `offset`, prot from `perms`.
-    MapFile { start: u64, end: u64, perms: String, offset: u64, path: String },
+    MapFile {
+        start: u64,
+        end: u64,
+        perms: String,
+        offset: u64,
+        path: String,
+    },
     /// mmap MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE, then fill with `data`.
-    Anon { start: u64, end: u64, perms: String, data: Vec<u8> },
+    Anon {
+        start: u64,
+        end: u64,
+        perms: String,
+        data: Vec<u8>,
+    },
 }
 
 impl RestoreRegion {
@@ -223,22 +234,27 @@ impl RestoreRegion {
 /// fresh process and they are relocated, not rebuilt. A region with captured
 /// bytes becomes `Anon`; otherwise a path-backed region becomes `MapFile`.
 /// Regions that are neither are left to the kernel/ABI.
-pub(crate) fn build_memory_plan(
-    maps: &[MemoryMap],
-    data: &[MemorySegment],
-) -> Vec<RestoreRegion> {
+pub(crate) fn build_memory_plan(maps: &[MemoryMap], data: &[MemorySegment]) -> Vec<RestoreRegion> {
     let mut plan = Vec::new();
     for m in maps {
-        if m.is_special() { continue; }
+        if m.is_special() {
+            continue;
+        }
         if let Some(seg) = data.iter().find(|s| s.start == m.start) {
             plan.push(RestoreRegion::Anon {
-                start: m.start, end: m.end, perms: m.perms.clone(), data: seg.data.clone(),
+                start: m.start,
+                end: m.end,
+                perms: m.perms.clone(),
+                data: seg.data.clone(),
             });
         } else if let Some(ref p) = m.path {
             if p.starts_with('/') {
                 plan.push(RestoreRegion::MapFile {
-                    start: m.start, end: m.end, perms: m.perms.clone(),
-                    offset: m.offset, path: p.clone(),
+                    start: m.start,
+                    end: m.end,
+                    perms: m.perms.clone(),
+                    offset: m.offset,
+                    path: p.clone(),
                 });
             }
         }
@@ -272,7 +288,10 @@ pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<SkippedFd>) {
         if is_restorable_file_path(&f.path) {
             restorable.push(f.clone());
         } else {
-            skipped.push(SkippedFd { fd: f.fd, path: f.path.clone() });
+            skipped.push(SkippedFd {
+                fd: f.fd,
+                path: f.path.clone(),
+            });
         }
     }
     (restorable, skipped)
@@ -311,7 +330,9 @@ pub(crate) fn plan_vdso_moves(cp: &[MemoryMap]) -> Vec<VdsoMove> {
             .find(|m| m.path.as_deref() == Some(name))
             .map(|m| (m.start, m.end))
     };
-    let Some((vdso_base, _)) = named("[vdso]") else { return Vec::new() };
+    let Some((vdso_base, _)) = named("[vdso]") else {
+        return Vec::new();
+    };
 
     let mut moves: Vec<VdsoMove> = ["[vvar]", "[vvar_vclock]", "[vdso]"]
         .into_iter()
@@ -329,9 +350,15 @@ pub(crate) fn plan_vdso_moves(cp: &[MemoryMap]) -> Vec<VdsoMove> {
 fn prot_bits(perms: &str) -> u32 {
     let b = perms.as_bytes();
     let mut p = 0u32;
-    if b.first() == Some(&b'r') { p |= libc::PROT_READ as u32; }
-    if b.get(1) == Some(&b'w') { p |= libc::PROT_WRITE as u32; }
-    if b.get(2) == Some(&b'x') { p |= libc::PROT_EXEC as u32; }
+    if b.first() == Some(&b'r') {
+        p |= libc::PROT_READ as u32;
+    }
+    if b.get(1) == Some(&b'w') {
+        p |= libc::PROT_WRITE as u32;
+    }
+    if b.get(2) == Some(&b'x') {
+        p |= libc::PROT_EXEC as u32;
+    }
     p
 }
 
@@ -381,7 +408,11 @@ fn restart_sentinel_in_a0(regs: &[u64]) -> Option<i64> {
     // a0-a7, s2-s11, t3-t6 — so a0 is index 10.
     const A0: usize = 10;
     let a0 = *regs.get(A0)? as i64;
-    if is_restart_sentinel(a0) { Some(a0) } else { None }
+    if is_restart_sentinel(a0) {
+        Some(a0)
+    } else {
+        None
+    }
 }
 
 /// Refuse a riscv64 register file whose `a0` holds a restart sentinel, with
@@ -577,7 +608,10 @@ pub(crate) fn plan(
             return Err(format!(
                 "checkpoint region {:#x}-{:#x} overlaps the restore-stub's reserved \
                  window {:#x}-{:#x}",
-                r.start(), r.end(), STUB_BASE, STUB_BASE + STUB_SPAN,
+                r.start(),
+                r.end(),
+                STUB_BASE,
+                STUB_BASE + STUB_SPAN,
             ));
         }
     }
@@ -596,11 +630,22 @@ pub(crate) fn plan(
     let mut region_tbl = Vec::with_capacity(regions.len() * REGION_ENTRY_LEN);
     for r in &regions {
         let (start, end, perms, src, file_off, path_off) = match r {
-            RestoreRegion::Anon { start, end, perms, data } => {
+            RestoreRegion::Anon {
+                start,
+                end,
+                perms,
+                data,
+            } => {
                 anon.push((*start, data.clone()));
                 (*start, *end, perms, SRC_ANON, 0u64, 0u32)
             }
-            RestoreRegion::MapFile { start, end, perms, offset, path } => {
+            RestoreRegion::MapFile {
+                start,
+                end,
+                perms,
+                offset,
+                path,
+            } => {
                 let off = strings.intern(&to_child_path(path, chroot_root, mounts))?;
                 (*start, *end, perms, SRC_FILE, *offset, off)
             }
@@ -666,7 +711,12 @@ pub(crate) fn plan(
     out.extend_from_slice(&fpstate);
     out.extend_from_slice(&strings.bytes);
 
-    Ok(RestorePlan { blob: out, anon, maps: ps.memory_maps.clone(), skipped })
+    Ok(RestorePlan {
+        blob: out,
+        anon,
+        maps: ps.memory_maps.clone(),
+        skipped,
+    })
 }
 
 #[cfg(test)]
@@ -676,7 +726,13 @@ mod tests {
     use crate::sandbox::Sandbox;
 
     fn map(start: u64, end: u64, path: Option<&str>) -> MemoryMap {
-        MemoryMap { start, end, perms: "rw-p".into(), offset: 0, path: path.map(Into::into) }
+        MemoryMap {
+            start,
+            end,
+            perms: "rw-p".into(),
+            offset: 0,
+            path: path.map(Into::into),
+        }
     }
 
     #[test]
@@ -711,55 +767,154 @@ mod tests {
     #[test]
     fn fd_plan_keeps_regular_files_only() {
         let fds = vec![
-            FdInfo { fd: 3, path: "/etc/hostname".into(), flags: 0, offset: 5 },
-            FdInfo { fd: 4, path: "socket:[12345]".into(), flags: 0, offset: 0 },
-            FdInfo { fd: 5, path: "pipe:[6789]".into(), flags: 0, offset: 0 },
+            FdInfo {
+                fd: 3,
+                path: "/etc/hostname".into(),
+                flags: 0,
+                offset: 5,
+            },
+            FdInfo {
+                fd: 4,
+                path: "socket:[12345]".into(),
+                flags: 0,
+                offset: 0,
+            },
+            FdInfo {
+                fd: 5,
+                path: "pipe:[6789]".into(),
+                flags: 0,
+                offset: 0,
+            },
         ];
         let (restorable, skipped) = build_fd_plan(&fds);
         assert_eq!(restorable.len(), 1);
         assert_eq!(restorable[0].fd, 3);
-        assert_eq!(skipped, vec![
-            SkippedFd { fd: 4, path: "socket:[12345]".into() },
-            SkippedFd { fd: 5, path: "pipe:[6789]".into() },
-        ]);
+        assert_eq!(
+            skipped,
+            vec![
+                SkippedFd {
+                    fd: 4,
+                    path: "socket:[12345]".into()
+                },
+                SkippedFd {
+                    fd: 5,
+                    path: "pipe:[6789]".into()
+                },
+            ]
+        );
     }
 
     #[test]
     fn fd_plan_skips_deleted_and_memfd() {
         let fds = vec![
-            FdInfo { fd: 3, path: "/etc/hostname".into(), flags: 0, offset: 5 },
-            FdInfo { fd: 6, path: "/tmp/gone (deleted)".into(), flags: 0, offset: 0 },
-            FdInfo { fd: 7, path: "/memfd:scratch (deleted)".into(), flags: 0, offset: 0 },
-            FdInfo { fd: 8, path: "/proc/1234/maps".into(), flags: 0, offset: 0 },
-            FdInfo { fd: 9, path: "/dev/pts/3".into(), flags: 0, offset: 0 },
-            FdInfo { fd: 10, path: "/sys/kernel/x".into(), flags: 0, offset: 0 },
+            FdInfo {
+                fd: 3,
+                path: "/etc/hostname".into(),
+                flags: 0,
+                offset: 5,
+            },
+            FdInfo {
+                fd: 6,
+                path: "/tmp/gone (deleted)".into(),
+                flags: 0,
+                offset: 0,
+            },
+            FdInfo {
+                fd: 7,
+                path: "/memfd:scratch (deleted)".into(),
+                flags: 0,
+                offset: 0,
+            },
+            FdInfo {
+                fd: 8,
+                path: "/proc/1234/maps".into(),
+                flags: 0,
+                offset: 0,
+            },
+            FdInfo {
+                fd: 9,
+                path: "/dev/pts/3".into(),
+                flags: 0,
+                offset: 0,
+            },
+            FdInfo {
+                fd: 10,
+                path: "/sys/kernel/x".into(),
+                flags: 0,
+                offset: 0,
+            },
         ];
         let (restorable, skipped) = build_fd_plan(&fds);
         assert_eq!(restorable.len(), 1);
         assert_eq!(restorable[0].fd, 3);
-        assert!(restorable.iter().all(|f| f.fd != 6 && f.fd != 7 && f.fd != 8 && f.fd != 9 && f.fd != 10),
-            "deleted, memfd, and pseudo-filesystem fds must not appear in restorable");
-        assert!(skipped.contains(&SkippedFd { fd: 6, path: "/tmp/gone (deleted)".into() }));
-        assert!(skipped.contains(&SkippedFd { fd: 7, path: "/memfd:scratch (deleted)".into() }));
-        assert!(skipped.contains(&SkippedFd { fd: 8, path: "/proc/1234/maps".into() }),
-            "/proc/ paths must be skipped");
-        assert!(skipped.contains(&SkippedFd { fd: 9, path: "/dev/pts/3".into() }),
-            "/dev/ paths must be skipped");
-        assert!(skipped.contains(&SkippedFd { fd: 10, path: "/sys/kernel/x".into() }),
-            "/sys/ paths must be skipped");
+        assert!(
+            restorable.iter().all(|f| f.fd != 6
+                && f.fd != 7
+                && f.fd != 8
+                && f.fd != 9
+                && f.fd != 10),
+            "deleted, memfd, and pseudo-filesystem fds must not appear in restorable"
+        );
+        assert!(skipped.contains(&SkippedFd {
+            fd: 6,
+            path: "/tmp/gone (deleted)".into()
+        }));
+        assert!(skipped.contains(&SkippedFd {
+            fd: 7,
+            path: "/memfd:scratch (deleted)".into()
+        }));
+        assert!(
+            skipped.contains(&SkippedFd {
+                fd: 8,
+                path: "/proc/1234/maps".into()
+            }),
+            "/proc/ paths must be skipped"
+        );
+        assert!(
+            skipped.contains(&SkippedFd {
+                fd: 9,
+                path: "/dev/pts/3".into()
+            }),
+            "/dev/ paths must be skipped"
+        );
+        assert!(
+            skipped.contains(&SkippedFd {
+                fd: 10,
+                path: "/sys/kernel/x".into()
+            }),
+            "/sys/ paths must be skipped"
+        );
     }
 
     #[test]
     fn plan_classifies_regions() {
         let maps = vec![
-            MemoryMap { start: 0x1000, end: 0x2000, perms: "r-xp".into(), offset: 0,
-                        path: Some("/bin/app".into()) },          // code: map from file
-            MemoryMap { start: 0x3000, end: 0x4000, perms: "rw-p".into(), offset: 0,
-                        path: None },                              // anon writable: fill bytes
-            MemoryMap { start: 0x5000, end: 0x6000, perms: "r--p".into(), offset: 0,
-                        path: Some("[vvar]".into()) },             // special: skip
+            MemoryMap {
+                start: 0x1000,
+                end: 0x2000,
+                perms: "r-xp".into(),
+                offset: 0,
+                path: Some("/bin/app".into()),
+            }, // code: map from file
+            MemoryMap {
+                start: 0x3000,
+                end: 0x4000,
+                perms: "rw-p".into(),
+                offset: 0,
+                path: None,
+            }, // anon writable: fill bytes
+            MemoryMap {
+                start: 0x5000,
+                end: 0x6000,
+                perms: "r--p".into(),
+                offset: 0,
+                path: Some("[vvar]".into()),
+            }, // special: skip
         ];
-        let data = vec![MemorySegment { start: 0x3000, data: vec![7u8; 0x1000] }];
+        let data = vec![MemorySegment {
+            start: 0x3000,
+            data: vec![7u8; 0x1000],
+        }];
         let plan = build_memory_plan(&maps, &data);
         assert!(matches!(plan[0], RestoreRegion::MapFile { .. }));
         assert!(matches!(plan[1], RestoreRegion::Anon { .. }));
@@ -774,26 +929,52 @@ mod tests {
             map(0x9000, 0xa000, None),
         ];
         let moves = plan_vdso_moves(&cp);
-        assert_eq!(moves, vec![
-            VdsoMove { delta: -0x1000, len: 0x1000, target: 0x1000 }, // [vvar]
-            VdsoMove { delta: 0, len: 0x1000, target: 0x2000 },       // [vdso]
-        ], "both special mappings relocate, ordered by ascending target");
+        assert_eq!(
+            moves,
+            vec![
+                VdsoMove {
+                    delta: -0x1000,
+                    len: 0x1000,
+                    target: 0x1000
+                }, // [vvar]
+                VdsoMove {
+                    delta: 0,
+                    len: 0x1000,
+                    target: 0x2000
+                }, // [vdso]
+            ],
+            "both special mappings relocate, ordered by ascending target"
+        );
     }
 
     #[test]
     fn special_mappings_verify_against_the_recorded_bases() {
-        let cp = vec![map(0x1000, 0x2000, Some("[vvar]")), map(0x2000, 0x3000, Some("[vdso]"))];
-        assert!(verify_special_mappings(&cp.clone(), &cp).is_ok(), "an exact match passes");
+        let cp = vec![
+            map(0x1000, 0x2000, Some("[vvar]")),
+            map(0x2000, 0x3000, Some("[vdso]")),
+        ];
+        assert!(
+            verify_special_mappings(&cp.clone(), &cp).is_ok(),
+            "an exact match passes"
+        );
 
         // Relocated to the wrong base: the resumed program would jump into a
         // vDSO that is no longer there.
-        let moved = vec![map(0x1000, 0x2000, Some("[vvar]")), map(0x9000, 0xa000, Some("[vdso]"))];
+        let moved = vec![
+            map(0x1000, 0x2000, Some("[vvar]")),
+            map(0x9000, 0xa000, Some("[vdso]")),
+        ];
         let err = verify_special_mappings(&moved, &cp).expect_err("a stale base is caught");
-        assert!(err.contains("[vdso]") && err.contains("0x2000"), "names what moved: {err}");
+        assert!(
+            err.contains("[vdso]") && err.contains("0x2000"),
+            "names what moved: {err}"
+        );
 
         // Gone entirely (unmapped by a MAP_FIXED that landed on it).
         let gone = vec![map(0x1000, 0x2000, Some("[vvar]"))];
-        assert!(verify_special_mappings(&gone, &cp).unwrap_err().contains("missing"));
+        assert!(verify_special_mappings(&gone, &cp)
+            .unwrap_err()
+            .contains("missing"));
     }
 
     #[test]
@@ -819,7 +1000,7 @@ mod tests {
             map(0x40_0000, 0x40_1000, Some("/bin/app")),
             map(0x7ffd_0000_0000, 0x7ffd_0002_0000, Some("[stack]")),
             map(0x7f00_0000_0000, 0x7f00_0000_2000, Some("[vdso]")),
-            map(STUB_BASE, STUB_BASE + 0x117000, None),          // the running stub
+            map(STUB_BASE, STUB_BASE + 0x117000, None), // the running stub
             map(0x7ffc_a06a_0000, 0x7ffc_a06c_2000, Some("[stack]")), // leftover
         ];
         assert_eq!(
@@ -866,7 +1047,10 @@ mod tests {
     fn vdso_moves_empty_without_a_recorded_vdso() {
         // A freestanding checkpoint records no vdso; nothing to relocate, and
         // the stub has no base to anchor a [vvar] delta against either.
-        let cp = vec![map(0x1000, 0x2000, Some("[vvar]")), map(0x2000, 0x3000, None)];
+        let cp = vec![
+            map(0x1000, 0x2000, Some("[vvar]")),
+            map(0x2000, 0x3000, None),
+        ];
         assert!(plan_vdso_moves(&cp).is_empty());
     }
 
@@ -894,30 +1078,70 @@ mod tests {
         const START: u64 = 0x4500_0000_0000;
         let cp = tiny_checkpoint(
             vec![MemoryMap {
-                start: START, end: START + 0x1000, perms: "rwxp".into(), offset: 0, path: None,
+                start: START,
+                end: START + 0x1000,
+                perms: "rwxp".into(),
+                offset: 0,
+                path: None,
             }],
-            vec![MemorySegment { start: START, data: vec![0xC7u8; 0x1000] }],
+            vec![MemorySegment {
+                start: START,
+                data: vec![0xC7u8; 0x1000],
+            }],
         );
         let p = plan(&cp, None, &[]).expect("plan");
         let blob = &p.blob;
 
-        assert_eq!(u32::from_le_bytes(blob[0..4].try_into().unwrap()), BLOB_MAGIC);
-        assert_eq!(u32::from_le_bytes(blob[4..8].try_into().unwrap()), BLOB_VERSION);
-        assert_eq!(u32::from_le_bytes(blob[8..12].try_into().unwrap()), 1, "n_regions");
-        assert_eq!(u32::from_le_bytes(blob[12..16].try_into().unwrap()), 0, "n_fds");
+        assert_eq!(
+            u32::from_le_bytes(blob[0..4].try_into().unwrap()),
+            BLOB_MAGIC
+        );
+        assert_eq!(
+            u32::from_le_bytes(blob[4..8].try_into().unwrap()),
+            BLOB_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes(blob[8..12].try_into().unwrap()),
+            1,
+            "n_regions"
+        );
+        assert_eq!(
+            u32::from_le_bytes(blob[12..16].try_into().unwrap()),
+            0,
+            "n_fds"
+        );
 
         // Region-table entry, byte-exact.
         let r0 = HEADER_LEN;
-        assert_eq!(u64::from_le_bytes(blob[r0..r0 + 8].try_into().unwrap()), START, "start");
-        assert_eq!(u64::from_le_bytes(blob[r0 + 8..r0 + 16].try_into().unwrap()), START + 0x1000, "end");
-        assert_eq!(u32::from_le_bytes(blob[r0 + 16..r0 + 20].try_into().unwrap()),
-                   (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u32, "prot");
+        assert_eq!(
+            u64::from_le_bytes(blob[r0..r0 + 8].try_into().unwrap()),
+            START,
+            "start"
+        );
+        assert_eq!(
+            u64::from_le_bytes(blob[r0 + 8..r0 + 16].try_into().unwrap()),
+            START + 0x1000,
+            "end"
+        );
+        assert_eq!(
+            u32::from_le_bytes(blob[r0 + 16..r0 + 20].try_into().unwrap()),
+            (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u32,
+            "prot"
+        );
         assert_eq!(blob[r0 + 20], SRC_ANON, "src");
 
         let regs_off = u64::from_le_bytes(blob[16..24].try_into().unwrap()) as usize;
-        assert_eq!(u32::from_le_bytes(blob[24..28].try_into().unwrap()) as usize, 27 * 8, "regs_len");
+        assert_eq!(
+            u32::from_le_bytes(blob[24..28].try_into().unwrap()) as usize,
+            27 * 8,
+            "regs_len"
+        );
         for i in 0..27usize {
-            let v = u64::from_le_bytes(blob[regs_off + i * 8..regs_off + i * 8 + 8].try_into().unwrap());
+            let v = u64::from_le_bytes(
+                blob[regs_off + i * 8..regs_off + i * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
             assert_eq!(v, i as u64);
         }
 
@@ -933,10 +1157,20 @@ mod tests {
         // must carry it once and both regions must point at that one offset.
         let cp = tiny_checkpoint(
             vec![
-                MemoryMap { start: 0x1000, end: 0x2000, perms: "r-xp".into(), offset: 0,
-                            path: Some("/bin/app".into()) },
-                MemoryMap { start: 0x2000, end: 0x3000, perms: "r--p".into(), offset: 0x1000,
-                            path: Some("/bin/app".into()) },
+                MemoryMap {
+                    start: 0x1000,
+                    end: 0x2000,
+                    perms: "r-xp".into(),
+                    offset: 0,
+                    path: Some("/bin/app".into()),
+                },
+                MemoryMap {
+                    start: 0x2000,
+                    end: 0x3000,
+                    perms: "r--p".into(),
+                    offset: 0x1000,
+                    path: Some("/bin/app".into()),
+                },
             ],
             Vec::new(),
         );
@@ -944,7 +1178,9 @@ mod tests {
         let off0 = u32::from_le_bytes(blob[HEADER_LEN + 32..HEADER_LEN + 36].try_into().unwrap());
         let off1 = u32::from_le_bytes(
             blob[HEADER_LEN + REGION_ENTRY_LEN + 32..HEADER_LEN + REGION_ENTRY_LEN + 36]
-                .try_into().unwrap());
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(off0, off1, "the repeated path is interned once");
 
         let strings_off = u64::from_le_bytes(blob[40..48].try_into().unwrap()) as usize;
@@ -956,13 +1192,22 @@ mod tests {
     fn plan_rejects_a_checkpoint_overlapping_the_stub_window() {
         let cp = tiny_checkpoint(
             vec![MemoryMap {
-                start: STUB_BASE, end: STUB_BASE + 0x1000, perms: "rw-p".into(),
-                offset: 0, path: None,
+                start: STUB_BASE,
+                end: STUB_BASE + 0x1000,
+                perms: "rw-p".into(),
+                offset: 0,
+                path: None,
             }],
-            vec![MemorySegment { start: STUB_BASE, data: vec![0u8; 0x1000] }],
+            vec![MemorySegment {
+                start: STUB_BASE,
+                data: vec![0u8; 0x1000],
+            }],
         );
         let err = plan(&cp, None, &[]).expect_err("must refuse to clobber the running stub");
-        assert!(err.contains("restore-stub"), "error should name the stub window: {err}");
+        assert!(
+            err.contains("restore-stub"),
+            "error should name the stub window: {err}"
+        );
     }
 
     #[test]
@@ -972,11 +1217,18 @@ mod tests {
         // must re-enter the syscall rather than resume past it with the sentinel.
         let mut regs = vec![0u64; 27];
         regs[10] = (-514i64) as u64; // rax
-        regs[15] = 34;               // orig_rax
-        regs[16] = 0x4010_0000;      // rip, just past the `syscall`
+        regs[15] = 34; // orig_rax
+        regs[16] = 0x4010_0000; // rip, just past the `syscall`
         rearm_restartable_syscall(&mut regs).unwrap();
-        assert_eq!(regs[10], 34, "rax reloaded with the original syscall number");
-        assert_eq!(regs[16], 0x4010_0000 - 2, "rip rewound onto the 2-byte syscall");
+        assert_eq!(
+            regs[10], 34,
+            "rax reloaded with the original syscall number"
+        );
+        assert_eq!(
+            regs[16],
+            0x4010_0000 - 2,
+            "rip rewound onto the 2-byte syscall"
+        );
     }
 
     #[test]
@@ -1006,11 +1258,29 @@ mod tests {
         fp[512..520].copy_from_slice(&0b111u64.to_le_bytes()); // xstate_bv: x87|SSE|AVX
         let img = build_fpstate_image(&fp);
         assert_eq!(img.len(), 1088 + 4);
-        assert_eq!(u32::from_le_bytes(img[464..468].try_into().unwrap()), FP_XSTATE_MAGIC1);
-        assert_eq!(u32::from_le_bytes(img[468..472].try_into().unwrap()), 1088 + 4, "extended_size");
-        assert_eq!(u64::from_le_bytes(img[472..480].try_into().unwrap()), 0b111, "xfeatures");
-        assert_eq!(u32::from_le_bytes(img[480..484].try_into().unwrap()), 1088, "xstate_size");
-        assert_eq!(u32::from_le_bytes(img[1088..1092].try_into().unwrap()), FP_XSTATE_MAGIC2);
+        assert_eq!(
+            u32::from_le_bytes(img[464..468].try_into().unwrap()),
+            FP_XSTATE_MAGIC1
+        );
+        assert_eq!(
+            u32::from_le_bytes(img[468..472].try_into().unwrap()),
+            1088 + 4,
+            "extended_size"
+        );
+        assert_eq!(
+            u64::from_le_bytes(img[472..480].try_into().unwrap()),
+            0b111,
+            "xfeatures"
+        );
+        assert_eq!(
+            u32::from_le_bytes(img[480..484].try_into().unwrap()),
+            1088,
+            "xstate_size"
+        );
+        assert_eq!(
+            u32::from_le_bytes(img[1088..1092].try_into().unwrap()),
+            FP_XSTATE_MAGIC2
+        );
     }
 
     #[test]
@@ -1024,7 +1294,10 @@ mod tests {
         fp[520..528].copy_from_slice(&(1u64 << 63).to_le_bytes());
         let img = build_fpstate_image(&fp);
         assert_eq!(img.len(), 512, "falls back to the legacy fxsave image");
-        assert!(img[464..512].iter().all(|&b| b == 0), "no xstate magic claimed");
+        assert!(
+            img[464..512].iter().all(|&b| b == 0),
+            "no xstate magic claimed"
+        );
     }
 
     #[test]

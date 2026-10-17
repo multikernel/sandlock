@@ -12,12 +12,12 @@ use crate::seccomp::notif::NotifAction;
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr,
-    set_port_in_sockaddr, sockaddr_is_ipv6,
+    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr, set_port_in_sockaddr,
+    sockaddr_is_ipv6,
 };
+use super::query_socket_protocol;
 use super::unix::connect_named_unix_on_behalf;
 use super::verdict::{layered_destination_verdict, path_under_any};
-use super::query_socket_protocol;
 
 // ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
@@ -413,7 +413,10 @@ mod tests {
         assert_eq!(family, libc::AF_INET6 as u16);
         assert_eq!(
             plan.addr[8..24],
-            "::ffff:127.0.0.1".parse::<std::net::Ipv6Addr>().unwrap().octets()
+            "::ffff:127.0.0.1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
         );
         assert_eq!(
             parse_ip_from_sockaddr(&plan.addr),
@@ -457,5 +460,4 @@ mod tests {
         assert_eq!(parse_port_from_sockaddr(&plan.addr), Some(3128));
         assert!(plan.record_orig_dest);
     }
-
 }

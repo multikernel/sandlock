@@ -165,16 +165,13 @@ impl SandboxState {
     /// reader always sees a complete file (the previous one or the new one).
     pub fn save(&self) -> Result<()> {
         let dir = self.state_dir();
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create state dir {:?}", dir))?;
-        let data = serde_json::to_string_pretty(self)
-            .context("serialize sandbox state")?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("create state dir {:?}", dir))?;
+        let data = serde_json::to_string_pretty(self).context("serialize sandbox state")?;
         // Temp and target share `dir` (same filesystem, so rename is atomic) and
         // the temp name carries the writer's PID so concurrent writers in
         // different processes never collide on it.
         let tmp = dir.join(format!("state.json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, data)
-            .with_context(|| format!("write state to {:?}", tmp))?;
+        std::fs::write(&tmp, data).with_context(|| format!("write state to {:?}", tmp))?;
         std::fs::rename(&tmp, self.state_file())
             .with_context(|| format!("rename {:?} -> {:?}", tmp, self.state_file()))
     }
@@ -184,16 +181,14 @@ impl SandboxState {
         let path = Path::new(&state_dir()).join(id).join("state.json");
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("read state from {:?}", path))?;
-        serde_json::from_str(&data)
-            .with_context(|| format!("parse state JSON from {:?}", path))
+        serde_json::from_str(&data).with_context(|| format!("parse state JSON from {:?}", path))
     }
 
     /// Remove the state directory from disk.
     pub fn delete(&self) -> Result<()> {
         let dir = self.state_dir();
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("remove state dir {:?}", dir))?;
+            std::fs::remove_dir_all(&dir).with_context(|| format!("remove state dir {:?}", dir))?;
         }
         Ok(())
     }

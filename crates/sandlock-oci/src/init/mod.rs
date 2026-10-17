@@ -13,8 +13,8 @@
 //! nothing is exec'd for init itself, which sidesteps Landlock having to
 //! authorize an execve of a path-less image.
 
-pub mod proto;
 mod fdrecv;
+pub mod proto;
 
 pub use proto::{Req, Resp, CONTROL_FD};
 
@@ -67,7 +67,10 @@ fn spawn(
     for (k, v) in env {
         std::env::set_var(k, v);
     }
-    let cargv: Vec<CString> = argv.iter().filter_map(|a| CString::new(a.as_str()).ok()).collect();
+    let cargv: Vec<CString> = argv
+        .iter()
+        .filter_map(|a| CString::new(a.as_str()).ok())
+        .collect();
     let mut ptrs: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     // Under chroot the sandlock seccomp exec handler rewrites the pathname in
@@ -128,7 +131,10 @@ pub fn run_init() {
             break;
         } // daemon closed the channel
           // Trim trailing ASCII whitespace before parsing.
-        let trimmed = &bytes[..bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(0, |i| i + 1)];
+        let trimmed = &bytes[..bytes
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map_or(0, |i| i + 1)];
         let req: Req = match serde_json::from_slice(trimmed) {
             Ok(r) => r,
             Err(e) => {
@@ -140,7 +146,12 @@ pub fn run_init() {
             Req::RunMain { argv, env, cwd } => {
                 let pid = spawn(&argv, &env, &cwd, None);
                 if pid < 0 {
-                    send(ctl, &Resp::Err { msg: "fork failed".into() });
+                    send(
+                        ctl,
+                        &Resp::Err {
+                            msg: "fork failed".into(),
+                        },
+                    );
                     continue;
                 }
                 main_pid = pid;
@@ -163,14 +174,24 @@ pub fn run_init() {
                     }
                 });
             }
-            Req::RunExec { argv, env, cwd, detach } => {
+            Req::RunExec {
+                argv,
+                env,
+                cwd,
+                detach,
+            } => {
                 if fds.len() < 3 {
                     for &fd in &fds {
                         unsafe {
                             libc::close(fd);
                         }
                     }
-                    send(ctl, &Resp::Err { msg: "exec needs 3 fds".into() });
+                    send(
+                        ctl,
+                        &Resp::Err {
+                            msg: "exec needs 3 fds".into(),
+                        },
+                    );
                     continue;
                 }
                 let stdio = [fds[0], fds[1], fds[2]];
@@ -181,7 +202,12 @@ pub fn run_init() {
                     }
                 } // parent drops its copies
                 if pid < 0 {
-                    send(ctl, &Resp::Err { msg: "fork failed".into() });
+                    send(
+                        ctl,
+                        &Resp::Err {
+                            msg: "fork failed".into(),
+                        },
+                    );
                     continue;
                 }
                 send(ctl, &Resp::Started { pid });

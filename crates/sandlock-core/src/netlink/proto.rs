@@ -13,9 +13,9 @@ pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWADDR: u16 = 20;
 
 pub const NLM_F_REQUEST: u16 = 0x001;
-pub const NLM_F_MULTI:   u16 = 0x002;
-pub const NLM_F_ACK:     u16 = 0x004;
-pub const NLM_F_DUMP:    u16 = 0x300;
+pub const NLM_F_MULTI: u16 = 0x002;
+pub const NLM_F_ACK: u16 = 0x004;
+pub const NLM_F_DUMP: u16 = 0x300;
 
 pub const IFLA_IFNAME: u16 = 3;
 pub const IFLA_ALT_IFNAME: u16 = 53;
@@ -24,49 +24,55 @@ const NLA_TYPE_MASK: u16 = 0x3fff;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NlMsgHdr {
-    pub nlmsg_len:   u32,
-    pub nlmsg_type:  u16,
+    pub nlmsg_len: u32,
+    pub nlmsg_type: u16,
     pub nlmsg_flags: u16,
-    pub nlmsg_seq:   u32,
-    pub nlmsg_pid:   u32,
+    pub nlmsg_seq: u32,
+    pub nlmsg_pid: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IfInfoMsg {
     pub ifi_family: u8,
-    pub _pad:       u8,
-    pub ifi_type:   u16,
-    pub ifi_index:  i32,
-    pub ifi_flags:  u32,
+    pub _pad: u8,
+    pub ifi_type: u16,
+    pub ifi_index: i32,
+    pub ifi_flags: u32,
     pub ifi_change: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IfAddrMsg {
-    pub ifa_family:    u8,
+    pub ifa_family: u8,
     pub ifa_prefixlen: u8,
-    pub ifa_flags:     u8,
-    pub ifa_scope:     u8,
-    pub ifa_index:     u32,
+    pub ifa_flags: u8,
+    pub ifa_scope: u8,
+    pub ifa_index: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RtAttr {
-    pub rta_len:  u16,
+    pub rta_len: u16,
     pub rta_type: u16,
 }
 
 pub const NLMSG_HDRLEN: usize = size_of::<NlMsgHdr>();
-pub const RTA_HDRLEN:   usize = size_of::<RtAttr>();
+pub const RTA_HDRLEN: usize = size_of::<RtAttr>();
 
-pub struct Writer { buf: Vec<u8> }
+pub struct Writer {
+    buf: Vec<u8>,
+}
 
 impl Writer {
-    pub fn new() -> Self { Self { buf: Vec::new() } }
-    pub fn into_vec(self) -> Vec<u8> { self.buf }
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+    pub fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
 
     pub fn write_aligned(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
@@ -76,10 +82,12 @@ impl Writer {
 
     pub fn write_attr(&mut self, rta_type: u16, payload: &[u8]) {
         let total = RTA_HDRLEN + payload.len();
-        let hdr = RtAttr { rta_len: total as u16, rta_type };
-        let hdr_bytes = unsafe {
-            std::slice::from_raw_parts(&hdr as *const _ as *const u8, RTA_HDRLEN)
+        let hdr = RtAttr {
+            rta_len: total as u16,
+            rta_type,
         };
+        let hdr_bytes =
+            unsafe { std::slice::from_raw_parts(&hdr as *const _ as *const u8, RTA_HDRLEN) };
         self.buf.extend_from_slice(hdr_bytes);
         self.buf.extend_from_slice(payload);
         let pad = nlmsg_align(total) - total;
@@ -90,11 +98,13 @@ impl Writer {
         let start = self.buf.len();
         let hdr = NlMsgHdr {
             nlmsg_len: 0,
-            nlmsg_type, nlmsg_flags: flags, nlmsg_seq: seq, nlmsg_pid: pid,
+            nlmsg_type,
+            nlmsg_flags: flags,
+            nlmsg_seq: seq,
+            nlmsg_pid: pid,
         };
-        let hdr_bytes = unsafe {
-            std::slice::from_raw_parts(&hdr as *const _ as *const u8, NLMSG_HDRLEN)
-        };
+        let hdr_bytes =
+            unsafe { std::slice::from_raw_parts(&hdr as *const _ as *const u8, NLMSG_HDRLEN) };
         self.buf.extend_from_slice(hdr_bytes);
         start
     }
@@ -119,9 +129,13 @@ pub struct ParsedRequest {
 }
 
 pub fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
-    if buf.len() < NLMSG_HDRLEN { return None; }
+    if buf.len() < NLMSG_HDRLEN {
+        return None;
+    }
     let hdr: NlMsgHdr = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const _) };
-    if (hdr.nlmsg_len as usize) > buf.len() { return None; }
+    if (hdr.nlmsg_len as usize) > buf.len() {
+        return None;
+    }
     let mut req = ParsedRequest {
         nlmsg_type: hdr.nlmsg_type,
         nlmsg_flags: hdr.nlmsg_flags,
@@ -129,7 +143,9 @@ pub fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
         nlmsg_pid: hdr.nlmsg_pid,
         ..Default::default()
     };
-    let payload = buf.get(NLMSG_HDRLEN..hdr.nlmsg_len as usize).unwrap_or_default();
+    let payload = buf
+        .get(NLMSG_HDRLEN..hdr.nlmsg_len as usize)
+        .unwrap_or_default();
     if hdr.nlmsg_type == RTM_GETLINK && payload.len() >= size_of::<IfInfoMsg>() {
         let ifi: IfInfoMsg = unsafe { std::ptr::read_unaligned(payload.as_ptr() as *const _) };
         req.ifi_index = ifi.ifi_index;
@@ -146,7 +162,9 @@ fn find_attr<'a>(mut attrs: &'a [u8], wanted: &[u16]) -> Option<&'a [u8]> {
     while attrs.len() >= RTA_HDRLEN {
         let hdr: RtAttr = unsafe { std::ptr::read_unaligned(attrs.as_ptr() as *const _) };
         let len = hdr.rta_len as usize;
-        if len < RTA_HDRLEN || len > attrs.len() { return None; }
+        if len < RTA_HDRLEN || len > attrs.len() {
+            return None;
+        }
         if wanted.contains(&(hdr.rta_type & NLA_TYPE_MASK)) {
             return Some(&attrs[RTA_HDRLEN..len]);
         }
@@ -186,7 +204,12 @@ mod tests {
         let mut w = Writer::new();
         let start = w.begin_msg(RTM_GETLINK, NLM_F_REQUEST, 1, 0);
         let ifi = IfInfoMsg {
-            ifi_family: 0, _pad: 0, ifi_type: 0, ifi_index, ifi_flags: 0, ifi_change: 0,
+            ifi_family: 0,
+            _pad: 0,
+            ifi_type: 0,
+            ifi_index,
+            ifi_flags: 0,
+            ifi_change: 0,
         };
         w.write_aligned(unsafe {
             std::slice::from_raw_parts(&ifi as *const _ as *const u8, size_of::<IfInfoMsg>())
@@ -214,7 +237,10 @@ mod tests {
     #[test]
     fn getlink_accepts_alt_ifname() {
         let buf = getlink_request(0, &[(IFLA_ALT_IFNAME, b"lo\0")]);
-        assert_eq!(parse_request(&buf).unwrap().ifname.as_deref(), Some(&b"lo"[..]));
+        assert_eq!(
+            parse_request(&buf).unwrap().ifname.as_deref(),
+            Some(&b"lo"[..])
+        );
     }
 
     #[test]

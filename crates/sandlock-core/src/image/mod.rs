@@ -81,11 +81,13 @@ pub async fn pull(reference: &str, cache_dir: Option<&Path>) -> Result<Image, Sa
         #[cfg(feature = "http")]
         Source::DockerDaemon(name) => docker::pull(&cache, &name).await,
         #[cfg(not(feature = "http"))]
-        Source::Registry(_) | Source::DockerDaemon(_) => Err(crate::error::SandboxError::FeatureDisabled {
-            what: format!("image reference {reference:?}"),
-            feature: "http",
+        Source::Registry(_) | Source::DockerDaemon(_) => {
+            Err(crate::error::SandboxError::FeatureDisabled {
+                what: format!("image reference {reference:?}"),
+                feature: "http",
+            }
+            .into())
         }
-        .into()),
         Source::OciDir { path, tag } => {
             blocking(move || {
                 let blobs = oci::LayoutDir::open(&path)?;
@@ -119,9 +121,15 @@ impl Source {
         } else if let Some(rest) = reference.strip_prefix("oci-archive:") {
             let (path, tag) = split_tag(rest);
             Ok(Source::OciArchive { path, tag })
-        } else if let Some(name) = reference.strip_prefix("docker-daemon:").filter(|n| !n.is_empty()) {
+        } else if let Some(name) = reference
+            .strip_prefix("docker-daemon:")
+            .filter(|n| !n.is_empty())
+        {
             Ok(Source::DockerDaemon(name.to_string()))
-        } else if let Some(name) = reference.strip_prefix("docker://").filter(|n| !n.is_empty()) {
+        } else if let Some(name) = reference
+            .strip_prefix("docker://")
+            .filter(|n| !n.is_empty())
+        {
             Ok(Source::Registry(name.to_string()))
         } else {
             Err(SandboxRuntimeError::Child(format!(
@@ -138,17 +146,29 @@ impl Source {
 /// not be part of a path.
 fn split_tag(rest: &str) -> (PathBuf, Option<String>) {
     match rest.rsplit_once(':') {
-        Some((path, tag)) if !tag.is_empty() && !tag.contains('/') => (path.into(), Some(tag.to_string())),
+        Some((path, tag)) if !tag.is_empty() && !tag.contains('/') => {
+            (path.into(), Some(tag.to_string()))
+        }
         _ => (rest.into(), None),
     }
 }
 
-fn from_layout(cache: &Cache, blobs: &dyn oci::Blobs, tag: Option<&str>) -> Result<Image, SandlockError> {
+fn from_layout(
+    cache: &Cache,
+    blobs: &dyn oci::Blobs,
+    tag: Option<&str>,
+) -> Result<Image, SandlockError> {
     let manifest = oci::resolve(blobs, tag)?;
-    cache.get_or_build(oci::digest_hex(&manifest.config.digest)?, |rootfs| unpack(blobs, &manifest, rootfs))
+    cache.get_or_build(oci::digest_hex(&manifest.config.digest)?, |rootfs| {
+        unpack(blobs, &manifest, rootfs)
+    })
 }
 
-fn unpack(blobs: &dyn oci::Blobs, manifest: &oci::Manifest, rootfs: &Path) -> Result<ImageConfig, SandlockError> {
+fn unpack(
+    blobs: &dyn oci::Blobs,
+    manifest: &oci::Manifest,
+    rootfs: &Path,
+) -> Result<ImageConfig, SandlockError> {
     oci::unpack(blobs, manifest, rootfs)?;
     let mut config = oci::config(blobs, manifest)?;
     if let Some(dir) = config.working_dir.take() {
@@ -167,8 +187,13 @@ fn resolve_working_dir(rootfs: &Path, dir: &str) -> Result<String, SandlockError
 
     let fail = |e: io::Error| SandboxRuntimeError::Child(format!("image: WorkingDir {dir}: {e}"));
     mkdirp_in_root(rootfs, dir, 0o755).map_err(|e| fail(io::Error::from_raw_os_error(e)))?;
-    let fd = openat2_in_root(rootfs, dir, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC, 0)
-        .map_err(|e| fail(io::Error::from_raw_os_error(e)))?;
+    let fd = openat2_in_root(
+        rootfs,
+        dir,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|e| fail(io::Error::from_raw_os_error(e)))?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let real = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(fail)?;
     let root = fs::canonicalize(rootfs).map_err(fail)?;
@@ -215,12 +240,17 @@ impl Cache {
         let entry = self.dir.join(key);
         let config = fs::read(entry.join(CONFIG_FILE)).ok()?;
         let config = serde_json::from_slice(&config).ok()?;
-        Some(Image { rootfs: entry.join("rootfs"), config })
+        Some(Image {
+            rootfs: entry.join("rootfs"),
+            config,
+        })
     }
 
     fn temp_path(&self, suffix: &str) -> Result<PathBuf, SandlockError> {
         fs::create_dir_all(&self.dir).map_err(SandboxRuntimeError::Io)?;
-        Ok(self.dir.join(format!(".tmp-{}{suffix}", uuid::Uuid::new_v4())))
+        Ok(self
+            .dir
+            .join(format!(".tmp-{}{suffix}", uuid::Uuid::new_v4())))
     }
 
     fn get_or_build(
@@ -248,7 +278,8 @@ impl Cache {
         let rootfs = tmp.join("rootfs");
         fs::create_dir_all(&rootfs).map_err(SandboxRuntimeError::Io)?;
         let config = build(&rootfs)?;
-        let json = serde_json::to_vec(&config).map_err(|e| SandboxRuntimeError::Child(e.to_string()))?;
+        let json =
+            serde_json::to_vec(&config).map_err(|e| SandboxRuntimeError::Child(e.to_string()))?;
         fs::write(tmp.join(CONFIG_FILE), json).map_err(SandboxRuntimeError::Io)?;
 
         let entry = self.dir.join(key);
@@ -264,8 +295,12 @@ impl Cache {
             }
             Err(e) => return Err(SandboxRuntimeError::Io(e).into()),
         }
-        self.lookup(key)
-            .ok_or_else(|| SandboxRuntimeError::Io(io::Error::other(format!("image cache entry {key} vanished"))).into())
+        self.lookup(key).ok_or_else(|| {
+            SandboxRuntimeError::Io(io::Error::other(format!(
+                "image cache entry {key} vanished"
+            )))
+            .into()
+        })
     }
 }
 
@@ -278,7 +313,9 @@ mod tests {
     #[tokio::test]
     async fn network_transports_need_the_http_feature() {
         for reference in ["docker://alpine", "docker-daemon:alpine"] {
-            let err = pull(reference, Some(Path::new("/nonexistent"))).await.unwrap_err();
+            let err = pull(reference, Some(Path::new("/nonexistent")))
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains("\"http\" feature"), "{err}");
         }
     }
@@ -300,13 +337,25 @@ mod tests {
 
     #[test]
     fn parses_transports() {
-        let dir = |p: &str, t: Option<&str>| Source::OciDir { path: p.into(), tag: t.map(String::from) };
-        assert_eq!(Source::parse("oci:/srv/img").unwrap(), dir("/srv/img", None));
-        assert_eq!(Source::parse("oci:/srv/img:v1").unwrap(), dir("/srv/img", Some("v1")));
+        let dir = |p: &str, t: Option<&str>| Source::OciDir {
+            path: p.into(),
+            tag: t.map(String::from),
+        };
+        assert_eq!(
+            Source::parse("oci:/srv/img").unwrap(),
+            dir("/srv/img", None)
+        );
+        assert_eq!(
+            Source::parse("oci:/srv/img:v1").unwrap(),
+            dir("/srv/img", Some("v1"))
+        );
         assert_eq!(Source::parse("oci:rel/img").unwrap(), dir("rel/img", None));
         assert_eq!(
             Source::parse("oci-archive:/tmp/x.tar:latest").unwrap(),
-            Source::OciArchive { path: "/tmp/x.tar".into(), tag: Some("latest".into()) }
+            Source::OciArchive {
+                path: "/tmp/x.tar".into(),
+                tag: Some("latest".into())
+            }
         );
         assert_eq!(
             Source::parse("docker-daemon:python:3.12").unwrap(),
@@ -316,9 +365,15 @@ mod tests {
             Source::parse("docker-daemon:sha256:abc").unwrap(),
             Source::DockerDaemon("sha256:abc".into())
         );
-        assert_eq!(Source::parse("docker://ghcr.io/a/b").unwrap(), Source::Registry("ghcr.io/a/b".into()));
+        assert_eq!(
+            Source::parse("docker://ghcr.io/a/b").unwrap(),
+            Source::Registry("ghcr.io/a/b".into())
+        );
         let err = Source::parse("python:3.12").unwrap_err().to_string();
-        assert!(err.contains("docker://python:3.12") && err.contains("docker-daemon:python:3.12"), "{err}");
+        assert!(
+            err.contains("docker://python:3.12") && err.contains("docker-daemon:python:3.12"),
+            "{err}"
+        );
         assert!(Source::parse("docker-daemon:").is_err());
         assert!(Source::parse("docker://").is_err());
     }
@@ -326,7 +381,10 @@ mod tests {
     fn one_layer_layout(file: &str) -> TestLayout {
         let layout = TestLayout::new();
         let img = layout.image(
-            &[("application/vnd.oci.image.layer.v1.tar", tar_of(&[(file, b"x")]))],
+            &[(
+                "application/vnd.oci.image.layer.v1.tar",
+                tar_of(&[(file, b"x")]),
+            )],
             serde_json::json!({"config": {"Cmd": ["run"]}}),
         );
         layout.index(vec![img]);
@@ -344,8 +402,13 @@ mod tests {
         assert_eq!(first.config.cmd, vec!["run"]);
 
         // Only the index and manifest are consulted on a hit.
-        let index: serde_json::Value = serde_json::from_slice(&fs::read(layout.path().join("index.json")).unwrap()).unwrap();
-        let manifest = index["manifests"][0]["digest"].as_str().unwrap().trim_start_matches("sha256:").to_string();
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(layout.path().join("index.json")).unwrap()).unwrap();
+        let manifest = index["manifests"][0]["digest"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("sha256:")
+            .to_string();
         for blob in fs::read_dir(layout.path().join("blobs/sha256")).unwrap() {
             let blob = blob.unwrap();
             if blob.file_name() != manifest.as_str() {
@@ -355,7 +418,10 @@ mod tests {
         let second = pull(&reference, Some(cache.path())).await.unwrap();
         assert_eq!(second.rootfs, first.rootfs);
         assert_eq!(second.config, first.config);
-        let entries: Vec<_> = fs::read_dir(cache.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let entries: Vec<_> = fs::read_dir(cache.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(entries.len(), 1, "no temp dirs left behind: {entries:?}");
     }
 
@@ -364,12 +430,18 @@ mod tests {
         let image = Image {
             rootfs: "/cache/img/rootfs".into(),
             config: ImageConfig {
-                env: vec!["PATH=/usr/local/bin:/usr/bin".into(), "LANG=C.UTF-8".into(), "NOEQUALS".into()],
+                env: vec![
+                    "PATH=/usr/local/bin:/usr/bin".into(),
+                    "LANG=C.UTF-8".into(),
+                    "NOEQUALS".into(),
+                ],
                 working_dir: Some("/srv".into()),
                 ..Default::default()
             },
         };
-        let b = crate::SandboxBuilder::default().env_var("LANG", "en_US.UTF-8").image(&image);
+        let b = crate::SandboxBuilder::default()
+            .env_var("LANG", "en_US.UTF-8")
+            .image(&image);
         assert_eq!(b.env["PATH"], "/usr/local/bin:/usr/bin");
         assert_eq!(b.env["LANG"], "en_US.UTF-8");
         assert!(!b.env.contains_key("NOEQUALS"));
@@ -377,7 +449,10 @@ mod tests {
         assert_eq!(b.chroot.as_deref(), Some(image.rootfs.as_path()));
         assert_eq!(b.workdir.as_deref(), Some(image.rootfs.as_path()));
 
-        let b = crate::SandboxBuilder::default().image(&image).cwd("/tmp").env_var("PATH", "/bin");
+        let b = crate::SandboxBuilder::default()
+            .image(&image)
+            .cwd("/tmp")
+            .env_var("PATH", "/bin");
         assert_eq!(b.cwd.as_deref(), Some(Path::new("/tmp")));
         assert_eq!(b.env["PATH"], "/bin");
     }
@@ -386,7 +461,10 @@ mod tests {
     fn image_writes_are_always_discarded() {
         use crate::sandbox::BranchAction;
         let rootfs = tempfile::tempdir().unwrap();
-        let image = Image { rootfs: rootfs.path().to_path_buf(), config: ImageConfig::default() };
+        let image = Image {
+            rootfs: rootfs.path().to_path_buf(),
+            config: ImageConfig::default(),
+        };
         let build = |b: crate::SandboxBuilder| b.build();
 
         let sb = build(crate::SandboxBuilder::default().image(&image)).unwrap();
@@ -394,17 +472,34 @@ mod tests {
         assert_eq!(sb.on_error, BranchAction::Abort);
         assert_eq!(sb.workdir.as_deref(), Some(rootfs.path()));
 
-        let explicit = crate::SandboxBuilder::default().on_exit(BranchAction::Abort).image(&image);
+        let explicit = crate::SandboxBuilder::default()
+            .on_exit(BranchAction::Abort)
+            .image(&image);
         assert!(build(explicit).is_ok());
 
         let other = tempfile::tempdir().unwrap();
-        let err = build(crate::SandboxBuilder::default().workdir(other.path()).image(&image)).unwrap_err();
+        let err = build(
+            crate::SandboxBuilder::default()
+                .workdir(other.path())
+                .image(&image),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("copy-on-write root"), "{err}");
 
         for action in [BranchAction::Commit, BranchAction::Keep] {
-            let err = build(crate::SandboxBuilder::default().image(&image).on_exit(action.clone())).unwrap_err();
+            let err = build(
+                crate::SandboxBuilder::default()
+                    .image(&image)
+                    .on_exit(action.clone()),
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("on_exit must be abort"), "{err}");
-            let err = build(crate::SandboxBuilder::default().on_error(action).image(&image)).unwrap_err();
+            let err = build(
+                crate::SandboxBuilder::default()
+                    .on_error(action)
+                    .image(&image),
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("on_error must be abort"), "{err}");
         }
     }
@@ -421,7 +516,10 @@ mod tests {
 
         assert_eq!(resolve_working_dir(r, "/work/dir").unwrap(), "/work/dir");
         assert!(r.join("work/dir").is_dir());
-        assert_eq!(resolve_working_dir(r, "/app/proj").unwrap(), "/usr/src/proj");
+        assert_eq!(
+            resolve_working_dir(r, "/app/proj").unwrap(),
+            "/usr/src/proj"
+        );
         assert_eq!(resolve_working_dir(r, "/up").unwrap(), "/");
         let _ = resolve_working_dir(r, "/out/x");
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
@@ -469,7 +567,9 @@ mod tests {
     fn failed_build_leaves_nothing_behind() {
         let cache = tempfile::tempdir().unwrap();
         let cache = Cache::new(Some(cache.path()));
-        let res = cache.get_or_build("k", |_| Err(SandboxRuntimeError::Child("boom".into()).into()));
+        let res = cache.get_or_build("k", |_| {
+            Err(SandboxRuntimeError::Child("boom".into()).into())
+        });
         assert!(res.is_err());
         assert_eq!(fs::read_dir(&cache.dir).unwrap().count(), 0);
     }

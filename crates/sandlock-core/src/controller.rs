@@ -51,7 +51,9 @@ impl Controller {
 
     fn signal_live(&self, sig: i32) -> Result<(), SandlockError> {
         if self.signal(sig)? == 0 {
-            return Err(SandboxRuntimeError::Io(std::io::Error::from_raw_os_error(libc::ESRCH)).into());
+            return Err(
+                SandboxRuntimeError::Io(std::io::Error::from_raw_os_error(libc::ESRCH)).into(),
+            );
         }
         Ok(())
     }
@@ -71,7 +73,10 @@ impl MainExit {
         if let Some(fd) = &pipe {
             unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
         }
-        Arc::new(MainExit { pipe, status: Mutex::new(None) })
+        Arc::new(MainExit {
+            pipe,
+            status: Mutex::new(None),
+        })
     }
 
     pub(crate) fn get(&self) -> Option<ExitStatus> {
@@ -81,10 +86,17 @@ impl MainExit {
                 let mut raw = [0u8; 4];
                 let n = unsafe { libc::read(fd.as_raw_fd(), raw.as_mut_ptr().cast(), raw.len()) };
                 *status = match n {
-                    4 => Some(crate::sandbox::sandbox_wait_status_to_exit(i32::from_le_bytes(raw))),
+                    4 => Some(crate::sandbox::sandbox_wait_status_to_exit(
+                        i32::from_le_bytes(raw),
+                    )),
                     // The write is atomic, so anything else but EAGAIN means
                     // the reaper died without reporting main.
-                    n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => None,
+                    n if n < 0
+                        && std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::WouldBlock =>
+                    {
+                        None
+                    }
                     _ => Some(ExitStatus::Killed),
                 };
             }
@@ -100,7 +112,8 @@ impl MainExit {
         let Some(fd) = &self.pipe else {
             return Err(std::io::Error::other("main's exit has no status pipe"));
         };
-        let ready = tokio::io::unix::AsyncFd::with_interest(fd.as_raw_fd(), tokio::io::Interest::READABLE)?;
+        let ready =
+            tokio::io::unix::AsyncFd::with_interest(fd.as_raw_fd(), tokio::io::Interest::READABLE)?;
         loop {
             if let Some(exit) = self.get() {
                 return Ok(exit);

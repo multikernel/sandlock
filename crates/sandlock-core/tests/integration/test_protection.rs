@@ -128,9 +128,18 @@ fn strict_all_on_v4_host_fails_only_for_v5_plus_protections() {
     // (v4); fails on FsIoctlDev (v5), SignalScope (v6),
     // AbstractUnixSocketScope (v6).
     let pol = ProtectionPolicy::strict_all();
-    assert_eq!(ProtectionStatus::resolve(Protection::FsRefer, 4, &pol), ProtectionStatus::Active);
-    assert_eq!(ProtectionStatus::resolve(Protection::FsTruncate, 4, &pol), ProtectionStatus::Active);
-    assert_eq!(ProtectionStatus::resolve(Protection::NetTcp, 4, &pol), ProtectionStatus::Active);
+    assert_eq!(
+        ProtectionStatus::resolve(Protection::FsRefer, 4, &pol),
+        ProtectionStatus::Active
+    );
+    assert_eq!(
+        ProtectionStatus::resolve(Protection::FsTruncate, 4, &pol),
+        ProtectionStatus::Active
+    );
+    assert_eq!(
+        ProtectionStatus::resolve(Protection::NetTcp, 4, &pol),
+        ProtectionStatus::Active
+    );
     assert_eq!(
         ProtectionStatus::resolve(Protection::FsIoctlDev, 4, &pol),
         ProtectionStatus::Unavailable
@@ -206,7 +215,10 @@ fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
     // must drop LANDLOCK_ACCESS_FS_REFER from the handled-fs mask.
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsRefer, ProtectionState::Degradable);
-    assert_eq!(ProtectionStatus::resolve(Protection::FsRefer, 1, &pol), ProtectionStatus::Degraded);
+    assert_eq!(
+        ProtectionStatus::resolve(Protection::FsRefer, 1, &pol),
+        ProtectionStatus::Degraded
+    );
     let mask = compute_fs_mask(1, &pol);
     assert_eq!(
         mask & LANDLOCK_ACCESS_FS_REFER,
@@ -244,17 +256,25 @@ fn active_protections_returns_six_entries() {
     // Construct a default Sandbox; we don't actually run it — just
     // call the accessor. The dev host has Landlock available, so
     // abi_version() should succeed.
-    let sb = sandlock_core::Sandbox::builder().build_unchecked().expect("build");
+    let sb = sandlock_core::Sandbox::builder()
+        .build_unchecked()
+        .expect("build");
     let result = sb.active_protections().expect("ABI detect");
     assert_eq!(result.len(), 6);
 }
 
 #[test]
 fn active_protections_reports_disabled_for_explicitly_off() {
-    let mut sb = sandlock_core::Sandbox::builder().build_unchecked().expect("build");
-    sb.protection_policy.set(Protection::SignalScope, ProtectionState::Disabled);
+    let mut sb = sandlock_core::Sandbox::builder()
+        .build_unchecked()
+        .expect("build");
+    sb.protection_policy
+        .set(Protection::SignalScope, ProtectionState::Disabled);
     let result = sb.active_protections().expect("ABI detect");
-    let signal = result.iter().find(|(p, _)| *p == Protection::SignalScope).unwrap();
+    let signal = result
+        .iter()
+        .find(|(p, _)| *p == Protection::SignalScope)
+        .unwrap();
     assert_eq!(signal.1, ProtectionStatus::Disabled);
 }
 
@@ -281,7 +301,8 @@ fn builder_disable_sets_state_to_disabled() {
         .build_unchecked()
         .expect("build");
     assert_eq!(
-        sb.protection_policy.state(Protection::AbstractUnixSocketScope),
+        sb.protection_policy
+            .state(Protection::AbstractUnixSocketScope),
         ProtectionState::Disabled
     );
 }
@@ -312,7 +333,8 @@ fn builder_methods_fluent_chain() {
         ProtectionState::Degradable
     );
     assert_eq!(
-        sb.protection_policy.state(Protection::AbstractUnixSocketScope),
+        sb.protection_policy
+            .state(Protection::AbstractUnixSocketScope),
         ProtectionState::Degradable
     );
     assert_eq!(
@@ -542,7 +564,11 @@ fn shutdown_without_pidfd_group_signals() {
     const CHILD: &str = "SANDLOCK_TEST_NO_PIDFD_GROUP_SIGNALS";
     if std::env::var_os(CHILD).is_none() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["test_protection::shutdown_without_pidfd_group_signals", "--exact", "--nocapture"])
+            .args([
+                "test_protection::shutdown_without_pidfd_group_signals",
+                "--exact",
+                "--nocapture",
+            ])
             .env(CHILD, "1")
             .spawn()
             .unwrap();
@@ -562,17 +588,53 @@ fn shutdown_without_pidfd_group_signals() {
     }
 
     let filter = [
-        libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 0 },
-        libc::sock_filter { code: 0x15, jt: 0, jf: 3, k: libc::SYS_pidfd_send_signal as u32 },
-        libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 16 + 3 * 8 },
-        libc::sock_filter { code: 0x45, jt: 0, jf: 1, k: 1 << 2 },
-        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32 },
-        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW },
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 3,
+            k: libc::SYS_pidfd_send_signal as u32,
+        },
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 16 + 3 * 8,
+        },
+        libc::sock_filter {
+            code: 0x45,
+            jt: 0,
+            jf: 1,
+            k: 1 << 2,
+        },
+        libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32,
+        },
+        libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
     ];
-    let program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut _,
+    };
     unsafe {
         assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
-        assert_eq!(libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program), 0);
+        assert_eq!(
+            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+            0
+        );
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -593,9 +655,15 @@ fn shutdown_without_pidfd_group_signals() {
         .build()
         .unwrap();
     let job = |name: &str| -> i32 {
-        std::fs::read_to_string(dir.path().join(name)).unwrap().trim().parse().unwrap()
+        std::fs::read_to_string(dir.path().join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
     };
-    let publish = |name: &str| format!("open('{d}/{name}.tmp','w').write(str(os.getpid())); os.rename('{d}/{name}.tmp','{d}/{name}'); signal.pause()");
+    let publish = |name: &str| {
+        format!("open('{d}/{name}.tmp','w').write(str(os.getpid())); os.rename('{d}/{name}.tmp','{d}/{name}'); signal.pause()")
+    };
     let wait_for = |name: &str| format!("while not os.path.exists('{d}/{name}'): time.sleep(0.01)");
     let gone = |pid: i32| unsafe { libc::kill(pid, 0) } != 0;
 

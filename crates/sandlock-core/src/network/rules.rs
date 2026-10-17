@@ -33,9 +33,9 @@ impl IpCidr {
             }
             None => (s, None),
         };
-        let addr: IpAddr = addr_str.parse().map_err(|_| {
-            SandboxError::Invalid(format!("`{}` is not a valid IP address", s))
-        })?;
+        let addr: IpAddr = addr_str
+            .parse()
+            .map_err(|_| SandboxError::Invalid(format!("`{}` is not a valid IP address", s)))?;
         let max = match addr {
             IpAddr::V4(_) => 32u8,
             IpAddr::V6(_) => 128u8,
@@ -167,7 +167,11 @@ impl NetRule {
     /// Shared grammar for both flags. `label` selects the error prefix and
     /// `allow_hosts` whether non-IP targets are accepted (allow) or
     /// rejected (deny).
-    fn parse_spec(spec: &str, label: &str, allow_hosts: bool) -> Result<Vec<NetRule>, SandboxError> {
+    fn parse_spec(
+        spec: &str,
+        label: &str,
+        allow_hosts: bool,
+    ) -> Result<Vec<NetRule>, SandboxError> {
         let (scheme, rest) = match spec.split_once("://") {
             Some((scheme, body)) => {
                 let proto = Protocol::parse(scheme).ok_or_else(|| {
@@ -208,7 +212,10 @@ impl NetRule {
         // 1. Bracketed IPv6 with a port: `[addr]:ports`.
         let (target, ports, all_ports) = if let Some(stripped) = rest.strip_prefix('[') {
             let (inside, port_part) = stripped.rsplit_once("]:").ok_or_else(|| {
-                SandboxError::Invalid(format!("{}: malformed bracketed address in `{}`", label, spec))
+                SandboxError::Invalid(format!(
+                    "{}: malformed bracketed address in `{}`",
+                    label, spec
+                ))
             })?;
             let (ports, all_ports) = parse_ports(port_part, label, spec)?;
             (NetTarget::Cidr(IpCidr::parse(inside)?), ports, all_ports)
@@ -265,9 +272,11 @@ fn parse_target(s: &str, label: &str, allow_hosts: bool) -> Result<NetTarget, Sa
         "" | "*" => Ok(NetTarget::AnyIp),
         // A `/` signals CIDR intent: parse strictly so a bad prefix is a
         // clear error rather than being misread as a hostname.
-        _ if s.contains('/') => Ok(NetTarget::Cidr(
-            IpCidr::parse(s).map_err(|e| SandboxError::Invalid(format!("{}: {}", label, e)))?,
-        )),
+        _ if s.contains('/') => {
+            Ok(NetTarget::Cidr(IpCidr::parse(s).map_err(|e| {
+                SandboxError::Invalid(format!("{}: {}", label, e))
+            })?))
+        }
         _ => {
             if let Ok(cidr) = IpCidr::parse(s) {
                 Ok(NetTarget::Cidr(cidr))
@@ -408,9 +417,7 @@ pub struct ResolvedNetAllowSet {
 /// sets — the on-behalf check routes ICMP through the IP-only path
 /// (PortAllow::Any). A `*` host on ICMP becomes `any_ip_all_ports`,
 /// which the handler reads as "no destination check."
-pub async fn resolve_net_allow(
-    rules: &[NetAllow],
-) -> io::Result<ResolvedNetAllowSet> {
+pub async fn resolve_net_allow(rules: &[NetAllow]) -> io::Result<ResolvedNetAllowSet> {
     use crate::seccomp::notif::PortAllow;
 
     // Resolve each unique hostname once, up front. A scheme-less spec
@@ -799,8 +806,18 @@ mod tests {
         // A CIDR / IP-literal target resolves into `cidrs` directly, with
         // no DNS lookup and no `per_ip` / `/etc/hosts` entry.
         let rules = vec![
-            NetAllow { protocol: Protocol::Tcp, target: NetTarget::Cidr(IpCidr::parse("10.0.0.0/8").unwrap()), ports: vec![80], all_ports: false },
-            NetAllow { protocol: Protocol::Tcp, target: NetTarget::Cidr(IpCidr::parse("1.2.3.4").unwrap()), ports: vec![], all_ports: true },
+            NetAllow {
+                protocol: Protocol::Tcp,
+                target: NetTarget::Cidr(IpCidr::parse("10.0.0.0/8").unwrap()),
+                ports: vec![80],
+                all_ports: false,
+            },
+            NetAllow {
+                protocol: Protocol::Tcp,
+                target: NetTarget::Cidr(IpCidr::parse("1.2.3.4").unwrap()),
+                ports: vec![],
+                all_ports: true,
+            },
         ];
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert_eq!(resolved.tcp.cidrs.len(), 2);
@@ -894,7 +911,11 @@ mod tests {
         // the scheme is unknown rather than a special-case error.
         for spec in ["sctp://host:1234", "icmp-raw://*"] {
             let err = NetRule::parse_allow(spec).unwrap_err();
-            assert!(format!("{}", err).contains("unknown scheme"), "spec: {}", spec);
+            assert!(
+                format!("{}", err).contains("unknown scheme"),
+                "spec: {}",
+                spec
+            );
         }
     }
 
@@ -928,7 +949,9 @@ mod tests {
         assert!(resolved.udp.per_ip.is_empty());
         assert!(resolved.icmp.per_ip.is_empty());
         // The resolved entry (`<ip> localhost`) surfaces in concrete_host_entries.
-        assert!(resolved.concrete_host_entries.contains("127.0.0.1 localhost"));
+        assert!(resolved
+            .concrete_host_entries
+            .contains("127.0.0.1 localhost"));
     }
 
     #[tokio::test]
@@ -1048,7 +1071,10 @@ mod tests {
         for ports in resolved.tcp.per_ip.values() {
             assert!(!ports.contains(&53), "UDP port leaked into TCP set");
         }
-        assert!(!resolved.udp.any_ip_ports.contains(&443), "TCP port leaked into UDP set");
+        assert!(
+            !resolved.udp.any_ip_ports.contains(&443),
+            "TCP port leaked into UDP set"
+        );
     }
 
     #[tokio::test]
@@ -1099,7 +1125,8 @@ mod tests {
     fn temp_rootfs_with_hosts(name: &str, hosts_content: Option<&str>) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "sandlock-test-compose-hosts-{}-{}",
-            name, std::process::id()
+            name,
+            std::process::id()
         ));
         let _ = std::fs::create_dir_all(dir.join("etc"));
         if let Some(content) = hosts_content {
@@ -1128,13 +1155,16 @@ mod tests {
         // Image ships an entry of its own but no localhost mapping; the
         // shim must keep the image's content and inject both loopback
         // entries on top so the always-on guarantee still holds.
-        let rootfs = temp_rootfs_with_hosts(
-            "no-localhost",
-            Some("10.0.0.5 myimage.local\n"),
-        );
+        let rootfs = temp_rootfs_with_hosts("no-localhost", Some("10.0.0.5 myimage.local\n"));
         let out = compose_virtual_etc_hosts(Some(&rootfs), "");
-        assert!(out.contains("10.0.0.5 myimage.local"), "image entry missing: {out}");
-        assert!(out.contains("127.0.0.1 localhost"), "v4 loopback missing: {out}");
+        assert!(
+            out.contains("10.0.0.5 myimage.local"),
+            "image entry missing: {out}"
+        );
+        assert!(
+            out.contains("127.0.0.1 localhost"),
+            "v4 loopback missing: {out}"
+        );
         assert!(out.contains("::1 localhost"), "v6 loopback missing: {out}");
         let _ = std::fs::remove_dir_all(&rootfs);
     }
@@ -1147,7 +1177,11 @@ mod tests {
             Some("127.0.0.1 localhost\n::1 localhost\n10.0.0.5 myimage.local\n"),
         );
         let out = compose_virtual_etc_hosts(Some(&rootfs), "");
-        assert_eq!(out.matches("127.0.0.1 localhost").count(), 1, "v4 dup'd: {out}");
+        assert_eq!(
+            out.matches("127.0.0.1 localhost").count(),
+            1,
+            "v4 dup'd: {out}"
+        );
         assert_eq!(out.matches("::1 localhost").count(), 1, "v6 dup'd: {out}");
         assert!(out.contains("10.0.0.5 myimage.local"));
         let _ = std::fs::remove_dir_all(&rootfs);
@@ -1156,13 +1190,14 @@ mod tests {
     #[test]
     fn compose_chroot_injects_only_missing_family() {
         // Image has v4 but no v6 localhost — inject only v6, leave v4 alone.
-        let rootfs = temp_rootfs_with_hosts(
-            "only-v4-localhost",
-            Some("127.0.0.1 localhost myimage\n"),
-        );
+        let rootfs =
+            temp_rootfs_with_hosts("only-v4-localhost", Some("127.0.0.1 localhost myimage\n"));
         let out = compose_virtual_etc_hosts(Some(&rootfs), "");
         assert_eq!(out.matches("127.0.0.1 localhost").count(), 1);
-        assert!(out.contains("::1 localhost"), "v6 loopback should be injected: {out}");
+        assert!(
+            out.contains("::1 localhost"),
+            "v6 loopback should be injected: {out}"
+        );
         let _ = std::fs::remove_dir_all(&rootfs);
     }
 
@@ -1420,6 +1455,10 @@ mod tests {
         assert_eq!(tcp_ips, udp_ips);
         let lines: Vec<&str> = resolved.concrete_host_entries.lines().collect();
         let unique: HashSet<&str> = lines.iter().copied().collect();
-        assert_eq!(lines.len(), unique.len(), "duplicate hosts lines: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            unique.len(),
+            "duplicate hosts lines: {lines:?}"
+        );
     }
 }

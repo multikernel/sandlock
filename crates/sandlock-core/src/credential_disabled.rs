@@ -13,5 +13,8 @@ pub fn resolve_inject_rules(
     if credentials.is_empty() && inject.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    Err(SandboxError::FeatureDisabled { what: "credential injection".into(), feature: "http" })
+    Err(SandboxError::FeatureDisabled {
+        what: "credential injection".into(),
+        feature: "http",
+    })
 }

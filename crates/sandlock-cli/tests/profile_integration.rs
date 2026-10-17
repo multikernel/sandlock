@@ -23,20 +23,31 @@ fn read_list() -> &'static str {
 fn profile_program_section_supplies_command() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
-    std::fs::write(&profile_path, format!(r#"
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"
         [program]
         exec = "/bin/true"
 
         [filesystem]
         {read}
-    "#, read = read_list())).unwrap();
+    "#,
+            read = read_list()
+        ),
+    )
+    .unwrap();
 
     let out = sandlock_bin()
         .args(["run", "--profile-file", profile_path.to_str().unwrap()])
         .output()
         .expect("spawn sandlock");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -44,41 +55,69 @@ fn trailing_command_overrides_profile_program_section() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
     // Profile says exec = "/bin/false" — should be overridden by CLI command.
-    std::fs::write(&profile_path, format!(r#"
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"
         [program]
         exec = "/bin/false"
 
         [filesystem]
         {read}
-    "#, read = read_list())).unwrap();
+    "#,
+            read = read_list()
+        ),
+    )
+    .unwrap();
 
     let out = sandlock_bin()
-        .args(["run", "--profile-file", profile_path.to_str().unwrap(), "--", "/bin/true"])
+        .args([
+            "run",
+            "--profile-file",
+            profile_path.to_str().unwrap(),
+            "--",
+            "/bin/true",
+        ])
         .output()
         .expect("spawn sandlock");
 
-    assert!(out.status.success(), "trailing command /bin/true should win over profile's /bin/false; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "trailing command /bin/true should win over profile's /bin/false; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
 fn profile_with_args_are_passed_to_command() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
-    std::fs::write(&profile_path, format!(r#"
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"
         [program]
         exec = "/bin/sh"
         args = ["-c", "exit 0"]
 
         [filesystem]
         {read}
-    "#, read = read_list())).unwrap();
+    "#,
+            read = read_list()
+        ),
+    )
+    .unwrap();
 
     let out = sandlock_bin()
         .args(["run", "--profile-file", profile_path.to_str().unwrap()])
         .output()
         .expect("spawn sandlock");
 
-    assert!(out.status.success(), "profile-supplied args should work; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "profile-supplied args should work; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -86,21 +125,29 @@ fn missing_exec_and_no_trailing_command_is_error() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
     // Profile has no [program] section at all.
-    std::fs::write(&profile_path, r#"
+    std::fs::write(
+        &profile_path,
+        r#"
         [filesystem]
         read = ["/usr"]
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
 
     let out = sandlock_bin()
         .args(["run", "--profile-file", profile_path.to_str().unwrap()])
         .output()
         .expect("spawn sandlock");
 
-    assert!(!out.status.success(), "should fail when no command source is available");
+    assert!(
+        !out.status.success(),
+        "should fail when no command source is available"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("no command") || stderr.contains("exec"),
-        "error message should mention missing command; stderr: {}", stderr
+        "error message should mention missing command; stderr: {}",
+        stderr
     );
 }
 
@@ -110,13 +157,20 @@ fn profile_by_name_loads_program_section() {
     let profiles_dir = tmp.path().join(".config/sandlock/profiles");
     std::fs::create_dir_all(&profiles_dir).unwrap();
     let profile_path = profiles_dir.join("by-name-test.toml");
-    std::fs::write(&profile_path, format!(r#"
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"
         [program]
         exec = "/bin/true"
 
         [filesystem]
         {read}
-    "#, read = read_list())).unwrap();
+    "#,
+            read = read_list()
+        ),
+    )
+    .unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_sandlock"))
         .env("HOME", tmp.path())
@@ -135,7 +189,10 @@ fn profile_by_name_loads_program_section() {
 fn no_supervisor_rejects_supervisor_only_profile_fields() {
     let tmp = tempfile::tempdir().unwrap();
     let profile_path = tmp.path().join("p.toml");
-    std::fs::write(&profile_path, format!(r#"
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"
         [program]
         exec = "/bin/true"
 
@@ -144,14 +201,26 @@ fn no_supervisor_rejects_supervisor_only_profile_fields() {
 
         [network]
         allow = ["example.com:443"]
-    "#, read = read_list())).unwrap();
+    "#,
+            read = read_list()
+        ),
+    )
+    .unwrap();
 
     let out = sandlock_bin()
-        .args(["run", "--no-supervisor", "--profile-file", profile_path.to_str().unwrap()])
+        .args([
+            "run",
+            "--no-supervisor",
+            "--profile-file",
+            profile_path.to_str().unwrap(),
+        ])
         .output()
         .expect("spawn sandlock");
 
-    assert!(!out.status.success(), "--no-supervisor should reject network rules from profiles");
+    assert!(
+        !out.status.success(),
+        "--no-supervisor should reject network rules from profiles"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("--no-supervisor") && stderr.contains("[network].allow"),
@@ -170,11 +239,18 @@ fn profile_home_variable_grants_real_access() {
     let profile_path = tmp.path().join("expand.toml");
     // The write grant is what proves expansion happened: it is mandatory, so
     // a literal "${HOME}" would abort the run on a path that does not exist.
-    std::fs::write(&profile_path, format!(r#"
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"
         [filesystem]
         {read}
         write = ["${{HOME}}/.sandlock-expand-probe"]
-    "#, read = read_list())).unwrap();
+    "#,
+            read = read_list()
+        ),
+    )
+    .unwrap();
 
     let out = sandlock_bin()
         .args([

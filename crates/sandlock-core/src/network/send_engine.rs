@@ -51,7 +51,12 @@ fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i3
 }
 
 /// Prepare a send without writing to the socket before callback approval.
-pub(crate) fn prepare_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, child_blocking: bool) -> NotifAction {
+pub(crate) fn prepare_send(
+    dup_fd: OwnedFd,
+    m: MaterializedMsg,
+    flags: i32,
+    child_blocking: bool,
+) -> NotifAction {
     NotifAction::prepare(&m.addr.clone(), dup_fd.as_raw_fd(), move || {
         execute_send(dup_fd, m, flags, child_blocking)
     })
@@ -65,7 +70,12 @@ pub(crate) fn prepare_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, chil
 /// kernel's "a blocking send of N returns N" contract without occupying the
 /// loop or a worker thread — a stream send that partially fit continues from
 /// the sent offset; a full send buffer defers from offset 0.
-fn execute_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, child_blocking: bool) -> NotifAction {
+fn execute_send(
+    dup_fd: OwnedFd,
+    m: MaterializedMsg,
+    flags: i32,
+    child_blocking: bool,
+) -> NotifAction {
     let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
     if ret >= 0 {
         let sent = ret as usize;
@@ -97,22 +107,40 @@ pub(crate) fn prepare_batch(
         return NotifAction::Errno(error);
     };
     use super::materialize::{parse_ip_from_sockaddr, parse_port_from_sockaddr};
-    let extra_destinations = entries.iter().skip(1).map(|(_, message, _)| {
-        (parse_ip_from_sockaddr(&message.addr), parse_port_from_sockaddr(&message.addr))
-    }).collect();
+    let extra_destinations = entries
+        .iter()
+        .skip(1)
+        .map(|(_, message, _)| {
+            (
+                parse_ip_from_sockaddr(&message.addr),
+                parse_port_from_sockaddr(&message.addr),
+            )
+        })
+        .collect();
     let addr = first.addr.clone();
     let fd = socket.as_raw_fd();
     let mut action = NotifAction::prepare(&addr, fd, move || {
         let mut sent = 0;
         for (socket, message, msglen_addr) in entries {
-            match batch_send_step(&socket, message, flags, notif_fd, notif_id, notif_pid, msglen_addr, sent) {
+            match batch_send_step(
+                &socket,
+                message,
+                flags,
+                notif_fd,
+                notif_id,
+                notif_pid,
+                msglen_addr,
+                sent,
+            ) {
                 BatchStep::Sent => sent += 1,
                 BatchStep::Done(action) => return action,
-                BatchStep::Stop(errno) => return if sent == 0 {
-                    NotifAction::Errno(errno)
-                } else {
-                    NotifAction::ReturnValue(sent as i64)
-                },
+                BatchStep::Stop(errno) => {
+                    return if sent == 0 {
+                        NotifAction::Errno(errno)
+                    } else {
+                        NotifAction::ReturnValue(sent as i64)
+                    }
+                }
             }
         }
         NotifAction::ReturnValue(sent as i64)
@@ -144,7 +172,12 @@ async fn push_until_done(
         .map_err(|_| libc::EIO)?;
     loop {
         let mut guard = afd.writable().await.map_err(|_| libc::EIO)?;
-        let ret = send_materialized_at(afd.get_ref().as_raw_fd(), &m, offset, flags | libc::MSG_DONTWAIT);
+        let ret = send_materialized_at(
+            afd.get_ref().as_raw_fd(),
+            &m,
+            offset,
+            flags | libc::MSG_DONTWAIT,
+        );
         if ret >= 0 {
             offset += ret as usize;
             if offset >= m.data.len() {
@@ -273,7 +306,14 @@ pub(crate) fn batch_send_step(
                 }
             };
             return BatchStep::Done(complete_batch_entry(
-                dup, m, flags, ret as usize, notif_fd, notif_id, notif_pid, msglen_addr,
+                dup,
+                m,
+                flags,
+                ret as usize,
+                notif_fd,
+                notif_id,
+                notif_pid,
+                msglen_addr,
                 prior_count,
             ));
         }
@@ -291,7 +331,15 @@ pub(crate) fn batch_send_step(
                 Err(_) => return BatchStep::Stop(libc::EIO),
             };
             return BatchStep::Done(complete_batch_entry(
-                dup, m, flags, 0, notif_fd, notif_id, notif_pid, msglen_addr, 0,
+                dup,
+                m,
+                flags,
+                0,
+                notif_fd,
+                notif_id,
+                notif_pid,
+                msglen_addr,
+                0,
             ));
         }
         return BatchStep::Stop(libc::EAGAIN);
@@ -310,22 +358,39 @@ mod tests {
         let (sender, mut receiver) = UnixStream::pair().unwrap();
         receiver.set_nonblocking(true).unwrap();
         let capacity: libc::c_int = 4096;
-        assert_eq!(unsafe {
-            libc::setsockopt(sender.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
-                &capacity as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&capacity) as libc::socklen_t)
-        }, 0);
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &capacity as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&capacity) as libc::socklen_t,
+                )
+            },
+            0
+        );
         let data = vec![42; 1024 * 1024];
         let expected = data.clone();
         let message = MaterializedMsg {
-            data, addr: Vec::new(), control: None,
-            _scm_fds: Vec::new(), _pinned: None,
+            data,
+            addr: Vec::new(),
+            control: None,
+            _scm_fds: Vec::new(),
+            _pinned: None,
         };
         let action = prepare_send(sender.into(), message, 0, true);
         let mut probe = [0; 1];
-        assert_eq!(receiver.read(&mut probe).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
-        let NotifAction::Prepared(operation) = action else { panic!("expected prepared send") };
-        let NotifAction::Defer(deferred) = operation.execute() else { panic!("expected partial send to defer") };
+        assert_eq!(
+            receiver.read(&mut probe).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let NotifAction::Prepared(operation) = action else {
+            panic!("expected prepared send")
+        };
+        let NotifAction::Defer(deferred) = operation.execute() else {
+            panic!("expected partial send to defer")
+        };
         receiver.set_nonblocking(false).unwrap();
         let reader = std::thread::spawn(move || {
             let mut received = vec![0; expected.len()];
@@ -342,11 +407,17 @@ mod tests {
         receiver.set_nonblocking(true).unwrap();
         let fd = sender.try_clone().unwrap().into();
         let message = MaterializedMsg {
-            data: b"denied".to_vec(), addr: Vec::new(), control: None,
-            _scm_fds: Vec::new(), _pinned: None,
+            data: b"denied".to_vec(),
+            addr: Vec::new(),
+            control: None,
+            _scm_fds: Vec::new(),
+            _pinned: None,
         };
         drop(prepare_send(fd, message, 0, false));
         let mut buf = [0; 6];
-        assert_eq!(receiver.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            receiver.read(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

@@ -1,12 +1,17 @@
-use sandlock_core::{Sandbox, Checkpoint};
+use sandlock_core::{Checkpoint, Sandbox};
 
 /// Test that checkpoint save/load roundtrips correctly.
 #[tokio::test]
 async fn test_checkpoint_save_load() {
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // Start a long-running process
     let mut sb = policy.clone();
@@ -16,8 +21,14 @@ async fn test_checkpoint_save_load() {
 
     // Checkpoint
     let cp = sb.checkpoint().await.unwrap();
-    assert!(!cp.process_state.memory_maps.is_empty(), "Should capture memory maps");
-    assert!(!cp.process_state.regs.is_empty(), "Should capture registers");
+    assert!(
+        !cp.process_state.memory_maps.is_empty(),
+        "Should capture memory maps"
+    );
+    assert!(
+        !cp.process_state.regs.is_empty(),
+        "Should capture registers"
+    );
     assert!(!cp.fd_table.is_empty(), "Should capture file descriptors");
 
     // Save to temp directory
@@ -35,7 +46,10 @@ async fn test_checkpoint_save_load() {
     // Load back
     let loaded = Checkpoint::load(&tmp).unwrap();
     assert_eq!(loaded.process_state.regs.len(), cp.process_state.regs.len());
-    assert_eq!(loaded.process_state.memory_data.len(), cp.process_state.memory_data.len());
+    assert_eq!(
+        loaded.process_state.memory_data.len(),
+        cp.process_state.memory_data.len()
+    );
     assert_eq!(loaded.fd_table.len(), cp.fd_table.len());
     assert_eq!(loaded.process_state.pid, cp.process_state.pid);
     assert!(!loaded.process_state.exe.is_empty());
@@ -50,9 +64,14 @@ async fn test_checkpoint_save_load() {
 #[tokio::test]
 async fn test_checkpoint_memory_maps() {
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
@@ -60,13 +79,18 @@ async fn test_checkpoint_memory_maps() {
     let cp = sb.checkpoint().await.unwrap();
 
     // Should have at least stack, heap, and code segments
-    let has_stack = cp.process_state.memory_maps.iter().any(|m| {
-        m.path.as_ref().map_or(false, |p| p.contains("[stack]"))
-    });
+    let has_stack = cp
+        .process_state
+        .memory_maps
+        .iter()
+        .any(|m| m.path.as_ref().map_or(false, |p| p.contains("[stack]")));
     assert!(has_stack, "Should capture stack mapping");
 
     // Memory data should have some writable segments captured
-    assert!(!cp.process_state.memory_data.is_empty(), "Should capture writable memory");
+    assert!(
+        !cp.process_state.memory_data.is_empty(),
+        "Should capture writable memory"
+    );
 
     sb.kill().unwrap();
     let _ = sb.wait().await;
@@ -76,9 +100,14 @@ async fn test_checkpoint_memory_maps() {
 #[tokio::test]
 async fn test_checkpoint_app_state_roundtrip() {
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
@@ -108,9 +137,14 @@ async fn test_checkpoint_app_state_roundtrip() {
 #[tokio::test]
 async fn test_checkpoint_no_app_state_file() {
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
@@ -134,9 +168,14 @@ async fn test_checkpoint_no_app_state_file() {
 #[tokio::test]
 async fn test_checkpoint_process_info() {
     let policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
@@ -145,7 +184,11 @@ async fn test_checkpoint_process_info() {
     let cp = sb.checkpoint().await.unwrap();
 
     assert_eq!(cp.process_state.pid, expected_pid);
-    assert!(cp.process_state.exe.contains("sleep"), "exe should contain 'sleep', got: {}", cp.process_state.exe);
+    assert!(
+        cp.process_state.exe.contains("sleep"),
+        "exe should contain 'sleep', got: {}",
+        cp.process_state.exe
+    );
     assert!(!cp.process_state.cwd.is_empty(), "cwd should not be empty");
 
     sb.kill().unwrap();
@@ -155,14 +198,21 @@ async fn test_checkpoint_process_info() {
 #[tokio::test]
 async fn test_checkpoint_refused_after_main_exits() {
     let mut sb = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
         .fs_read("/proc")
-        .build().unwrap();
+        .build()
+        .unwrap();
     sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
     sb.wait().await.unwrap();
     assert!(matches!(
         sb.checkpoint().await,
-        Err(sandlock_core::SandlockError::Runtime(sandlock_core::error::SandboxRuntimeError::NotRunning))
+        Err(sandlock_core::SandlockError::Runtime(
+            sandlock_core::error::SandboxRuntimeError::NotRunning
+        ))
     ));
     sb.shutdown().await.unwrap();
 }
@@ -180,5 +230,8 @@ async fn test_checkpoint_not_running() {
     let policy = Sandbox::builder().build().unwrap();
     let sb = policy.clone();
     let result = sb.checkpoint().await;
-    assert!(result.is_err(), "Checkpoint on non-running sandbox should error");
+    assert!(
+        result.is_err(),
+        "Checkpoint on non-running sandbox should error"
+    );
 }

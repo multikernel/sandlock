@@ -167,7 +167,14 @@ pub fn landlock_restrict_self(ruleset_fd: &OwnedFd, flags: u32) -> io::Result<()
 
 /// Raw seccomp(2) syscall (syscall 317 on x86_64).
 pub fn seccomp(operation: u32, flags: u64, args: *const std::ffi::c_void) -> io::Result<i64> {
-    unsafe { syscall3(crate::arch::SYS_SECCOMP, operation as u64, flags, args as u64) }
+    unsafe {
+        syscall3(
+            crate::arch::SYS_SECCOMP,
+            operation as u64,
+            flags,
+            args as u64,
+        )
+    }
 }
 
 // ============================================================
@@ -197,7 +204,13 @@ pub fn pidfd_getfd(pidfd: &OwnedFd, targetfd: i32, flags: u32) -> io::Result<Own
 pub fn pidfd_send_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     unsafe {
-        syscall4(crate::arch::SYS_PIDFD_SEND_SIGNAL, pidfd.as_raw_fd() as u64, sig as u64, 0, 0)?
+        syscall4(
+            crate::arch::SYS_PIDFD_SEND_SIGNAL,
+            pidfd.as_raw_fd() as u64,
+            sig as u64,
+            0,
+            0,
+        )?
     };
     Ok(())
 }

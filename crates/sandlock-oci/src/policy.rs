@@ -116,10 +116,7 @@ pub struct OciPolicy {
 const SANDLOCK_ANN_PREFIX: &str = "io.sandlock.";
 
 /// Look up a `io.sandlock.<key>` annotation value.
-fn annotation<'a>(
-    annotations: Option<&'a HashMap<String, String>>,
-    key: &str,
-) -> Option<&'a str> {
+fn annotation<'a>(annotations: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a str> {
     annotations
         .and_then(|m| m.get(&format!("{SANDLOCK_ANN_PREFIX}{key}")))
         .map(String::as_str)
@@ -201,8 +198,15 @@ impl OciPolicy {
         // Process mounts — populate fs_mount, fs_read, fs_write, scratch_dirs
         if let Some(mounts) = spec.mounts() {
             map_mounts(
-                mounts, bundle, &rootfs, id,
-                &mut fs_mount, &mut fs_mount_ro, &mut fs_read, &mut fs_write, &mut scratch_dirs,
+                mounts,
+                bundle,
+                &rootfs,
+                id,
+                &mut fs_mount,
+                &mut fs_mount_ro,
+                &mut fs_read,
+                &mut fs_write,
+                &mut scratch_dirs,
             );
         }
 
@@ -214,34 +218,52 @@ impl OciPolicy {
         // so and_then/map can work without moving out of the spec reference (E0507).
         // Closures return owned values (.clone()) so no "reference to closure param" errors.
 
-        let cwd = spec.process().as_ref()
-            .and_then(|p| {
-                let c = p.cwd().clone();
-                if c.as_os_str().is_empty() { None } else { Some(c) }
-            });
+        let cwd = spec.process().as_ref().and_then(|p| {
+            let c = p.cwd().clone();
+            if c.as_os_str().is_empty() {
+                None
+            } else {
+                Some(c)
+            }
+        });
 
-        let env: HashMap<String, String> = spec.process().as_ref()
+        let env: HashMap<String, String> = spec
+            .process()
+            .as_ref()
             .and_then(|p| p.env().clone())
             .map(|env| {
                 env.iter()
-                    .filter_map(|v| v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                    .filter_map(|v| {
+                        v.split_once('=')
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                    })
                     .collect()
             })
             .unwrap_or_default();
 
-        let max_memory = spec.linux().as_ref()
+        let max_memory = spec
+            .linux()
+            .as_ref()
             .and_then(|l| l.resources().clone())
             .and_then(|res| res.memory().clone())
             .and_then(|mem| {
-                mem.limit().filter(|&l| l > 0).map(|l| ByteSize::bytes(l as u64))
+                mem.limit()
+                    .filter(|&l| l > 0)
+                    .map(|l| ByteSize::bytes(l as u64))
             });
 
-        let max_processes = spec.linux().as_ref()
+        let max_processes = spec
+            .linux()
+            .as_ref()
             .and_then(|l| l.resources().clone())
             .and_then(|res| res.pids().clone())
             .and_then(|pids| {
                 let limit = pids.limit();
-                if limit > 0 { Some(limit as u32) } else { None }
+                if limit > 0 {
+                    Some(limit as u32)
+                } else {
+                    None
+                }
             });
 
         // OCI `cpu.quota`/`cpu.period` express a CPU allowance in *cores*
@@ -253,7 +275,9 @@ impl OciPolicy {
         // map only a strict sub-core request (quota < period) here; a multi-core
         // cap belongs on affinity (`cpu_cores`), not on this throttle.  Don't
         // fake it by clamping to 100, which core reads as unlimited anyway.
-        let max_cpu = spec.linux().as_ref()
+        let max_cpu = spec
+            .linux()
+            .as_ref()
             .and_then(|l| l.resources().clone())
             .and_then(|res| res.cpu().clone())
             .and_then(|cpu| {
@@ -277,7 +301,9 @@ impl OciPolicy {
         // the workload may run on.  It maps directly to core's `cpu_cores`
         // (sched_setaffinity), an exact, non-approximate mapping, so unlike a
         // multi-core quota it is genuine enforcement.
-        let cpu_cores = spec.linux().as_ref()
+        let cpu_cores = spec
+            .linux()
+            .as_ref()
             .and_then(|l| l.resources().clone())
             .and_then(|res| res.cpu().clone())
             .and_then(|cpu| cpu.cpus().clone())
@@ -286,7 +312,10 @@ impl OciPolicy {
         // OCI process.user → run-as identity (uid/gid, both required by the spec).
         let run_user = spec.process().as_ref().map(|p| {
             let u = p.user();
-            RunAs { uid: u.uid(), gid: u.gid() }
+            RunAs {
+                uid: u.uid(),
+                gid: u.gid(),
+            }
         });
 
         // Networking + HTTP ACL from `io.sandlock.*` annotations. The OCI runtime
@@ -326,7 +355,8 @@ impl OciPolicy {
         // core resolves through the chroot/mounts, so pass them through as-is.
         let http_ca = annotation(ann, "config.http_ca").map(|p| resolve_host_path(bundle, p));
         let http_key = annotation(ann, "config.http_key").map(|p| resolve_host_path(bundle, p));
-        let http_ca_out = annotation(ann, "config.http_ca_out").map(|p| resolve_host_path(bundle, p));
+        let http_ca_out =
+            annotation(ann, "config.http_ca_out").map(|p| resolve_host_path(bundle, p));
         let http_inject_ca = annotation_list(annotation(ann, "config.http_inject_ca"))
             .into_iter()
             .map(PathBuf::from)
@@ -510,12 +540,20 @@ fn parse_cpuset(s: &str) -> Option<Vec<u32>> {
 fn rootfs_path(spec: &Spec, bundle: &Path) -> Result<Option<PathBuf>> {
     let raw = match spec.root().as_ref().and_then(|r| {
         let p = r.path().clone();
-        if p.as_os_str().is_empty() { None } else { Some(p) }
+        if p.as_os_str().is_empty() {
+            None
+        } else {
+            Some(p)
+        }
     }) {
         Some(p) => p,
         None => return Ok(None),
     };
-    let resolved = if raw.is_absolute() { raw } else { bundle.join(&raw) };
+    let resolved = if raw.is_absolute() {
+        raw
+    } else {
+        bundle.join(&raw)
+    };
     if resolved.exists() {
         Ok(Some(resolved))
     } else {
@@ -615,7 +653,11 @@ fn map_mounts(
                     .map(|opts| opts.iter().any(|o| o == "ro"))
                     .unwrap_or(false);
                 let source: Option<PathBuf> = mount.source().as_ref().map(|s| {
-                    if s.is_absolute() { s.clone() } else { bundle.join(s) }
+                    if s.is_absolute() {
+                        s.clone()
+                    } else {
+                        bundle.join(s)
+                    }
                 });
                 if let Some(src) = source {
                     let keep = match rootfs {
@@ -651,12 +693,25 @@ mod tests {
     fn minimal_spec() -> Spec {
         SpecBuilder::default()
             .version("1.0.2")
-            .root(RootBuilder::default().path("rootfs").readonly(false).build().unwrap())
+            .root(
+                RootBuilder::default()
+                    .path("rootfs")
+                    .readonly(false)
+                    .build()
+                    .unwrap(),
+            )
             .process(
                 ProcessBuilder::default()
                     .cwd("/app")
-                    .args(vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()])
-                    .env(vec!["PATH=/usr/bin:/bin".to_string(), "FOO=bar".to_string()])
+                    .args(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "echo hello".to_string(),
+                    ])
+                    .env(vec![
+                        "PATH=/usr/bin:/bin".to_string(),
+                        "FOO=bar".to_string(),
+                    ])
                     .build()
                     .unwrap(),
             )
@@ -671,7 +726,13 @@ mod tests {
         }
         SpecBuilder::default()
             .version("1.0.2")
-            .root(RootBuilder::default().path("rootfs").readonly(false).build().unwrap())
+            .root(
+                RootBuilder::default()
+                    .path("rootfs")
+                    .readonly(false)
+                    .build()
+                    .unwrap(),
+            )
             .annotations(annotations)
             .build()
             .unwrap()
@@ -684,7 +745,10 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = spec_with_annotations(&[
-            ("io.sandlock.network.allow", "api.openai.com:443; github.com:22,443"),
+            (
+                "io.sandlock.network.allow",
+                "api.openai.com:443; github.com:22,443",
+            ),
             ("io.sandlock.network.deny", "10.0.0.0/8"),
             ("io.sandlock.network.allow_bind", "8080,9000-9005"),
             ("io.sandlock.network.deny_bind", "22"),
@@ -693,7 +757,10 @@ mod tests {
         let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
 
         // `;` separates rules; `,` stays inside a single rule.
-        assert_eq!(policy.net_allow, vec!["api.openai.com:443", "github.com:22,443"]);
+        assert_eq!(
+            policy.net_allow,
+            vec!["api.openai.com:443", "github.com:22,443"]
+        );
         assert_eq!(policy.net_deny, vec!["10.0.0.0/8"]);
         assert_eq!(policy.net_allow_bind, vec!["8080,9000-9005"]);
         assert_eq!(policy.net_deny_bind, vec!["22"]);
@@ -713,23 +780,35 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = spec_with_annotations(&[
-            ("io.sandlock.http.allow", "GET api.internal/v1/*; POST api.internal/submit"),
+            (
+                "io.sandlock.http.allow",
+                "GET api.internal/v1/*; POST api.internal/submit",
+            ),
             ("io.sandlock.http.deny", "* */admin/*"),
             ("io.sandlock.http.ports", "80;8080"),
             ("io.sandlock.config.http_ca", "ca.pem"),
             ("io.sandlock.config.http_key", "/abs/key.pem"),
-            ("io.sandlock.config.http_inject_ca", "/etc/ssl/certs/ca-certificates.crt"),
+            (
+                "io.sandlock.config.http_inject_ca",
+                "/etc/ssl/certs/ca-certificates.crt",
+            ),
         ]);
         let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
 
-        assert_eq!(policy.http_allow, vec!["GET api.internal/v1/*", "POST api.internal/submit"]);
+        assert_eq!(
+            policy.http_allow,
+            vec!["GET api.internal/v1/*", "POST api.internal/submit"]
+        );
         assert_eq!(policy.http_deny, vec!["* */admin/*"]);
         assert_eq!(policy.http_ports, vec![80, 8080]);
         // Relative host path resolves against the bundle; absolute stays as-is.
         assert_eq!(policy.http_ca, Some(bundle.join("ca.pem")));
         assert_eq!(policy.http_key, Some(PathBuf::from("/abs/key.pem")));
         // Inject targets are sandbox-virtual, passed through unchanged.
-        assert_eq!(policy.http_inject_ca, vec![PathBuf::from("/etc/ssl/certs/ca-certificates.crt")]);
+        assert_eq!(
+            policy.http_inject_ca,
+            vec![PathBuf::from("/etc/ssl/certs/ca-certificates.crt")]
+        );
     }
 
     #[test]
@@ -939,7 +1018,13 @@ mod tests {
 
         let spec = SpecBuilder::default()
             .version("1.0.2")
-            .root(RootBuilder::default().path("rootfs").readonly(true).build().unwrap())
+            .root(
+                RootBuilder::default()
+                    .path("rootfs")
+                    .readonly(true)
+                    .build()
+                    .unwrap(),
+            )
             .process(
                 ProcessBuilder::default()
                     .args(vec!["sh".to_string()])
@@ -993,7 +1078,10 @@ mod tests {
             .fs_mount
             .iter()
             .any(|(d, h)| d == Path::new("/tmp") && h.ends_with("ctr1/tmpfs/tmp")));
-        assert!(policy.scratch_dirs.iter().any(|d| d.ends_with("ctr1/tmpfs/tmp")));
+        assert!(policy
+            .scratch_dirs
+            .iter()
+            .any(|d| d.ends_with("ctr1/tmpfs/tmp")));
         assert!(policy.fs_write.contains(&PathBuf::from("/tmp")));
 
         // /proc mounts the host procfs so the sandbox gets a full /proc; the
@@ -1090,9 +1178,21 @@ mod tests {
         let spec: Spec = serde_json::from_value(json).unwrap();
         let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
         // process.user flows into run_user; the userns skip decision is core's.
-        assert_eq!(policy.run_user, Some(RunAs { uid: 1000, gid: 2000 }));
+        assert_eq!(
+            policy.run_user,
+            Some(RunAs {
+                uid: 1000,
+                gid: 2000
+            })
+        );
 
         let sandbox = policy.to_sandbox().unwrap();
-        assert_eq!(sandbox.user, Some(RunAs { uid: 1000, gid: 2000 }));
+        assert_eq!(
+            sandbox.user,
+            Some(RunAs {
+                uid: 1000,
+                gid: 2000
+            })
+        );
     }
 }

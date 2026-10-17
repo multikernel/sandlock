@@ -1,4 +1,4 @@
-use sandlock_core::{Sandbox};
+use sandlock_core::Sandbox;
 use std::net::TcpListener;
 use std::path::PathBuf;
 
@@ -8,8 +8,13 @@ fn temp_file(name: &str) -> PathBuf {
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
-        .fs_read("/etc").fs_read("/proc").fs_read("/dev")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
         .fs_write("/tmp")
 }
 
@@ -33,24 +38,31 @@ async fn test_udp_rule_scopes_destination_by_host() {
     // Two sendto calls on the same socket: one to the allowed host, one
     // to a different host on the same port. The on-behalf handler must
     // accept the first and deny the second with ECONNREFUSED (errno 111).
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "try:\n",
-        "  s.sendto(b'x', ('127.0.0.1', 53))\n",
-        "  open('{ok}', 'w').write('ALLOWED')\n",
-        "except OSError as e:\n",
-        "  open('{ok}', 'w').write(f'ERR:{{e.errno}}')\n",
-        "try:\n",
-        "  s.sendto(b'x', ('1.1.1.1', 53))\n",
-        "  open('{deny}', 'w').write('ALLOWED')\n",
-        "except OSError as e:\n",
-        "  open('{deny}', 'w').write(f'ERR:{{e.errno}}')\n",
-        "s.close()\n",
-    ), ok = out_allowed.display(), deny = out_blocked.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "try:\n",
+            "  s.sendto(b'x', ('127.0.0.1', 53))\n",
+            "  open('{ok}', 'w').write('ALLOWED')\n",
+            "except OSError as e:\n",
+            "  open('{ok}', 'w').write(f'ERR:{{e.errno}}')\n",
+            "try:\n",
+            "  s.sendto(b'x', ('1.1.1.1', 53))\n",
+            "  open('{deny}', 'w').write('ALLOWED')\n",
+            "except OSError as e:\n",
+            "  open('{deny}', 'w').write(f'ERR:{{e.errno}}')\n",
+            "s.close()\n",
+        ),
+        ok = out_allowed.display(),
+        deny = out_blocked.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let allowed = std::fs::read_to_string(&out_allowed).unwrap_or_default();
@@ -59,7 +71,10 @@ async fn test_udp_rule_scopes_destination_by_host() {
     let _ = std::fs::remove_file(&out_blocked);
 
     assert_eq!(allowed, "ALLOWED", "sendto to allowed host should succeed");
-    assert_eq!(blocked, "ERR:111", "sendto to disallowed host should ECONNREFUSED");
+    assert_eq!(
+        blocked, "ERR:111",
+        "sendto to disallowed host should ECONNREFUSED"
+    );
 }
 
 /// Regression for the uncapped-sockaddr-length DoS: a child can pass
@@ -101,18 +116,27 @@ async fn test_sendto_huge_addrlen_rejected_with_einval() {
         "s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     // The run completing at all is the core assertion: an OOM-aborted supervisor
     // would kill the child instead of letting it finish.
-    assert!(result.success(), "supervisor should survive a 4 GiB addr_len; exit={:?}", result.code());
+    assert!(
+        result.success(),
+        "supervisor should survive a 4 GiB addr_len; exit={:?}",
+        result.code()
+    );
 
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     // EINVAL (22) for both: the oversized addr_len is rejected before the
     // destination gate, so allowed vs blocked is never reached.
-    assert_eq!(got, "ERR:22|ERR:22",
-        "a bogus 4 GiB addr_len must be rejected with EINVAL, matching the kernel");
+    assert_eq!(
+        got, "ERR:22|ERR:22",
+        "a bogus 4 GiB addr_len must be rejected with EINVAL, matching the kernel"
+    );
 }
 
 /// `udp://*:*` is the "any UDP destination" gate — it should not regress
@@ -124,24 +148,31 @@ async fn test_udp_wildcard_allows_any_destination() {
 
     let policy = base_policy().net_allow("udp://*:*").build().unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "try:\n",
-        "  s.sendto(b'x', ('127.0.0.1', 53))\n",
-        "  open('{a}', 'w').write('ALLOWED')\n",
-        "except OSError as e:\n",
-        "  open('{a}', 'w').write(f'ERR:{{e.errno}}')\n",
-        "try:\n",
-        "  s.sendto(b'x', ('1.1.1.1', 53))\n",
-        "  open('{b}', 'w').write('ALLOWED')\n",
-        "except OSError as e:\n",
-        "  open('{b}', 'w').write(f'ERR:{{e.errno}}')\n",
-        "s.close()\n",
-    ), a = out_a.display(), b = out_b.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "try:\n",
+            "  s.sendto(b'x', ('127.0.0.1', 53))\n",
+            "  open('{a}', 'w').write('ALLOWED')\n",
+            "except OSError as e:\n",
+            "  open('{a}', 'w').write(f'ERR:{{e.errno}}')\n",
+            "try:\n",
+            "  s.sendto(b'x', ('1.1.1.1', 53))\n",
+            "  open('{b}', 'w').write('ALLOWED')\n",
+            "except OSError as e:\n",
+            "  open('{b}', 'w').write(f'ERR:{{e.errno}}')\n",
+            "s.close()\n",
+        ),
+        a = out_a.display(),
+        b = out_b.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let a = std::fs::read_to_string(&out_a).unwrap_or_default();
@@ -165,27 +196,34 @@ async fn test_udp_rule_does_not_authorize_tcp() {
 
     let policy = base_policy().net_allow("udp://1.1.1.1:53").build().unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(2)\n",
-        "try:\n",
-        "  s.connect(('1.1.1.1', 53))\n",
-        "  open('{out}', 'w').write('ALLOWED')\n",
-        "except (OSError, socket.timeout) as e:\n",
-        "  errno = getattr(e, 'errno', 0)\n",
-        "  open('{out}', 'w').write(f'BLOCKED:{{errno}}')\n",
-        "s.close()\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(2)\n",
+            "try:\n",
+            "  s.connect(('1.1.1.1', 53))\n",
+            "  open('{out}', 'w').write('ALLOWED')\n",
+            "except (OSError, socket.timeout) as e:\n",
+            "  errno = getattr(e, 'errno', 0)\n",
+            "  open('{out}', 'w').write(f'BLOCKED:{{errno}}')\n",
+            "s.close()\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert!(
         content.starts_with("BLOCKED:"),
-        "TCP connect must not piggyback on a UDP rule, got: {}", content
+        "TCP connect must not piggyback on a UDP rule, got: {}",
+        content
     );
 }
 
@@ -262,8 +300,11 @@ async fn test_sendmmsg_partial_failure_on_blocked_destination() {
         "s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -274,7 +315,8 @@ async fn test_sendmmsg_partial_failure_on_blocked_destination() {
     // it as (sendmmsg sets errno only on full failure ret<0).
     assert!(
         content.starts_with("ret=1 ") && content.contains("msg0_len=1"),
-        "expected partial success ret=1 msg0_len=1, got: {}", content
+        "expected partial success ret=1 msg0_len=1, got: {}",
+        content
     );
 }
 
@@ -337,7 +379,6 @@ async fn test_connected_sendmmsg_delivers_on_behalf() {
 
     let result = policy
         .clone()
-        
         .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
@@ -416,8 +457,11 @@ async fn test_sendmmsg_single_blocked_returns_econnrefused() {
         "s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -425,7 +469,8 @@ async fn test_sendmmsg_single_blocked_returns_econnrefused() {
 
     assert_eq!(
         content, "ret=-1 errno=111",
-        "blocked sendmmsg should return -1 with ECONNREFUSED, got: {}", content
+        "blocked sendmmsg should return -1 with ECONNREFUSED, got: {}",
+        content
     );
 }
 
@@ -435,27 +480,37 @@ async fn test_net_allow_blocks_disallowed_host() {
     let out = temp_file("block");
 
     let policy = base_policy()
-        .net_allow("127.0.0.1:80")  // only localhost:80
+        .net_allow("127.0.0.1:80") // only localhost:80
         .build()
         .unwrap();
 
     // Try to connect to 1.1.1.1:80 — should be blocked
-    let script = format!(concat!(
-        "import socket\n",
-        "try:\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "  s.settimeout(2)\n",
-        "  s.connect(('1.1.1.1', 80))\n",
-        "  s.close()\n",
-        "  open('{out}', 'w').write('ALLOWED')\n",
-        "except (OSError, socket.timeout):\n",
-        "  open('{out}', 'w').write('BLOCKED')\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "try:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "  s.settimeout(2)\n",
+            "  s.connect(('1.1.1.1', 80))\n",
+            "  s.close()\n",
+            "  open('{out}', 'w').write('ALLOWED')\n",
+            "except (OSError, socket.timeout):\n",
+            "  open('{out}', 'w').write('BLOCKED')\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert_eq!(content, "BLOCKED", "connection to 1.1.1.1 should be blocked");
+    assert_eq!(
+        content, "BLOCKED",
+        "connection to 1.1.1.1 should be blocked"
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -474,27 +529,35 @@ async fn test_net_allow_permits_listed_endpoint() {
         .unwrap();
 
     // Create a local TCP server and connect to it — should be allowed
-    let script = format!(concat!(
-        "import socket, threading\n",
-        "srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "srv.bind(('127.0.0.1', {port}))\n",
-        "srv.listen(1)\n",
-        "port = srv.getsockname()[1]\n",
-        "def accept():\n",
-        "  conn, _ = srv.accept()\n",
-        "  conn.close()\n",
-        "t = threading.Thread(target=accept, daemon=True)\n",
-        "t.start()\n",
-        "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "c.connect(('127.0.0.1', port))\n",
-        "c.close()\n",
-        "t.join(timeout=2)\n",
-        "srv.close()\n",
-        "open('{out}', 'w').write('CONNECTED')\n",
-    ), out = out.display(), port = test_port);
+    let script = format!(
+        concat!(
+            "import socket, threading\n",
+            "srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "srv.bind(('127.0.0.1', {port}))\n",
+            "srv.listen(1)\n",
+            "port = srv.getsockname()[1]\n",
+            "def accept():\n",
+            "  conn, _ = srv.accept()\n",
+            "  conn.close()\n",
+            "t = threading.Thread(target=accept, daemon=True)\n",
+            "t.start()\n",
+            "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "c.connect(('127.0.0.1', port))\n",
+            "c.close()\n",
+            "t.join(timeout=2)\n",
+            "srv.close()\n",
+            "open('{out}', 'w').write('CONNECTED')\n",
+        ),
+        out = out.display(),
+        port = test_port
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "CONNECTED");
@@ -512,25 +575,36 @@ async fn test_net_allow_any_ip_port() {
 
     let policy = base_policy().net_allow(":1").build().unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(1)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', 1))\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "except ConnectionRefusedError:\n",
-        "  open('{out}', 'w').write('REFUSED')\n",
-        "except PermissionError:\n",
-        "  open('{out}', 'w').write('BLOCKED')\n",
-        "finally:\n",
-        "  s.close()\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(1)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', 1))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except ConnectionRefusedError:\n",
+            "  open('{out}', 'w').write('REFUSED')\n",
+            "except PermissionError:\n",
+            "  open('{out}', 'w').write('BLOCKED')\n",
+            "finally:\n",
+            "  s.close()\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert_eq!(content, "REFUSED", "connect to permitted port should reach kernel; got: {}", content);
+    assert_eq!(
+        content, "REFUSED",
+        "connect to permitted port should reach kernel; got: {}",
+        content
+    );
 
     let _ = std::fs::remove_file(&out);
 }
@@ -554,35 +628,49 @@ async fn test_net_allow_endpoint_rejects_other_ports() {
         l_clone.set_nonblocking(true).unwrap();
         while !stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
             match l_clone.accept() {
-                Ok((mut conn, _)) => { let _ = std::io::Write::write_all(&mut conn, b"hi"); }
+                Ok((mut conn, _)) => {
+                    let _ = std::io::Write::write_all(&mut conn, b"hi");
+                }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
         }
     });
 
-    let allowed_port: u16 = if blocked_port == u16::MAX { 1024 } else { blocked_port + 1 };
+    let allowed_port: u16 = if blocked_port == u16::MAX {
+        1024
+    } else {
+        blocked_port + 1
+    };
 
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{}", allowed_port))
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(2)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', {port}))\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "except ConnectionRefusedError:\n",
-        "  open('{out}', 'w').write('REFUSED')\n",
-        "except (OSError, socket.timeout) as e:\n",
-        "  open('{out}', 'w').write('OTHER:' + e.__class__.__name__)\n",
-        "finally:\n",
-        "  s.close()\n",
-    ), out = out.display(), port = blocked_port);
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(2)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except ConnectionRefusedError:\n",
+            "  open('{out}', 'w').write('REFUSED')\n",
+            "except (OSError, socket.timeout) as e:\n",
+            "  open('{out}', 'w').write('OTHER:' + e.__class__.__name__)\n",
+            "finally:\n",
+            "  s.close()\n",
+        ),
+        out = out.display(),
+        port = blocked_port
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = acceptor.join();
 
@@ -620,21 +708,29 @@ async fn test_grandchild_network_connect() {
 
     // The sandboxed process spawns a subprocess (grandchild) that does the
     // actual TCP connect. This exercises dup_fd_from_pid(notif.pid, ...).
-    let script = format!(concat!(
-        "import subprocess, sys\n",
-        "child = subprocess.run([sys.executable, '-c', ",
-        "\"import socket\\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\\n",
-        "s.settimeout(5)\\n",
-        "s.connect(('127.0.0.1', {port}))\\n",
-        "data = s.recv(16)\\n",
-        "s.close()\\n",
-        "open('{out}', 'w').write(data.decode())\\n",
-        "\"])\n",
-        "sys.exit(child.returncode)\n",
-    ), out = out.display(), port = port);
+    let script = format!(
+        concat!(
+            "import subprocess, sys\n",
+            "child = subprocess.run([sys.executable, '-c', ",
+            "\"import socket\\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\\n",
+            "s.settimeout(5)\\n",
+            "s.connect(('127.0.0.1', {port}))\\n",
+            "data = s.recv(16)\\n",
+            "s.close()\\n",
+            "open('{out}', 'w').write(data.decode())\\n",
+            "\"])\n",
+            "sys.exit(child.returncode)\n",
+        ),
+        out = out.display(),
+        port = port
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "hello", "grandchild should connect and read data");
@@ -661,17 +757,25 @@ async fn test_net_allow_wildcard_any_host_any_port() {
 
     let policy = base_policy().net_allow(":*").build().unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(5)\n",
-        "s.connect(('127.0.0.1', {port}))\n",
-        "data = s.recv(16)\n",
-        "s.close()\n",
-        "open('{out}', 'w').write(data.decode())\n",
-    ), out = out.display(), port = port);
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(5)\n",
+            "s.connect(('127.0.0.1', {port}))\n",
+            "data = s.recv(16)\n",
+            "s.close()\n",
+            "open('{out}', 'w').write(data.decode())\n",
+        ),
+        out = out.display(),
+        port = port
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "ok", "wildcard :* should permit arbitrary egress");
@@ -697,36 +801,51 @@ async fn test_net_allow_wildcard_host_only() {
 
     let policy = base_policy().net_allow("localhost:*").build().unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "results = []\n",
-        // localhost any port — should connect
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(5)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', {port}))\n",
-        "  results.append('local:ok')\n",
-        "  s.close()\n",
-        "except OSError as e:\n",
-        "  results.append(f'local:err{{e.errno}}')\n",
-        // non-localhost — should be blocked
-        "s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s2.settimeout(2)\n",
-        "try:\n",
-        "  s2.connect(('1.1.1.1', 80))\n",
-        "  results.append('remote:ALLOWED')\n",
-        "  s2.close()\n",
-        "except (OSError, socket.timeout):\n",
-        "  results.append('remote:blocked')\n",
-        "open('{out}', 'w').write(','.join(results))\n",
-    ), out = out.display(), port = port);
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "results = []\n",
+            // localhost any port — should connect
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(5)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  results.append('local:ok')\n",
+            "  s.close()\n",
+            "except OSError as e:\n",
+            "  results.append(f'local:err{{e.errno}}')\n",
+            // non-localhost — should be blocked
+            "s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s2.settimeout(2)\n",
+            "try:\n",
+            "  s2.connect(('1.1.1.1', 80))\n",
+            "  results.append('remote:ALLOWED')\n",
+            "  s2.close()\n",
+            "except (OSError, socket.timeout):\n",
+            "  results.append('remote:blocked')\n",
+            "open('{out}', 'w').write(','.join(results))\n",
+        ),
+        out = out.display(),
+        port = port
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(content.contains("local:ok"), "localhost should connect; got: {}", content);
-    assert!(content.contains("remote:blocked"),
-        "remote host must remain blocked under host:* wildcard; got: {}", content);
+    assert!(
+        content.contains("local:ok"),
+        "localhost should connect; got: {}",
+        content
+    );
+    assert!(
+        content.contains("remote:blocked"),
+        "remote host must remain blocked under host:* wildcard; got: {}",
+        content
+    );
 
     srv.join().unwrap();
     let _ = std::fs::remove_file(&out);
@@ -738,7 +857,11 @@ async fn test_net_allow_wildcard_host_only() {
 #[tokio::test]
 async fn test_net_deny_bind_blocks_tcp_only() {
     fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
     let denied = free_port();
     let mut allowed = free_port();
@@ -756,43 +879,60 @@ async fn test_net_deny_bind_blocks_tcp_only() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {denied}))\n",
-        "  res['tcp_denied'] = 'bound'\n",
-        "except PermissionError:\n",
-        "  res['tcp_denied'] = 'eacces'\n",
-        "s.close()\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {allowed}))\n",
-        "  res['tcp_allowed'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['tcp_allowed'] = 'err:%d' % e.errno\n",
-        "s.close()\n",
-        "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "try:\n",
-        "  u.bind(('127.0.0.1', {denied}))\n",
-        "  res['udp_denied'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['udp_denied'] = 'err:%d' % e.errno\n",
-        "u.close()\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), denied = denied, allowed = allowed, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {denied}))\n",
+            "  res['tcp_denied'] = 'bound'\n",
+            "except PermissionError:\n",
+            "  res['tcp_denied'] = 'eacces'\n",
+            "s.close()\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {allowed}))\n",
+            "  res['tcp_allowed'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['tcp_allowed'] = 'err:%d' % e.errno\n",
+            "s.close()\n",
+            "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "try:\n",
+            "  u.bind(('127.0.0.1', {denied}))\n",
+            "  res['udp_denied'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['udp_denied'] = 'err:%d' % e.errno\n",
+            "u.close()\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        denied = denied,
+        allowed = allowed,
+        out = out.display()
+    );
 
-    let result = policy.clone()
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(content.contains("\"tcp_denied\": \"eacces\""), "denied TCP bind must fail with EACCES; got: {content}");
-    assert!(content.contains("\"tcp_allowed\": \"ok\""), "non-denied TCP bind must succeed; got: {content}");
-    assert!(content.contains("\"udp_denied\": \"ok\""), "UDP on the denied port must be allowed (TCP-only); got: {content}");
+    assert!(
+        content.contains("\"tcp_denied\": \"eacces\""),
+        "denied TCP bind must fail with EACCES; got: {content}"
+    );
+    assert!(
+        content.contains("\"tcp_allowed\": \"ok\""),
+        "non-denied TCP bind must succeed; got: {content}"
+    );
+    assert!(
+        content.contains("\"udp_denied\": \"ok\""),
+        "UDP on the denied port must be allowed (TCP-only); got: {content}"
+    );
 }
 
 /// `--net-allow-bind '*'` leaves Landlock's BIND_TCP hook unhandled: any
@@ -803,25 +943,31 @@ async fn test_net_deny_bind_blocks_tcp_only() {
 async fn test_net_allow_bind_wildcard_permits_any_bind() {
     let out = temp_file("bindall");
 
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "for key, port in (('fixed', 18461), ('ephemeral', 0)):\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "  try:\n",
-        "    s.bind(('127.0.0.1', port))\n",
-        "    res[key] = 'ok'\n",
-        "  except OSError as e:\n",
-        "    res[key] = 'err:%d' % e.errno\n",
-        "  s.close()\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "for key, port in (('fixed', 18461), ('ephemeral', 0)):\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "  try:\n",
+            "    s.bind(('127.0.0.1', port))\n",
+            "    res[key] = 'ok'\n",
+            "  except OSError as e:\n",
+            "    res[key] = 'err:%d' % e.errno\n",
+            "  s.close()\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        out = out.display()
+    );
 
     // Control: no allow-bind list means default-deny for TCP bind.
     let policy = base_policy().build().unwrap();
-    let result = policy.clone()
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(
@@ -831,8 +977,11 @@ async fn test_net_allow_bind_wildcard_permits_any_bind() {
 
     // Wildcard: every bind succeeds.
     let policy = base_policy().net_allow_bind("*").build().unwrap();
-    let result = policy.clone()
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -865,32 +1014,38 @@ async fn test_net_allow_bind_wildcard_keeps_connect_enforcement() {
     let port = listener.local_addr().unwrap().port();
     let out = temp_file("bindall-connect");
 
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "b = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "b.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  b.bind(('127.0.0.1', 18517))\n",
-        "  res['bind'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['bind'] = 'err:%d' % e.errno\n",
-        "b.close()\n",
-        "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "c.settimeout(3)\n",
-        "try:\n",
-        "  c.connect(('127.0.0.1', {port}))\n",
-        "  res['connect'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['connect'] = 'err:%d' % e.errno\n",
-        "c.close()\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), port = port, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "b = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "b.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  b.bind(('127.0.0.1', 18517))\n",
+            "  res['bind'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['bind'] = 'err:%d' % e.errno\n",
+            "b.close()\n",
+            "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "c.settimeout(3)\n",
+            "try:\n",
+            "  c.connect(('127.0.0.1', {port}))\n",
+            "  res['connect'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['connect'] = 'err:%d' % e.errno\n",
+            "c.close()\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        port = port,
+        out = out.display()
+    );
 
     // 1. Wildcard bind, empty net_allow: Landlock CONNECT_TCP deny-all.
     let mut policy = base_policy().net_allow_bind("*").build().unwrap();
     let result = policy
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(
@@ -910,7 +1065,9 @@ async fn test_net_allow_bind_wildcard_keeps_connect_enforcement() {
         .build()
         .unwrap();
     let result = policy
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -951,20 +1108,26 @@ async fn test_empty_net_allow_denies_tcp_despite_fs_grants() {
     // call: an empty allowlist means "deny all outbound".
     let mut policy = base_policy().build().unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(3)\n",
-        "try:\n",
-        "  s.connect(('127.0.0.1', {port}))\n",
-        "  open('{out}', 'w').write('ALLOWED')\n",
-        "except OSError as e:\n",
-        "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
-        "s.close()\n",
-    ), port = port, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('ALLOWED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
+            "s.close()\n",
+        ),
+        port = port,
+        out = out.display()
+    );
 
     let result = policy
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let got = std::fs::read_to_string(&out).unwrap_or_default();
@@ -1014,20 +1177,26 @@ async fn test_connected_unix_sendmsg_passes_through_under_net_policy() {
     // shape of the report (a `--net-allow` rule plus fs grants).
     let mut policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
 
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
-        "s.connect('{sock}')\n",
-        "try:\n",
-        "  n = s.sendmsg([b'hello'])\n",
-        "  open('{out}', 'w').write('SENT:%d' % n)\n",
-        "except OSError as e:\n",
-        "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
-        "s.close()\n",
-    ), sock = sock_path.display(), out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "s.connect('{sock}')\n",
+            "try:\n",
+            "  n = s.sendmsg([b'hello'])\n",
+            "  open('{out}', 'w').write('SENT:%d' % n)\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
+            "s.close()\n",
+        ),
+        sock = sock_path.display(),
+        out = out.display()
+    );
 
     let result = policy
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let got = std::fs::read_to_string(&out).unwrap_or_default();
@@ -1066,7 +1235,10 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
     let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let received_w = received.clone();
     let accepter = std::thread::spawn(move || {
-        let (conn, _) = match listener.accept() { Ok(c) => c, Err(_) => return };
+        let (conn, _) = match listener.accept() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
         let cfd = conn.as_raw_fd();
         let mut databuf = [0u8; 8];
         let mut cmsgbuf = [0u8; 64];
@@ -1080,9 +1252,13 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
         msg.msg_control = cmsgbuf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = cmsgbuf.len() as _;
         let n = unsafe { libc::recvmsg(cfd, &mut msg, 0) };
-        if n < 0 { return; }
+        if n < 0 {
+            return;
+        }
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-        if cmsg.is_null() { return; }
+        if cmsg.is_null() {
+            return;
+        }
         let c = unsafe { &*cmsg };
         if c.cmsg_level == libc::SOL_SOCKET && c.cmsg_type == libc::SCM_RIGHTS {
             let data = unsafe { libc::CMSG_DATA(cmsg) } as *const RawFd;
@@ -1098,7 +1274,11 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
     let out = temp_file("scm-out");
     // fs_read("/tmp") lets the child open the payload O_RDONLY; net_allow forces
     // the on-behalf path where the SCM_RIGHTS translation matters.
-    let mut policy = base_policy().fs_read("/tmp").net_allow("127.0.0.1:80").build().unwrap();
+    let mut policy = base_policy()
+        .fs_read("/tmp")
+        .net_allow("127.0.0.1:80")
+        .build()
+        .unwrap();
 
     let script = format!(concat!(
         "import socket, array, os\n",
@@ -1114,7 +1294,9 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
     ), sock = sock_path.display(), payload = payload.display(), out = out.display());
 
     let result = policy
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let sent = std::fs::read_to_string(&out).unwrap_or_default();
@@ -1124,7 +1306,10 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&payload);
 
-    assert_eq!(sent, "SENT:1", "SCM_RIGHTS sendmsg under net_allow must succeed (got {sent:?})");
+    assert_eq!(
+        sent, "SENT:1",
+        "SCM_RIGHTS sendmsg under net_allow must succeed (got {sent:?})"
+    );
     assert_eq!(
         got_fd, "SCMOK",
         "receiver must read the passed fd's file — SCM_RIGHTS translated to the real open file (got {got_fd:?})"
@@ -1173,17 +1358,24 @@ async fn test_large_blocking_send_defers_and_delivers_under_net_policy() {
     // A SINGLE blocking send() of N bytes must return N — the kernel's contract
     // for a blocking stream socket. A regression that returned on the first
     // partial (one SO_SNDBUF worth) would write a short count here.
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
-        "s.connect('{sock}')\n",
-        "n = s.send(b'z' * {n})\n",   // one syscall; blocking → must return all N
-        "s.close()\n",
-        "open('{out}', 'w').write('SENT:%d' % n)\n",
-    ), sock = sock_path.display(), n = N, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "s.connect('{sock}')\n",
+            "n = s.send(b'z' * {n})\n", // one syscall; blocking → must return all N
+            "s.close()\n",
+            "open('{out}', 'w').write('SENT:%d' % n)\n",
+        ),
+        sock = sock_path.display(),
+        n = N,
+        out = out.display()
+    );
 
     let result = policy
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let sent = std::fs::read_to_string(&out).unwrap_or_default();
@@ -1196,7 +1388,10 @@ async fn test_large_blocking_send_defers_and_delivers_under_net_policy() {
         sent, format!("SENT:{N}"),
         "one blocking send() must return the full {N} bytes (deferred to completion, not truncated)"
     );
-    assert_eq!(got, N, "peer must receive all {N} bytes — no truncation on the deferred path");
+    assert_eq!(
+        got, N,
+        "peer must receive all {N} bytes — no truncation on the deferred path"
+    );
 }
 
 /// `sendmmsg` of one large message on a blocking connected stream socket, to a
@@ -1261,7 +1456,9 @@ async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
     ), sock = sock_path.display(), n = N, out = out.display());
 
     let result = policy
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -1271,10 +1468,14 @@ async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
     let _ = std::fs::remove_file(&sock_path);
 
     assert_eq!(
-        content, format!("ret=1 msg_len={N}"),
+        content,
+        format!("ret=1 msg_len={N}"),
         "blocking sendmmsg entry must complete off-loop: ret=1 with full msg_len (got {content:?})"
     );
-    assert_eq!(got, N, "peer must receive all {N} bytes of the deferred batch entry");
+    assert_eq!(
+        got, N,
+        "peer must receive all {N} bytes of the deferred batch entry"
+    );
 }
 
 /// Any network supervision (`--net-allow`, `--port-remap`, ...) moves
@@ -1285,7 +1486,11 @@ async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
 #[tokio::test]
 async fn test_net_allow_bind_enforced_on_behalf() {
     fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
     let allowed = free_port();
     let mut other = free_port();
@@ -1293,48 +1498,74 @@ async fn test_net_allow_bind_enforced_on_behalf() {
         other = free_port();
     }
 
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "def tcp(key, port):\n",
-        "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "  try:\n",
-        "    s.bind(('127.0.0.1', port)); res[key] = 'ok'\n",
-        "  except PermissionError:\n",
-        "    res[key] = 'eacces'\n",
-        "  except OSError as e:\n",
-        "    res[key] = 'err:%d' % e.errno\n",
-        "  s.close()\n",
-        "tcp('allowed', {allowed})\n",
-        "tcp('other', {other})\n",
-        "tcp('ephemeral', 0)\n",
-        "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
-        "try:\n",
-        "  u.bind(('127.0.0.1', {other})); res['udp'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['udp'] = 'err:%d' % e.errno\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), allowed = allowed, other = other, out = "{out}");
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "def tcp(key, port):\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "  try:\n",
+            "    s.bind(('127.0.0.1', port)); res[key] = 'ok'\n",
+            "  except PermissionError:\n",
+            "    res[key] = 'eacces'\n",
+            "  except OSError as e:\n",
+            "    res[key] = 'err:%d' % e.errno\n",
+            "  s.close()\n",
+            "tcp('allowed', {allowed})\n",
+            "tcp('other', {other})\n",
+            "tcp('ephemeral', 0)\n",
+            "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "try:\n",
+            "  u.bind(('127.0.0.1', {other})); res['udp'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['udp'] = 'err:%d' % e.errno\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        allowed = allowed,
+        other = other,
+        out = "{out}"
+    );
 
     let supervised = [
-        ("net_allow", base_policy().net_allow("udp://*").net_allow("127.0.0.1:1")),
+        (
+            "net_allow",
+            base_policy().net_allow("udp://*").net_allow("127.0.0.1:1"),
+        ),
         ("net_deny", base_policy().net_deny("10.0.0.0/8")),
-        ("port_remap", base_policy().net_allow("udp://*").port_remap(true)),
+        (
+            "port_remap",
+            base_policy().net_allow("udp://*").port_remap(true),
+        ),
     ];
     for (label, builder) in supervised {
         let out = temp_file(&format!("allowbind_{label}"));
         let policy = builder.net_allow_bind_port(allowed).build().unwrap();
         let script = script.replace("{out}", &out.display().to_string());
-        let result = policy.clone()
-            .run_interactive(&["python3", "-c", &script]).await.unwrap();
+        let result = policy
+            .clone()
+            .run_interactive(&["python3", "-c", &script])
+            .await
+            .unwrap();
         assert!(result.success(), "{label}: exit={:?}", result.code());
         let content = std::fs::read_to_string(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
-        assert!(content.contains("\"allowed\": \"ok\""), "{label}: listed port must bind; got: {content}");
-        assert!(content.contains("\"other\": \"eacces\""), "{label}: unlisted port must fail with EACCES; got: {content}");
-        assert!(content.contains("\"ephemeral\": \"eacces\""), "{label}: bind(0) must fail with EACCES; got: {content}");
-        assert!(content.contains("\"udp\": \"ok\""), "{label}: UDP bind must be unaffected; got: {content}");
+        assert!(
+            content.contains("\"allowed\": \"ok\""),
+            "{label}: listed port must bind; got: {content}"
+        );
+        assert!(
+            content.contains("\"other\": \"eacces\""),
+            "{label}: unlisted port must fail with EACCES; got: {content}"
+        );
+        assert!(
+            content.contains("\"ephemeral\": \"eacces\""),
+            "{label}: bind(0) must fail with EACCES; got: {content}"
+        );
+        assert!(
+            content.contains("\"udp\": \"ok\""),
+            "{label}: UDP bind must be unaffected; got: {content}"
+        );
     }
 }
 
@@ -1342,24 +1573,38 @@ async fn test_net_allow_bind_enforced_on_behalf() {
 /// hold on the on-behalf path too, not only under Landlock.
 #[tokio::test]
 async fn test_default_bind_deny_enforced_on_behalf() {
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let out = temp_file("defaultbind");
     let policy = base_policy().port_remap(true).build().unwrap();
-    let script = format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {port})); r = 'ok'\n",
-        "except PermissionError:\n",
-        "  r = 'eacces'\n",
-        "open('{out}', 'w').write(r)\n",
-    ), port = port, out = out.display());
-    let result = policy.clone()
-        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {port})); r = 'ok'\n",
+            "except PermissionError:\n",
+            "  r = 'eacces'\n",
+            "open('{out}', 'w').write(r)\n",
+        ),
+        port = port,
+        out = out.display()
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert_eq!(content, "eacces", "TCP bind with no allowlist must fail under port_remap");
+    assert_eq!(
+        content, "eacces",
+        "TCP bind with no allowlist must fail under port_remap"
+    );
 }
 
 // ============================================================
@@ -1367,21 +1612,30 @@ async fn test_default_bind_deny_enforced_on_behalf() {
 // ============================================================
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn connect_script(port: u16, host: &str, out: &std::path::Path) -> String {
-    format!(concat!(
-        "import socket\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.settimeout(3)\n",
-        "try:\n",
-        "  s.connect(('{host}', {port}))\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "except OSError as e:\n",
-        "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
-        "s.close()\n",
-    ), host = host, port = port, out = out.display())
+    format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('{host}', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR:%d' % e.errno)\n",
+            "s.close()\n",
+        ),
+        host = host,
+        port = port,
+        out = out.display()
+    )
 }
 
 /// Finite combined allow + deny where the denied overlap loses: the allowlist
@@ -1399,14 +1653,19 @@ async fn test_combined_finite_overlap_denied() {
         .build()
         .unwrap();
 
-    let result = policy.clone()
+    let result = policy
+        .clone()
         .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.1", &out)])
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     drop(listener);
-    assert_eq!(got, "ERR:111", "denied overlap must be refused (ECONNREFUSED); got {got:?}");
+    assert_eq!(
+        got, "ERR:111",
+        "denied overlap must be refused (ECONNREFUSED); got {got:?}"
+    );
 }
 
 /// Finite combined allow + deny where the endpoint is outside the denylist:
@@ -1423,14 +1682,19 @@ async fn test_combined_finite_non_overlap_connects() {
         .build()
         .unwrap();
 
-    let result = policy.clone()
+    let result = policy
+        .clone()
         .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.1", &out)])
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     drop(listener);
-    assert_eq!(got, "CONNECTED", "non-overlapping allow must connect; got {got:?}");
+    assert_eq!(
+        got, "CONNECTED",
+        "non-overlapping allow must connect; got {got:?}"
+    );
 }
 
 /// Wildcard allow with a deny carve-out: `:port` form allows any IP on the
@@ -1462,14 +1726,24 @@ async fn test_combined_wildcard_allow_with_deny_carve_out() {
         "open('{out}', 'w').write('a=' + probe('127.0.0.1', {p1}) + ' b=' + probe('127.0.0.2', {p2}))\n",
     ), out = out.display(), p1 = p1, p2 = p2);
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     drop(l1);
     drop(l2);
-    assert!(got.contains("a=OK"), "wildcard allow must connect outside the carve-out; got {got:?}");
-    assert!(got.contains("b=ERR111"), "deny carve-out must refuse; got {got:?}");
+    assert!(
+        got.contains("a=OK"),
+        "wildcard allow must connect outside the carve-out; got {got:?}"
+    );
+    assert!(
+        got.contains("b=ERR111"),
+        "deny carve-out must refuse; got {got:?}"
+    );
 }
 
 /// Unrestricted allow (`net_allow("*")` resolves per-protocol to
@@ -1501,14 +1775,24 @@ async fn test_combined_unrestricted_allow_with_deny_carve_out() {
         "open('{out}', 'w').write('a=' + probe('127.0.0.1', {p1}) + ' b=' + probe('127.0.0.2', {p2}))\n",
     ), out = out.display(), p1 = p1, p2 = p2);
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     drop(l1);
     drop(l2);
-    assert!(got.contains("a=OK"), "unrestricted allow must connect outside the carve-out; got {got:?}");
-    assert!(got.contains("b=ERR111"), "deny carve-out must refuse even under unrestricted allow; got {got:?}");
+    assert!(
+        got.contains("a=OK"),
+        "unrestricted allow must connect outside the carve-out; got {got:?}"
+    );
+    assert!(
+        got.contains("b=ERR111"),
+        "deny carve-out must refuse even under unrestricted allow; got {got:?}"
+    );
 }
 
 /// An allowed hostname that resolves into a denied CIDR is refused. Uses
@@ -1519,10 +1803,9 @@ async fn test_combined_unrestricted_allow_with_deny_carve_out() {
 async fn test_combined_hostname_resolving_into_denied_cidr_refused() {
     // Guard against a host where `localhost` does not resolve to 127.0.0.1:
     // without that resolution the test would pass vacuously.
-    let resolved: Vec<std::net::IpAddr> =
-        std::net::ToSocketAddrs::to_socket_addrs("localhost:0")
-            .map(|it| it.map(|sa| sa.ip()).collect())
-            .unwrap_or_default();
+    let resolved: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs("localhost:0")
+        .map(|it| it.map(|sa| sa.ip()).collect())
+        .unwrap_or_default();
     if !resolved.contains(&"127.0.0.1".parse().unwrap()) {
         eprintln!("SKIP test_combined_hostname_resolving_into_denied_cidr_refused: localhost does not resolve to 127.0.0.1 (got {resolved:?})");
         return;
@@ -1537,14 +1820,19 @@ async fn test_combined_hostname_resolving_into_denied_cidr_refused() {
         .build()
         .unwrap();
 
-    let result = policy.clone()
+    let result = policy
+        .clone()
         .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.1", &out)])
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     drop(listener);
-    assert_eq!(got, "ERR:111", "hostname allow resolving into a denied CIDR must be refused; got {got:?}");
+    assert_eq!(
+        got, "ERR:111",
+        "hostname allow resolving into a denied CIDR must be refused; got {got:?}"
+    );
 }
 
 /// Deny-only plus HTTP reachability must retain deny-only network semantics:
@@ -1563,16 +1851,24 @@ async fn test_deny_only_with_http_allow_stays_deny_only() {
         .http_allow("GET 127.0.0.1/*")
         .build()
         .unwrap();
-    assert!(policy.net_allow.is_empty(), "HTTP reachability must stay out of net_allow");
+    assert!(
+        policy.net_allow.is_empty(),
+        "HTTP reachability must stay out of net_allow"
+    );
 
-    let result = policy.clone()
+    let result = policy
+        .clone()
         .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.2", &out)])
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     drop(listener);
-    assert_eq!(got, "CONNECTED", "deny-only + HTTP must still allow non-denied egress; got {got:?}");
+    assert_eq!(
+        got, "CONNECTED",
+        "deny-only + HTTP must still allow non-denied egress; got {got:?}"
+    );
 }
 
 fn bind_probe_script(out: &std::path::Path, ports: &[u16]) -> String {
@@ -1580,12 +1876,16 @@ fn bind_probe_script(out: &std::path::Path, ports: &[u16]) -> String {
         "try:\n  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n  s.bind(('127.0.0.1', {p}))\n  res[{p}] = 'ok'\n  s.close()\nexcept OSError as e:\n  res[{p}] = 'err:%d' % e.errno\n",
         p = p,
     )).collect();
-    format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "{cases}",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), cases = cases.join(""), out = out.display())
+    format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "{cases}",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        cases = cases.join(""),
+        out = out.display()
+    )
 }
 
 /// Finite allow-bind + deny-bind: the denied port loses while a merely
@@ -1605,14 +1905,26 @@ async fn test_combined_bind_deny_wins() {
         .build()
         .unwrap();
 
-    let result = policy.clone()
-        .run_interactive(&["python3", "-c", &bind_probe_script(&out, &[p_allowed, p_denied])])
-        .await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&[
+            "python3",
+            "-c",
+            &bind_probe_script(&out, &[p_allowed, p_denied]),
+        ])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(got.contains(&format!("\"{p_allowed}\": \"ok\"")), "allowed bind must succeed; got {got:?}");
-    assert!(got.contains(&format!("\"{p_denied}\": \"err:13\"")), "denied bind must fail with EACCES; got {got:?}");
+    assert!(
+        got.contains(&format!("\"{p_allowed}\": \"ok\"")),
+        "allowed bind must succeed; got {got:?}"
+    );
+    assert!(
+        got.contains(&format!("\"{p_denied}\": \"err:13\"")),
+        "denied bind must fail with EACCES; got {got:?}"
+    );
 }
 
 /// `allow_bind("*")` with a deny carve-out: an unlisted fixed port binds
@@ -1629,34 +1941,49 @@ async fn test_bind_wildcard_with_deny_carve_out() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {denied}))\n",
-        "  res['denied'] = 'bound'\n",
-        "except PermissionError:\n",
-        "  res['denied'] = 'eacces'\n",
-        "s.close()\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {other}))\n",
-        "  res['other'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['other'] = 'err:%d' % e.errno\n",
-        "s.close()\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), denied = p_denied, other = p_other, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {denied}))\n",
+            "  res['denied'] = 'bound'\n",
+            "except PermissionError:\n",
+            "  res['denied'] = 'eacces'\n",
+            "s.close()\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {other}))\n",
+            "  res['other'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['other'] = 'err:%d' % e.errno\n",
+            "s.close()\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        denied = p_denied,
+        other = p_other,
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(got.contains("\"denied\": \"eacces\""), "denied carve-out must fail with EACCES; got {got:?}");
-    assert!(got.contains("\"other\": \"ok\""), "non-denied bind under wildcard must succeed; got {got:?}");
+    assert!(
+        got.contains("\"denied\": \"eacces\""),
+        "denied carve-out must fail with EACCES; got {got:?}"
+    );
+    assert!(
+        got.contains("\"other\": \"ok\""),
+        "non-denied bind under wildcard must succeed; got {got:?}"
+    );
 }
 
 /// Standalone `allow_bind(0)`: an ephemeral `bind(0)` succeeds while an
@@ -1668,33 +1995,47 @@ async fn test_allow_bind_zero_ephemeral_only() {
 
     let policy = base_policy().net_allow_bind_port(0).build().unwrap();
 
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', 0))\n",
-        "  res['ephemeral'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['ephemeral'] = 'err:%d' % e.errno\n",
-        "s.close()\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {fixed}))\n",
-        "  res['fixed'] = 'bound'\n",
-        "except OSError as e:\n",
-        "  res['fixed'] = 'err:%d' % e.errno\n",
-        "s.close()\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), fixed = p_fixed, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', 0))\n",
+            "  res['ephemeral'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['ephemeral'] = 'err:%d' % e.errno\n",
+            "s.close()\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {fixed}))\n",
+            "  res['fixed'] = 'bound'\n",
+            "except OSError as e:\n",
+            "  res['fixed'] = 'err:%d' % e.errno\n",
+            "s.close()\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        fixed = p_fixed,
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(got.contains("\"ephemeral\": \"ok\""), "bind(0) must succeed; got {got:?}");
-    assert!(got.contains(&format!("\"fixed\": \"err:13\"")), "explicit nonzero bind must be denied (EACCES); got {got:?}");
+    assert!(
+        got.contains("\"ephemeral\": \"ok\""),
+        "bind(0) must succeed; got {got:?}"
+    );
+    assert!(
+        got.contains(&format!("\"fixed\": \"err:13\"")),
+        "explicit nonzero bind must be denied (EACCES); got {got:?}"
+    );
 }
 
 /// Combined `allow_bind(0)` + deny-bind: ephemeral binds succeed, the denied
@@ -1719,40 +2060,58 @@ async fn test_combined_bind_zero_with_deny() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import socket, json\n",
-        "res = {{}}\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', 0))\n",
-        "  res['ephemeral'] = 'ok'\n",
-        "except OSError as e:\n",
-        "  res['ephemeral'] = 'err:%d' % e.errno\n",
-        "s.close()\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {denied}))\n",
-        "  res['denied'] = 'bound'\n",
-        "except OSError as e:\n",
-        "  res['denied'] = 'err:%d' % e.errno\n",
-        "s.close()\n",
-        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
-        "try:\n",
-        "  s.bind(('127.0.0.1', {other}))\n",
-        "  res['other'] = 'bound'\n",
-        "except OSError as e:\n",
-        "  res['other'] = 'err:%d' % e.errno\n",
-        "s.close()\n",
-        "open('{out}', 'w').write(json.dumps(res))\n",
-    ), denied = p_denied, other = p_other, out = out.display());
+    let script = format!(
+        concat!(
+            "import socket, json\n",
+            "res = {{}}\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', 0))\n",
+            "  res['ephemeral'] = 'ok'\n",
+            "except OSError as e:\n",
+            "  res['ephemeral'] = 'err:%d' % e.errno\n",
+            "s.close()\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {denied}))\n",
+            "  res['denied'] = 'bound'\n",
+            "except OSError as e:\n",
+            "  res['denied'] = 'err:%d' % e.errno\n",
+            "s.close()\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "try:\n",
+            "  s.bind(('127.0.0.1', {other}))\n",
+            "  res['other'] = 'bound'\n",
+            "except OSError as e:\n",
+            "  res['other'] = 'err:%d' % e.errno\n",
+            "s.close()\n",
+            "open('{out}', 'w').write(json.dumps(res))\n",
+        ),
+        denied = p_denied,
+        other = p_other,
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let got = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    assert!(got.contains("\"ephemeral\": \"ok\""), "bind(0) must succeed; got {got:?}");
-    assert!(got.contains("\"denied\": \"err:13\""), "denied explicit bind must fail with EACCES; got {got:?}");
-    assert!(got.contains("\"other\": \"err:13\""), "unlisted explicit bind must stay denied; got {got:?}");
+    assert!(
+        got.contains("\"ephemeral\": \"ok\""),
+        "bind(0) must succeed; got {got:?}"
+    );
+    assert!(
+        got.contains("\"denied\": \"err:13\""),
+        "denied explicit bind must fail with EACCES; got {got:?}"
+    );
+    assert!(
+        got.contains("\"other\": \"err:13\""),
+        "unlisted explicit bind must stay denied; got {got:?}"
+    );
 }
