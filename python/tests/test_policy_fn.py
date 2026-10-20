@@ -60,7 +60,7 @@ class TestSyscallEvent:
         assert e.denied is False
 
     def test_frozen(self):
-        e = SyscallEvent(syscall="openat", category="file", pid=1)
+        e = SyscallEvent(syscall="openat", category="filesystem", pid=1)
         with pytest.raises(AttributeError):
             e.syscall = "other"
 
@@ -82,7 +82,7 @@ class TestSyscallEvent:
         assert not e.argv_contains("ruby")
 
     def test_argv_contains_none(self):
-        e = SyscallEvent(syscall="openat", category="file", pid=1)
+        e = SyscallEvent(syscall="openat", category="filesystem", pid=1)
         assert not e.argv_contains("anything")
 
 
@@ -306,7 +306,7 @@ class TestPolicyFnVerdict:
     def test_audit_allows(self):
         """Return 'audit' or -2 to allow but flag."""
         def on_event(event, ctx):
-            if event.category == "file":
+            if event.category == "filesystem":
                 return "audit"
             return 0
 
@@ -423,6 +423,47 @@ class TestPolicyFnPerPid:
 def test_invalid_verdict_timeout(verdict_timeout):
     with pytest.raises(ValueError, match="verdict_timeout"):
         PolicyFn(lambda event, ctx: 0, verdict_timeout=verdict_timeout)
+
+
+@pytest.mark.parametrize("events", [set(), {"bogus"}, {"network", "dns"}])
+def test_invalid_events(events):
+    with pytest.raises(ValueError, match="events"):
+        PolicyFn(lambda event, ctx: 0, events=events)
+
+
+def test_events_rejects_bare_string():
+    with pytest.raises(TypeError, match="events"):
+        PolicyFn(lambda event, ctx: 0, events="network")
+
+
+def test_events_default_to_all_categories():
+    assert PolicyFn(lambda event, ctx: 0).events == {"filesystem", "network", "process"}
+
+
+def test_network_events_only():
+    seen = []
+    deny_errors = []
+
+    def on_event(event, ctx):
+        seen.append((event.syscall, event.category))
+        try:
+            ctx.deny_path("/etc/hostname")
+        except RuntimeError as e:
+            deny_errors.append(e)
+        return 0
+
+    with _loopback_listener() as (host, port):
+        result = _policy(policy_fn=PolicyFn(on_event, events=["network"])).run(
+            ["python3", "-c",
+             "import socket, subprocess\n"
+             "open('/etc/hostname').read()\n"
+             "subprocess.run(['/bin/true'], check=True)\n"
+             f"socket.create_connection(('{host}', {port})).close()\n"]
+        )
+    assert result.success, result.error
+    assert any(name == "connect" for name, _ in seen), seen
+    assert all(category == "network" for _, category in seen), seen
+    assert len(deny_errors) == len(seen)
 
 
 def test_verdict_timeout_denies_late_allow():

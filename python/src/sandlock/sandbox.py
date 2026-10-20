@@ -187,6 +187,9 @@ class Image:
     config: ImageConfig = field(default_factory=ImageConfig)
 
 
+_EVENT_CATEGORIES = {"filesystem": 1 << 0, "network": 1 << 1, "process": 1 << 2}
+
+
 @dataclass(frozen=True)
 class PolicyFn:
     """A policy callback and the timeout for its held verdicts."""
@@ -198,11 +201,26 @@ class PolicyFn:
     """Call ``callback(event, ctx, approval)`` instead of using its return
     value. ``approval`` is an :class:`Approval` for held syscalls, which may be
     kept and answered later from any thread, and None otherwise."""
+    events: frozenset[str] = field(default=frozenset(_EVENT_CATEGORIES), kw_only=True)
+    """Event categories delivered to the callback: ``"filesystem"``,
+    ``"network"``, ``"process"``. Syscalls outside them are not intercepted for
+    the callback and stay governed by the static policy."""
 
     def __post_init__(self):
         if not callable(self.callback):
             raise TypeError("callback must be callable")
         self._verdict_timeout_ms()
+        if isinstance(self.events, str):
+            raise TypeError("events must be a collection of category names, not a string")
+        object.__setattr__(self, "events", frozenset(self.events))
+        if not self.events or not self.events <= _EVENT_CATEGORIES.keys():
+            raise ValueError(f"events must be a non-empty subset of {sorted(_EVENT_CATEGORIES)}")
+
+    def _events_mask(self) -> int:
+        mask = 0
+        for name in self.events:
+            mask |= _EVENT_CATEGORIES[name]
+        return mask
 
     def _verdict_timeout_ms(self) -> int:
         import math

@@ -2401,9 +2401,33 @@ fn with_c_event<R>(
     f(&c_event)
 }
 
+/// `events` bit for filesystem syscall events of a policy callback.
+pub const SANDLOCK_EVENT_FILESYSTEM: u32 = 1 << 0;
+/// `events` bit for network syscall events of a policy callback.
+pub const SANDLOCK_EVENT_NETWORK: u32 = 1 << 1;
+/// `events` bit for process syscall events of a policy callback.
+pub const SANDLOCK_EVENT_PROCESS: u32 = 1 << 2;
+/// Every policy callback event category.
+pub const SANDLOCK_EVENT_ALL: u32 =
+    SANDLOCK_EVENT_FILESYSTEM | SANDLOCK_EVENT_NETWORK | SANDLOCK_EVENT_PROCESS;
+
+fn event_categories(events: u32) -> Vec<sandlock_core::policy_fn::SyscallCategory> {
+    use sandlock_core::policy_fn::SyscallCategory;
+    [
+        (SANDLOCK_EVENT_FILESYSTEM, SyscallCategory::Filesystem),
+        (SANDLOCK_EVENT_NETWORK, SyscallCategory::Network),
+        (SANDLOCK_EVENT_PROCESS, SyscallCategory::Process),
+    ]
+    .into_iter()
+    .filter(|&(bit, _)| events & bit != 0)
+    .map(|(_, category)| category)
+    .collect()
+}
+
 /// Set a policy callback and its held verdict timeout in milliseconds.
 /// Negative disables the timeout; zero denies immediately. Pass 5000 for
-/// the SDK default.
+/// the SDK default. `events` is a mask of `SANDLOCK_EVENT_*` bits selecting
+/// the categories delivered to the callback.
 ///
 /// # Safety
 /// `b` must be a valid builder pointer. `cb` must be a valid function pointer
@@ -2417,6 +2441,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
     b: *mut SandboxBuilder,
     cb: sandlock_policy_fn_t,
     verdict_timeout_ms: i64,
+    events: u32,
     user_data: *mut c_void,
     user_data_drop: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> *mut SandboxBuilder {
@@ -2444,13 +2469,15 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn(
     } else {
         Some(std::time::Duration::from_millis(verdict_timeout_ms as u64))
     };
-    let policy_fn = sandlock_core::PolicyFn::new(cb_fn).verdict_timeout(timeout);
+    let policy_fn = sandlock_core::PolicyFn::new(cb_fn)
+        .verdict_timeout(timeout)
+        .events(&event_categories(events));
     Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
 }
 
 /// Set a deferred policy callback, which may keep each held syscall's
-/// approval and resolve it after returning. The timeout and `user_data`
-/// contract are those of `sandlock_sandbox_builder_policy_fn`.
+/// approval and resolve it after returning. The timeout, `events`, and
+/// `user_data` contract are those of `sandlock_sandbox_builder_policy_fn`.
 ///
 /// # Safety
 /// As for `sandlock_sandbox_builder_policy_fn`.
@@ -2459,6 +2486,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
     b: *mut SandboxBuilder,
     cb: sandlock_policy_deferred_fn_t,
     verdict_timeout_ms: i64,
+    events: u32,
     user_data: *mut c_void,
     user_data_drop: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 ) -> *mut SandboxBuilder {
@@ -2487,7 +2515,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
     } else {
         Some(std::time::Duration::from_millis(verdict_timeout_ms as u64))
     };
-    let policy_fn = sandlock_core::PolicyFn::deferred(cb_fn).verdict_timeout(timeout);
+    let policy_fn = sandlock_core::PolicyFn::deferred(cb_fn)
+        .verdict_timeout(timeout)
+        .events(&event_categories(events));
     Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
 }
 
@@ -2639,7 +2669,7 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_pid_network(
 }
 
 /// Deny access to a path dynamically (checked on openat). Returns 0, or -1
-/// when file events are not subscribed or an argument is invalid.
+/// when filesystem events are not subscribed or an argument is invalid.
 ///
 /// # Safety
 /// `ctx` must be a valid context pointer. `path` must be a valid C string.

@@ -471,6 +471,7 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				b,
 				(C.sandlock_policy_deferred_fn_t)(C.goDeferredPolicyCallback),
 				C.int64_t(timeoutMs),
+				C.SANDLOCK_EVENT_ALL,
 				registerPolicyCallback(s.PolicyFn.Deferred),
 				(*[0]byte)(C.goPolicyDrop),
 			)
@@ -479,6 +480,7 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				b,
 				(C.sandlock_policy_fn_t)(C.goPolicyCallback),
 				C.int64_t(timeoutMs),
+				C.SANDLOCK_EVENT_ALL,
 				registerPolicyCallback(s.PolicyFn.Callback),
 				(*[0]byte)(C.goPolicyDrop),
 			)

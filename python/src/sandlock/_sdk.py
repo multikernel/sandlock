@@ -198,6 +198,7 @@ _lib.sandlock_sandbox_builder_policy_fn.argtypes = [
     _c_builder_p,
     _POLICY_FN_TYPE,
     ctypes.c_int64,
+    ctypes.c_uint32,
     ctypes.c_void_p,
     ctypes.c_void_p,
 ]
@@ -215,6 +216,7 @@ _lib.sandlock_sandbox_builder_policy_fn_deferred.argtypes = [
     _c_builder_p,
     _POLICY_DEFERRED_FN_TYPE,
     ctypes.c_int64,
+    ctypes.c_uint32,
     ctypes.c_void_p,
     ctypes.c_void_p,
 ]
@@ -246,7 +248,7 @@ _lib.sandlock_ctx_restrict_max_processes.argtypes = [_c_ctx_p, ctypes.c_uint32]
 _lib.sandlock_ctx_restrict_pid_network.restype = None
 _lib.sandlock_ctx_restrict_pid_network.argtypes = [_c_ctx_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
 
-_lib.sandlock_ctx_deny_path.restype = None
+_lib.sandlock_ctx_deny_path.restype = ctypes.c_int
 _lib.sandlock_ctx_deny_path.argtypes = [_c_ctx_p, ctypes.c_char_p]
 
 _lib.sandlock_ctx_allow_path.restype = None
@@ -727,7 +729,7 @@ class SyscallEvent:
     cost.
     """
     syscall: str
-    category: str  # "file", "network", "process", "memory"
+    category: str  # "filesystem", "network", "process"
     pid: int
     parent_pid: int = 0
     host: str | None = None
@@ -772,8 +774,9 @@ class PolicyContext:
         _lib.sandlock_ctx_restrict_pid_network(self._ptr, pid, arr, len(ips))
 
     def deny_path(self, path: str) -> None:
-        """Deny access to a path (checked on openat)."""
-        _lib.sandlock_ctx_deny_path(self._ptr, _encode(path))
+        """Deny access to a path (checked on openat). Requires filesystem events."""
+        if _lib.sandlock_ctx_deny_path(self._ptr, _encode(path)) != 0:
+            raise RuntimeError("deny_path requires the policy_fn to subscribe to filesystem events")
 
     def allow_path(self, path: str) -> None:
         """Remove a previously denied path."""
@@ -1447,10 +1450,10 @@ class _NativePolicy:
                         for i in range(ev.argc)
                         if ev.argv[i]
                     )
-                _CATEGORIES = {0: "file", 1: "network", 2: "process", 3: "memory"}
+                _CATEGORIES = {0: "filesystem", 1: "network", 2: "process"}
                 return SyscallEvent(
                     syscall=ev.syscall.decode("utf-8") if ev.syscall else "",
-                    category=_CATEGORIES.get(ev.category, "file"),
+                    category=_CATEGORIES[ev.category],
                     pid=ev.pid,
                     parent_pid=ev.parent_pid,
                     host=ev.host.decode("utf-8") if ev.host else None,
@@ -1471,7 +1474,7 @@ class _NativePolicy:
 
                 c_callback = _POLICY_DEFERRED_FN_TYPE(_c_deferred)
                 b = _lib.sandlock_sandbox_builder_policy_fn_deferred(
-                    b, c_callback, policy_fn._verdict_timeout_ms(), None, None,
+                    b, c_callback, policy_fn._verdict_timeout_ms(), policy_fn._events_mask(), None, None,
                 )
             else:
                 def _c_callback(event_p, ctx_p, _user_data):
@@ -1480,7 +1483,7 @@ class _NativePolicy:
 
                 c_callback = _POLICY_FN_TYPE(_c_callback)
                 b = _lib.sandlock_sandbox_builder_policy_fn(
-                    b, c_callback, policy_fn._verdict_timeout_ms(), None, None,
+                    b, c_callback, policy_fn._verdict_timeout_ms(), policy_fn._events_mask(), None, None,
                 )
 
         err = ctypes.c_int(0)

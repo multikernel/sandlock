@@ -34,6 +34,26 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 #define SANDLOCK_CHANGE_AFTER 1
 
 /**
+ * `events` bit for filesystem syscall events of a policy callback.
+ */
+#define SANDLOCK_EVENT_FILESYSTEM (1 << 0)
+
+/**
+ * `events` bit for network syscall events of a policy callback.
+ */
+#define SANDLOCK_EVENT_NETWORK (1 << 1)
+
+/**
+ * `events` bit for process syscall events of a policy callback.
+ */
+#define SANDLOCK_EVENT_PROCESS (1 << 2)
+
+/**
+ * Every policy callback event category.
+ */
+#define SANDLOCK_EVENT_ALL ((SANDLOCK_EVENT_FILESYSTEM | SANDLOCK_EVENT_NETWORK) | SANDLOCK_EVENT_PROCESS)
+
+/**
  * `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
  * memfd writable (do not seal). Default (bit clear) seals it read-only.
  */
@@ -1224,7 +1244,8 @@ void sandlock_gather_free(sandlock_gather_t *g);
 /**
  * Set a policy callback and its held verdict timeout in milliseconds.
  * Negative disables the timeout; zero denies immediately. Pass 5000 for
- * the SDK default.
+ * the SDK default. `events` is a mask of `SANDLOCK_EVENT_*` bits selecting
+ * the categories delivered to the callback.
  *
  * # Safety
  * `b` must be a valid builder pointer. `cb` must be a valid function pointer
@@ -1237,13 +1258,14 @@ void sandlock_gather_free(sandlock_gather_t *g);
 sandlock_builder_t *sandlock_sandbox_builder_policy_fn(sandlock_builder_t *b,
                                                        sandlock_policy_fn_t cb,
                                                        int64_t verdict_timeout_ms,
+                                                       uint32_t events,
                                                        void *user_data,
                                                        void (*user_data_drop)(void *user_data));
 
 /**
  * Set a deferred policy callback, which may keep each held syscall's
- * approval and resolve it after returning. The timeout and `user_data`
- * contract are those of `sandlock_sandbox_builder_policy_fn`.
+ * approval and resolve it after returning. The timeout, `events`, and
+ * `user_data` contract are those of `sandlock_sandbox_builder_policy_fn`.
  *
  * # Safety
  * As for `sandlock_sandbox_builder_policy_fn`.
@@ -1251,6 +1273,7 @@ sandlock_builder_t *sandlock_sandbox_builder_policy_fn(sandlock_builder_t *b,
 sandlock_builder_t *sandlock_sandbox_builder_policy_fn_deferred(sandlock_builder_t *b,
                                                                 sandlock_policy_deferred_fn_t cb,
                                                                 int64_t verdict_timeout_ms,
+                                                                uint32_t events,
                                                                 void *user_data,
                                                                 void (*user_data_drop)(void *user_data));
 
@@ -1335,7 +1358,7 @@ void sandlock_ctx_restrict_pid_network(sandlock_ctx_t *ctx,
 
 /**
  * Deny access to a path dynamically (checked on openat). Returns 0, or -1
- * when file events are not subscribed or an argument is invalid.
+ * when filesystem events are not subscribed or an argument is invalid.
  *
  * # Safety
  * `ctx` must be a valid context pointer. `path` must be a valid C string.

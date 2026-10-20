@@ -8,7 +8,7 @@ use sandlock_ffi::{
     sandlock_result_success, sandlock_run, sandlock_sandbox_build,
     sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_new,
     sandlock_sandbox_builder_policy_fn, sandlock_sandbox_builder_policy_fn_deferred,
-    sandlock_sandbox_free,
+    sandlock_sandbox_free, SANDLOCK_EVENT_ALL,
 };
 
 static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -38,6 +38,7 @@ fn policy_fn_user_data_drop_fires_on_policy_free() {
             builder,
             policy_callback,
             5000,
+            SANDLOCK_EVENT_ALL,
             USER_DATA_TOKEN as *mut c_void,
             Some(drop_user_data),
         )
@@ -104,6 +105,7 @@ fn run_with_approver(verdict: Option<i32>) -> bool {
             b,
             deferred_callback,
             5000,
+            SANDLOCK_EVENT_ALL,
             approver as *mut c_void,
             Some(drop_approver),
         )

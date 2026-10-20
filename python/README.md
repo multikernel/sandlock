@@ -676,7 +676,7 @@ from sandlock import Sandbox, PolicyFn, SyscallEvent, PolicyContext
 def my_policy(event: SyscallEvent, ctx: PolicyContext):
     if event.category == "network" and event.host == "evil.com":
         return True   # deny
-    if event.category == "file" and "/secrets" in (event.path or ""):
+    if event.category == "filesystem" and "/secrets" in (event.path or ""):
         ctx.deny_path("/secrets")
         return True   # deny
     return False      # allow
@@ -689,10 +689,10 @@ sb = Sandbox(..., policy_fn=PolicyFn(my_policy))
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `syscall` | `str` | Syscall name (e.g. `"openat"`, `"connect"`) |
-| `category` | `str` | `"file"`, `"network"`, `"process"`, or `"memory"` |
+| `category` | `str` | `"filesystem"`, `"network"`, or `"process"` |
 | `pid` | `int` | Process ID |
 | `parent_pid` | `int` | Parent process ID |
-| `path` | `str \| None` | File path (for file events) |
+| `path` | `str \| None` | File path (for filesystem events) |
 | `host` | `str \| None` | Hostname (for network events) |
 | `port` | `int` | Port number (for network events) |
 | `argv` | `tuple[str, ...] \| None` | Command arguments (for execve) |
