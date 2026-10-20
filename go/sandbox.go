@@ -64,27 +64,23 @@ const (
 type SyscallCategory uint8
 
 const (
-	// CategoryFile covers filesystem operations such as openat and unlinkat.
-	CategoryFile SyscallCategory = iota
+	// CategoryFilesystem covers filesystem operations such as openat and unlinkat.
+	CategoryFilesystem SyscallCategory = iota
 	// CategoryNetwork covers network operations such as connect and bind.
 	CategoryNetwork
 	// CategoryProcess covers process lifecycle operations such as execve.
 	CategoryProcess
-	// CategoryMemory covers memory-management operations such as mmap.
-	CategoryMemory
 )
 
 // String returns the category name used by the Python SDK.
 func (c SyscallCategory) String() string {
 	switch c {
-	case CategoryFile:
-		return "file"
+	case CategoryFilesystem:
+		return "filesystem"
 	case CategoryNetwork:
 		return "network"
 	case CategoryProcess:
 		return "process"
-	case CategoryMemory:
-		return "memory"
 	default:
 		return "unknown"
 	}
@@ -182,6 +178,9 @@ type PolicyFn struct {
 	// VerdictTimeout includes queue time. Zero uses five seconds; a negative
 	// value, conventionally NoTimeout, disables the deadline.
 	VerdictTimeout time.Duration
+	// Events limits delivery to these categories; empty means all. Syscalls
+	// outside them are not intercepted for the callback.
+	Events []SyscallCategory
 }
 
 // Protection identifies a single Landlock protection whose enforcement

@@ -466,12 +466,19 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				timeoutMs++
 			}
 		}
+		events := C.uint32_t(C.SANDLOCK_EVENT_ALL)
+		if len(s.PolicyFn.Events) > 0 {
+			events = 0
+			for _, category := range s.PolicyFn.Events {
+				events |= 1 << category
+			}
+		}
 		if s.PolicyFn.Deferred != nil {
 			b = C.sandlock_sandbox_builder_policy_fn_deferred(
 				b,
 				(C.sandlock_policy_deferred_fn_t)(C.goDeferredPolicyCallback),
 				C.int64_t(timeoutMs),
-				C.SANDLOCK_EVENT_ALL,
+				events,
 				registerPolicyCallback(s.PolicyFn.Deferred),
 				(*[0]byte)(C.goPolicyDrop),
 			)
@@ -480,7 +487,7 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				b,
 				(C.sandlock_policy_fn_t)(C.goPolicyCallback),
 				C.int64_t(timeoutMs),
-				C.SANDLOCK_EVENT_ALL,
+				events,
 				registerPolicyCallback(s.PolicyFn.Callback),
 				(*[0]byte)(C.goPolicyDrop),
 			)
@@ -622,13 +629,16 @@ func (c *PolicyContext) RestrictPIDNetwork(pid uint32, ips []string) error {
 }
 
 // DenyPath dynamically denies access to path for mediated openat checks.
+// It requires the PolicyFn to subscribe to CategoryFilesystem.
 func (c *PolicyContext) DenyPath(path string) error {
 	if hasNUL(path) {
 		return ErrInvalidString
 	}
 	cp := C.CString(path)
 	defer C.free(unsafe.Pointer(cp))
-	C.sandlock_ctx_deny_path(c.cptr(), cp)
+	if C.sandlock_ctx_deny_path(c.cptr(), cp) != 0 {
+		return ErrFilesystemEventsRequired
+	}
 	return nil
 }
 

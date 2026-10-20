@@ -4,11 +4,14 @@ package sandlock_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1025,6 +1028,65 @@ func TestShutdownCancelsUnlimitedApproval(t *testing.T) {
 	case <-cancelled:
 	default:
 		t.Fatal("shutdown did not cancel approval")
+	}
+}
+
+func TestPolicyFnNetworkEventsOnly(t *testing.T) {
+	requireLandlock(t)
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	var mu sync.Mutex
+	var seen []sandlock.SyscallEvent
+	var denyErrs []error
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			Events: []sandlock.SyscallCategory{sandlock.CategoryNetwork},
+			Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+				mu.Lock()
+				defer mu.Unlock()
+				seen = append(seen, event)
+				denyErrs = append(denyErrs, ctx.DenyPath("/etc/hostname"))
+				return sandlock.Allow()
+			},
+		},
+	}
+	script := fmt.Sprintf(`
+import socket, subprocess
+open('/etc/hostname').read()
+subprocess.run(['/bin/true'], check=True)
+socket.create_connection(('127.0.0.1', %d)).close()
+`, port)
+	res, err := sb.Run(context.Background(), "python3", "-c", script)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("run failed: exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	connected := false
+	for i, event := range seen {
+		if event.Category != sandlock.CategoryNetwork {
+			t.Errorf("unsubscribed %s event for %s", event.Category, event.Syscall)
+		}
+		if !errors.Is(denyErrs[i], sandlock.ErrFilesystemEventsRequired) {
+			t.Errorf("DenyPath without filesystem events returned %v", denyErrs[i])
+		}
+		connected = connected || event.Syscall == "connect"
+	}
+	if !connected {
+		t.Fatal("connect event missing")
 	}
 }
 
