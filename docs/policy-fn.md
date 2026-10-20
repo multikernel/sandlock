@@ -29,8 +29,8 @@ def on_event(event, ctx):
         ctx.restrict_network([])           # block all network
         ctx.deny_path("/etc/shadow")       # dynamic fs deny
 
-    # Audit every file access (allow but flag)
-    if event.category == "file":
+    # Audit every filesystem access (allow but flag)
+    if event.category == "filesystem":
         return "audit"
 
     return 0  # allow
@@ -46,7 +46,7 @@ result = sandbox.run(["python3", "agent.py"])
 **Verdicts:** `0`/`False` = allow, `True`/`-1` = deny (EPERM),
 positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 
-**Event fields:** `syscall`, `category` (file/network/process/memory),
+**Event fields:** `syscall`, `category` (filesystem/network/process),
 `pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
 
 > **TOCTOU NOTE** Per `seccomp_unotify(2)`, the kernel
@@ -75,6 +75,7 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)`: network control
 - `ctx.restrict_max_memory(bytes)` / `ctx.restrict_max_processes(n)`: resource limits
 - `ctx.deny_path(path)` / `ctx.allow_path(path)`: dynamic filesystem restriction
+  (`deny_path` fails unless filesystem events are subscribed; see below)
 - `ctx.restrict_pid_network(pid, ips)`: per-PID network override
 
 **Held syscalls** (the calling task is blocked awaiting a verdict; the
@@ -95,7 +96,7 @@ let mut dynamic = Sandbox::builder()
         }
         if event.syscall == "execve" {
             ctx.restrict_network(&[]);
-            ctx.deny_path("/etc/shadow");
+            ctx.deny_path("/etc/shadow").expect("filesystem events are subscribed");
         }
         Verdict::Allow
     }))
@@ -119,8 +120,8 @@ zero uses the five-second default, positive values set a timeout, and negative
 values disable it. Python and Go round positive fractional milliseconds up.
 
 In C, pass the timeout in milliseconds alongside the callback:
-`sandlock_sandbox_builder_policy_fn(builder, callback, timeout_ms, user_data,
-user_data_drop)`. Negative values disable the timeout; zero denies immediately;
+`sandlock_sandbox_builder_policy_fn(builder, callback, timeout_ms, events,
+user_data, user_data_drop)`. Negative values disable the timeout; zero denies immediately;
 pass `5000` for the SDK default. There is no independent sandbox timeout setter.
 
 Shutdown cancels outstanding verdict waits and discards queued events. A running
@@ -130,6 +131,39 @@ bounded waits for user input. The context is valid only during its callback.
 Shutdown joins that callback before releasing its data; it cannot forcibly
 interrupt user code. A verdict timeout closes the verdict wait, but does not
 interrupt a callback already running. Its eventual verdict is ignored.
+
+## Event subscriptions
+
+A callback receives every event category by default. Subscribing to fewer
+categories also drops the interception that only those categories need: a
+network-only callback leaves file syscalls untrapped and skips the ptrace
+fork tracking and `execve` freeze that make `argv` safe to inspect.
+
+```python
+PolicyFn(on_net, events={"network"})
+```
+
+Rust uses `PolicyFn::new(on_net).events(&[SyscallCategory::Network])`, Go sets
+`PolicyFn.Events: []sandlock.SyscallCategory{sandlock.CategoryNetwork}`, and C
+passes `SANDLOCK_EVENT_NETWORK` as the `events` mask (`SANDLOCK_EVENT_ALL` keeps
+every category).
+
+| Category | Syscalls | Subscribing adds |
+|----------|----------|------------------|
+| `filesystem` | `open`, `openat`, `openat2`, `mkdir(at)`, `mknod(at)`, `unlink(at)`, `rmdir`, `symlink(at)`, `link(at)`, `rename(at)`, `renameat2`, `truncate` | traps on these path syscalls, plus those `ctx.deny_path()` gates |
+| `network` | `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind` | traps on these syscalls |
+| `process` | `execve`, `execveat`, `clone`, `clone3`, `fork`, `vfork` | `execve` traps, ptrace fork tracking, and the `execve` freeze |
+
+Process creation syscalls are always trapped for process accounting, so
+subscribing to `process` adds no traps for them; it delivers their events and
+tracks each new child with ptrace.
+
+Unsubscribed syscalls remain governed by the static policy. Network supervision
+stays on for any callback, so `ctx.restrict_network()` works from every
+category. `ctx.deny_path()` needs filesystem events because only they keep path
+syscalls trapped; without them it fails (Python raises `RuntimeError`, Go
+returns `ErrFilesystemEventsRequired`, C returns `-1`) rather than silently not
+denying.
 
 ## Deferred approval
 
