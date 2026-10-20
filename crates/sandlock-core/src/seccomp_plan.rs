@@ -7,6 +7,7 @@
 use syscalls::{Sysno, SysnoSet};
 
 use crate::arch;
+use crate::policy_fn::SyscallCategory;
 use crate::resolved::ResolvedSandbox;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{jump, stmt};
@@ -313,23 +314,16 @@ fn build_fs_denied_path_syscalls() -> Vec<i64> {
     v
 }
 
-/// Syscalls intercepted for policy_fn event emission.
+/// Syscalls intercepted for policy_fn filesystem events.
 ///
-/// Must match what `emit_policy_event` can decode into a `SyscallEvent`, so
-/// every field documented there fires for a policy_fn-only sandbox instead of
-/// depending on COW, chroot, or network supervision happening to intercept
-/// the syscall.
-fn policy_event_syscalls() -> Vec<i64> {
+/// Policy event lists must match what `emit_policy_event` can decode into a
+/// `SyscallEvent`, so every field documented there fires for a policy_fn-only
+/// sandbox instead of depending on COW, chroot, or network supervision
+/// happening to intercept the syscall.
+fn policy_file_event_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
         arch::SYS_OPENAT2,
-        libc::SYS_connect,
-        libc::SYS_sendto,
-        libc::SYS_sendmsg,
-        libc::SYS_sendmmsg,
-        libc::SYS_bind,
-        libc::SYS_execve,
-        libc::SYS_execveat,
         libc::SYS_mkdirat,
         libc::SYS_mknodat,
         libc::SYS_unlinkat,
@@ -355,6 +349,16 @@ fn policy_event_syscalls() -> Vec<i64> {
     );
     v
 }
+
+const POLICY_NETWORK_EVENT_SYSCALLS: &[i64] = &[
+    libc::SYS_connect,
+    libc::SYS_sendto,
+    libc::SYS_sendmsg,
+    libc::SYS_sendmmsg,
+    libc::SYS_bind,
+];
+
+const POLICY_PROCESS_EVENT_SYSCALLS: &[i64] = &[libc::SYS_execve, libc::SYS_execveat];
 
 const PORT_REMAP_SYSCALLS: &[i64] = &[libc::SYS_bind, libc::SYS_getsockname];
 
@@ -434,10 +438,18 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.extend(&fs_denied_path_syscalls());
     }
 
-    // Dynamic policy callback: intercept every syscall the event emitter
-    // can decode.
-    if features.policy_fn {
-        nrs.extend(&policy_event_syscalls());
+    // Dynamic policy callback: intercept what the event emitter can decode
+    // for each subscribed category.
+    if features.policy_events.contains(SyscallCategory::Filesystem) {
+        nrs.extend(&policy_file_event_syscalls());
+        // ctx.deny_path() needs every syscall a static deny would gate.
+        nrs.extend(fs_denied_path_syscalls());
+    }
+    if features.policy_events.contains(SyscallCategory::Network) {
+        nrs.extend(POLICY_NETWORK_EVENT_SYSCALLS);
+    }
+    if features.policy_events.contains(SyscallCategory::Process) {
+        nrs.extend(POLICY_PROCESS_EVENT_SYSCALLS);
     }
 
     // Port remapping

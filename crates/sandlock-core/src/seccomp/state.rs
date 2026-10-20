@@ -819,6 +819,7 @@ impl DeniedSet {
 pub struct PolicyFnState {
     pub(crate) verdict_timeout: Option<std::time::Duration>,
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    pub(crate) events: crate::policy_fn::CategorySet,
     /// Event sender for dynamic policy callback (None if no policy_fn).
     pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::policy_fn::PolicyMsg>>,
     /// Shared live policy for dynamic updates (None if no policy_fn).
@@ -832,6 +833,7 @@ impl PolicyFnState {
         Self {
             verdict_timeout: Some(std::time::Duration::from_secs(5)),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            events: crate::policy_fn::CategorySet::NONE,
             event_tx: None,
             live_policy: None,
             denied: std::sync::Arc::new(DeniedSet::default()),

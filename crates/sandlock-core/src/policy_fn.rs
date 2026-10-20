@@ -44,13 +44,28 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyscallCategory {
     /// Filesystem operations (openat, unlinkat, mkdirat, etc.)
-    File,
+    Filesystem,
     /// Network operations (connect, sendto, bind, etc.)
     Network,
     /// Process lifecycle (clone, execve, vfork, etc.)
     Process,
-    /// Memory management (mmap, munmap, brk, etc.)
-    Memory,
+}
+
+/// The event categories a policy callback subscribes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CategorySet(u8);
+
+impl CategorySet {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const ALL: Self = Self(0b111);
+
+    pub(crate) fn of(categories: &[SyscallCategory]) -> Self {
+        Self(categories.iter().fold(0, |bits, &c| bits | 1 << c as u8))
+    }
+
+    pub(crate) fn contains(self, category: SyscallCategory) -> bool {
+        self.0 & 1 << category as u8 != 0
+    }
 }
 
 // ============================================================
@@ -176,6 +191,7 @@ pub struct PolicyContext {
     restricted: HashSet<&'static str>,
     pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
     denied: Arc<crate::seccomp::state::DeniedSet>,
+    events: CategorySet,
 }
 
 impl PolicyContext {
@@ -192,6 +208,7 @@ impl PolicyContext {
             restricted: HashSet::new(),
             pid_overrides,
             denied,
+            events: CategorySet::ALL,
         }
     }
 
@@ -286,9 +303,14 @@ impl PolicyContext {
     /// Deny access to a path (and all children). Checked by the supervisor
     /// on openat/stat/access syscalls. Takes effect immediately. The file's
     /// inode identity is captured too, so the deny survives hardlinks and
-    /// renames to a non-denied name.
-    pub fn deny_path(&self, path: &str) {
+    /// renames to a non-denied name. Fails unless filesystem events
+    /// are subscribed, since only then are path syscalls intercepted.
+    pub fn deny_path(&self, path: &str) -> Result<(), PolicyFnError> {
+        if !self.events.contains(SyscallCategory::Filesystem) {
+            return Err(PolicyFnError::NotSubscribed(SyscallCategory::Filesystem));
+        }
         self.denied.deny(path);
+        Ok(())
     }
 
     /// Remove a previously denied path.
@@ -316,6 +338,8 @@ impl PolicyContext {
 pub enum PolicyFnError {
     #[error("cannot grant restricted field: {0}")]
     FieldRestricted(String),
+    #[error("{0:?} events are not subscribed")]
+    NotSubscribed(SyscallCategory),
 }
 
 // ============================================================
@@ -391,6 +415,7 @@ impl Approval {
 pub struct PolicyFn {
     pub(crate) callback: PolicyCallback,
     pub(crate) verdict_timeout: Option<Duration>,
+    pub(crate) events: CategorySet,
 }
 
 impl PolicyFn {
@@ -421,6 +446,7 @@ impl PolicyFn {
         Self {
             callback: Arc::new(callback),
             verdict_timeout: Some(Duration::from_secs(5)),
+            events: CategorySet::ALL,
         }
     }
 
@@ -429,6 +455,14 @@ impl PolicyFn {
     /// the syscall without interrupting a callback already running.
     pub fn verdict_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.verdict_timeout = timeout;
+        self
+    }
+
+    /// Deliver only events in these categories (default: all). Syscalls
+    /// outside them are not intercepted for the callback, so a network-only
+    /// callback skips file traps and execve freezing.
+    pub fn events(mut self, categories: &[SyscallCategory]) -> Self {
+        self.events = CategorySet::of(categories);
         self
     }
 }
@@ -516,6 +550,7 @@ pub(crate) fn spawn_policy_fn(
     ceiling: LivePolicy,
     pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
     denied: Arc<crate::seccomp::state::DeniedSet>,
+    events: CategorySet,
 ) -> PolicyFnWorker {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PolicyMsg>();
 
@@ -526,6 +561,7 @@ pub(crate) fn spawn_policy_fn(
         .spawn(move || {
             let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
             ctx.cancellation = worker_cancellation;
+            ctx.events = events;
 
             while let Some(PolicyMsg::Event(pe)) = rx.blocking_recv() {
                 if ctx.is_cancelled() {
@@ -561,7 +597,7 @@ mod tests {
     fn test_event() -> SyscallEvent {
         SyscallEvent {
             syscall: "openat".into(),
-            category: SyscallCategory::File,
+            category: SyscallCategory::Filesystem,
             pid: 1,
             parent_pid: None,
             host: None,
@@ -680,6 +716,7 @@ mod tests {
             test_live(),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(crate::seccomp::state::DeniedSet::default()),
+            CategorySet::ALL,
         );
         let tx = worker.sender();
         tx.send(PolicyMsg::Event(PolicyEvent {
@@ -733,6 +770,7 @@ mod tests {
             test_live(),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(crate::seccomp::state::DeniedSet::default()),
+            CategorySet::ALL,
         );
         let tx = worker.sender();
         let (gate_tx, mut gate_rx) = tokio::sync::oneshot::channel();
@@ -812,6 +850,7 @@ mod tests {
             test_live(),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(crate::seccomp::state::DeniedSet::default()),
+            CategorySet::ALL,
         );
         let (first_tx, first_rx) = tokio::sync::oneshot::channel();
         let (second_tx, second_rx) = tokio::sync::oneshot::channel();
@@ -937,6 +976,44 @@ mod tests {
     }
 
     #[test]
+    fn test_category_set() {
+        let net = CategorySet::of(&[SyscallCategory::Network]);
+        assert!(net.contains(SyscallCategory::Network));
+        assert!(!net.contains(SyscallCategory::Filesystem));
+        assert!(!net.contains(SyscallCategory::Process));
+        assert!(!CategorySet::NONE.contains(SyscallCategory::Filesystem));
+        assert_eq!(
+            CategorySet::of(&[
+                SyscallCategory::Filesystem,
+                SyscallCategory::Network,
+                SyscallCategory::Process,
+            ]),
+            CategorySet::ALL
+        );
+    }
+
+    #[test]
+    fn test_deny_path_requires_file_events() {
+        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
+        let mut ctx = PolicyContext::new(
+            Arc::new(RwLock::new(test_live())),
+            test_live(),
+            Arc::new(RwLock::new(HashMap::new())),
+            denied.clone(),
+        );
+        ctx.events = CategorySet::of(&[SyscallCategory::Network]);
+        assert!(matches!(
+            ctx.deny_path("/etc/hostname"),
+            Err(PolicyFnError::NotSubscribed(SyscallCategory::Filesystem))
+        ));
+        assert!(!denied.is_path_denied("/etc/hostname"));
+
+        ctx.events = CategorySet::ALL;
+        ctx.deny_path("/etc/hostname").unwrap();
+        assert!(denied.is_path_denied("/etc/hostname"));
+    }
+
+    #[test]
     fn test_event_argv_contains() {
         let event = SyscallEvent {
             syscall: "execve".to_string(),
@@ -964,7 +1041,7 @@ mod tests {
     fn test_event_argv_contains_none() {
         let event = SyscallEvent {
             syscall: "openat".to_string(),
-            category: SyscallCategory::File,
+            category: SyscallCategory::Filesystem,
             pid: 1,
             parent_pid: None,
             host: None,

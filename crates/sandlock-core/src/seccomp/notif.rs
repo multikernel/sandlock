@@ -2087,8 +2087,9 @@ fn syscall_name(nr: i64) -> &'static str {
     }
 }
 
-/// Map a syscall number to a high-level category.
-fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
+/// Map a syscall number to a high-level category, `None` for syscalls other
+/// features trap that policy_fn has no category for.
+fn syscall_category(nr: i64) -> Option<crate::policy_fn::SyscallCategory> {
     use crate::policy_fn::SyscallCategory;
     match nr {
         n if n == libc::SYS_openat
@@ -2119,7 +2120,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || Some(n) == arch::sys_rename()
             || Some(n) == arch::sys_renameat() =>
         {
-            SyscallCategory::File
+            Some(SyscallCategory::Filesystem)
         }
         n if n == libc::SYS_connect
             || n == libc::SYS_sendto
@@ -2128,7 +2129,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_bind
             || n == libc::SYS_getsockname =>
         {
-            SyscallCategory::Network
+            Some(SyscallCategory::Network)
         }
         n if n == libc::SYS_clone
             || n == libc::SYS_clone3
@@ -2137,17 +2138,9 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_execve
             || n == libc::SYS_execveat =>
         {
-            SyscallCategory::Process
+            Some(SyscallCategory::Process)
         }
-        n if n == libc::SYS_mmap
-            || n == libc::SYS_munmap
-            || n == libc::SYS_brk
-            || n == libc::SYS_mremap
-            || n == libc::SYS_mprotect =>
-        {
-            SyscallCategory::Memory
-        }
-        _ => SyscallCategory::File, // default
+        _ => None,
     }
 }
 
@@ -2494,12 +2487,14 @@ async fn emit_policy_event(
     };
     let timeout = pfs.verdict_timeout;
     let cancellation = pfs.cancellation.clone();
+    let events = pfs.events;
     drop(pfs);
 
     let nr = notif.data.nr as i64;
+    // Other features trap syscalls outside the subscribed categories too.
+    let category = syscall_category(nr).filter(|&c| events.contains(c))?;
     let denied = matches!(action, NotifAction::Errno(_));
     let name = syscall_name(nr);
-    let category = syscall_category(nr);
     let parent_pid = i32::try_from(notif.pid)
         .ok()
         .and_then(crate::seccomp::state::read_ppid)

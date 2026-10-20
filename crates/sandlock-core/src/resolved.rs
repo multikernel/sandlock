@@ -1,3 +1,4 @@
+use crate::policy_fn::{CategorySet, SyscallCategory};
 use crate::sandbox::Sandbox;
 
 /// Internal normalized view of a sandbox configuration.
@@ -41,7 +42,7 @@ pub(crate) struct SandboxFeatures {
     pub(crate) cow: bool,
     pub(crate) chroot: bool,
     pub(crate) fs_denies: bool,
-    pub(crate) policy_fn: bool,
+    pub(crate) policy_events: CategorySet,
     pub(crate) port_remap: bool,
     pub(crate) http_acl: bool,
     pub(crate) argv_safety_required: bool,
@@ -64,12 +65,17 @@ impl SandboxFeatures {
         let network_destination_policy = !sandbox.net_allow.is_empty()
             || http_reachability
             || !sandbox.net_deny.is_empty()
+            // Any callback may restrict_network() from any event category.
             || sandbox.policy_fn.is_some()
             || http_acl;
         let bind_denylist = !sandbox.net_deny_bind.is_empty();
         let exec_handler = handler_syscalls
             .iter()
             .any(|&nr| nr == libc::SYS_execve || nr == libc::SYS_execveat);
+        let policy_events = sandbox
+            .policy_fn
+            .as_ref()
+            .map_or(CategorySet::NONE, |p| p.events);
 
         Self {
             memory_limit: sandbox.max_memory.is_some(),
@@ -84,10 +90,10 @@ impl SandboxFeatures {
             cow: sandbox.workdir.is_some(),
             chroot: sandbox.chroot.is_some(),
             fs_denies: !sandbox.fs_denied.is_empty(),
-            policy_fn: sandbox.policy_fn.is_some(),
+            policy_events,
             port_remap: sandbox.port_remap,
             http_acl,
-            argv_safety_required: sandbox.policy_fn.is_some() || exec_handler,
+            argv_safety_required: policy_events.contains(SyscallCategory::Process) || exec_handler,
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
             net_allow_present: sandbox.net_allow_is_active(),
             net_deny: !sandbox.net_deny.is_empty(),

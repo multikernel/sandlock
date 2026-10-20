@@ -2681,8 +2681,10 @@ impl Sandbox {
                     ceiling,
                     pid_overrides,
                     denied,
+                    policy_fn.events,
                 );
                 policy_fn_state.verdict_timeout = policy_fn.verdict_timeout;
+                policy_fn_state.events = policy_fn.events;
                 policy_fn_state.cancellation = worker.cancellation();
                 policy_fn_state.event_tx = Some(worker.sender());
                 let (stop, worker_cancel) = (self.rt().stop.clone(), worker.cancellation());

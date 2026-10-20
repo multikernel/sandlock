@@ -249,7 +249,7 @@ async fn test_policy_fn_deny_path() {
     let policy = base_policy()
         .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
-                ctx.deny_path("/etc/hostname");
+                ctx.deny_path("/etc/hostname").unwrap();
             }
             Verdict::Allow
         }))
@@ -444,8 +444,10 @@ async fn test_policy_fn_event_categories() {
     assert!(result.success());
 
     let captured = categories.lock().unwrap();
-    // openat should be File
-    let has_file = captured.iter().any(|(_, c)| *c == SyscallCategory::File);
+    // openat should be Filesystem
+    let has_file = captured
+        .iter()
+        .any(|(_, c)| *c == SyscallCategory::Filesystem);
     assert!(
         has_file,
         "should have File category events, got: {:?}",
@@ -458,6 +460,111 @@ async fn test_policy_fn_event_categories() {
         "should have Process category events, got: {:?}",
         *captured
     );
+}
+
+/// Syscalls trapped only for the memory limit have no category and must not
+/// reach the callback.
+#[tokio::test]
+async fn test_policy_fn_skips_memory_limit_syscalls() {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+
+    let mut policy = base_policy()
+        .max_memory(ByteSize::mib(256))
+        .policy_fn(PolicyFn::new(move |event, _ctx| {
+            seen_clone.lock().unwrap().push(event.syscall.clone());
+            Verdict::Allow
+        }))
+        .build()
+        .unwrap();
+
+    let result = policy
+        .run_interactive(&["python3", "-c", "print('memory')"])
+        .await
+        .unwrap();
+    assert!(result.success());
+
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(
+        !seen.iter().any(|s| matches!(
+            s.as_str(),
+            "mmap" | "munmap" | "brk" | "mremap" | "mprotect"
+        )),
+        "memory syscalls reached the callback: {:?}",
+        *seen
+    );
+}
+
+#[tokio::test]
+async fn test_policy_fn_network_events_only() {
+    let (_listener, port) = loopback_listener("127.0.0.1");
+    let seen: Arc<Mutex<Vec<(String, SyscallCategory)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+    let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let denied_clone = denied.clone();
+
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(move |event, ctx| {
+                if ctx.deny_path("/etc/hostname").is_ok() {
+                    denied_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                seen_clone
+                    .lock()
+                    .unwrap()
+                    .push((event.syscall.clone(), event.category));
+                Verdict::Allow
+            })
+            .events(&[SyscallCategory::Network]),
+        )
+        .build()
+        .unwrap();
+
+    let script = format!(
+        concat!(
+            "import socket, subprocess\n",
+            "open('/etc/hostname').read()\n",
+            "subprocess.run(['/bin/true'], check=True)\n",
+            "s = socket.socket(); s.connect(('127.0.0.1', {port})); s.close()\n",
+        ),
+        port = port
+    );
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+    assert!(
+        !denied.load(std::sync::atomic::Ordering::SeqCst),
+        "deny_path must fail without filesystem events"
+    );
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter().any(|(name, _)| name == "connect"),
+        "connect event missing: {:?}",
+        *seen
+    );
+    assert!(
+        seen.iter().all(|(_, c)| *c == SyscallCategory::Network),
+        "only network events expected: {:?}",
+        *seen
+    );
+}
+
+#[test]
+fn test_policy_fn_network_events_skip_file_and_exec_traps() {
+    let policy = base_policy()
+        .policy_fn(PolicyFn::new(|_event, _ctx| Verdict::Allow).events(&[SyscallCategory::Network]))
+        .build()
+        .unwrap();
+    let notified = sandlock_core::context::notif_syscalls(&policy, None);
+    assert!(notified.contains(&(libc::SYS_connect as u32)));
+    assert!(notified.contains(&(libc::SYS_sendmmsg as u32)));
+    assert!(!notified.contains(&(libc::SYS_mkdirat as u32)));
+    assert!(!notified.contains(&(libc::SYS_unlinkat as u32)));
+    assert!(!notified.contains(&(libc::SYS_execve as u32)));
 }
 
 // ============================================================
@@ -564,7 +671,7 @@ async fn test_policy_fn_audit() {
 
     let policy = base_policy()
         .policy_fn(PolicyFn::new(move |event, _ctx| {
-            if event.category == SyscallCategory::File {
+            if event.category == SyscallCategory::Filesystem {
                 audited_clone.lock().unwrap().push(event.syscall.clone());
                 return Verdict::Audit;
             }
@@ -582,7 +689,10 @@ async fn test_policy_fn_audit() {
     assert!(result.success(), "Audit should allow, not deny");
 
     let captured = audited.lock().unwrap();
-    assert!(!captured.is_empty(), "should have audited file events");
+    assert!(
+        !captured.is_empty(),
+        "should have audited filesystem events"
+    );
 }
 
 /// restrict_pid_network blocks a pid's outbound even without a net_allow

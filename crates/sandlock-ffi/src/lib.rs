@@ -2244,7 +2244,7 @@ pub unsafe extern "C" fn sandlock_gather_free(g: *mut sandlock_gather_t) {
 #[repr(C)]
 pub struct sandlock_event_t {
     pub syscall: *const c_char,
-    /// Category: 0=File, 1=Network, 2=Process, 3=Memory
+    /// Category: 0=Filesystem, 1=Network, 2=Process
     pub category: u8,
     pub pid: u32,
     pub parent_pid: u32,     // 0 if unknown
@@ -2377,10 +2377,9 @@ fn with_c_event<R>(
     let argc = argv_ptrs.len() as u32;
 
     let category = match event.category {
-        sandlock_core::policy_fn::SyscallCategory::File => 0u8,
+        sandlock_core::policy_fn::SyscallCategory::Filesystem => 0u8,
         sandlock_core::policy_fn::SyscallCategory::Network => 1,
         sandlock_core::policy_fn::SyscallCategory::Process => 2,
-        sandlock_core::policy_fn::SyscallCategory::Memory => 3,
     };
 
     let c_event = sandlock_event_t {
@@ -2639,18 +2638,27 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_pid_network(
     ctx.restrict_pid_network(pid, &parsed);
 }
 
-/// Deny access to a path dynamically (checked on openat).
+/// Deny access to a path dynamically (checked on openat). Returns 0, or -1
+/// when file events are not subscribed or an argument is invalid.
 ///
 /// # Safety
 /// `ctx` must be a valid context pointer. `path` must be a valid C string.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_deny_path(ctx: *mut sandlock_ctx_t, path: *const c_char) {
+pub unsafe extern "C" fn sandlock_ctx_deny_path(
+    ctx: *mut sandlock_ctx_t,
+    path: *const c_char,
+) -> c_int {
     if ctx.is_null() || path.is_null() {
-        return;
+        return -1;
     }
     let ctx = &*(*ctx).ctx;
-    let path = CStr::from_ptr(path).to_str().unwrap_or("");
-    ctx.deny_path(path);
+    let Ok(path) = CStr::from_ptr(path).to_str() else {
+        return -1;
+    };
+    match ctx.deny_path(path) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
 /// Remove a previously denied path.

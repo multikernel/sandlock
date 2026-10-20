@@ -222,7 +222,7 @@ typedef struct {
 typedef struct {
   const char *syscall;
   /**
-   * Category: 0=File, 1=Network, 2=Process, 3=Memory
+   * Category: 0=Filesystem, 1=Network, 2=Process
    */
   uint8_t category;
   uint32_t pid;
@@ -1334,12 +1334,13 @@ void sandlock_ctx_restrict_pid_network(sandlock_ctx_t *ctx,
                                        uint32_t count);
 
 /**
- * Deny access to a path dynamically (checked on openat).
+ * Deny access to a path dynamically (checked on openat). Returns 0, or -1
+ * when file events are not subscribed or an argument is invalid.
  *
  * # Safety
  * `ctx` must be a valid context pointer. `path` must be a valid C string.
  */
-void sandlock_ctx_deny_path(sandlock_ctx_t *ctx, const char *path);
+int sandlock_ctx_deny_path(sandlock_ctx_t *ctx, const char *path);
 
 /**
  * Remove a previously denied path.
