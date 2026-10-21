@@ -7,6 +7,7 @@ const EXIT_RUN_FAILED: i32 = 11;
 const EXIT_FOREGROUND_STOLEN: i32 = 12;
 const EXIT_FOREGROUND_NOT_TAKEN: i32 = 13;
 const EXIT_FOREGROUND_NOT_RESTORED: i32 = 14;
+const EXIT_BACKGROUND_RUN_FAILED: i32 = 15;
 
 /// Fork a child into a fresh session whose controlling terminal is a new
 /// pty (slave on stdin), then run `f` there and return its exit code.
@@ -232,5 +233,62 @@ fn shutdown_returns_tty_foreground_taken_by_a_job() {
         code, EXIT_OK,
         "helper exit {code} (10=no tty foreground at start, 11=spawn/wait/shutdown failed, \
          13=the job never took the tty foreground, 14=tty foreground not returned after shutdown)"
+    );
+}
+
+/// A run started from a background job (`sandlock run ... &`) must leave the
+/// terminal with the foreground group. Taking it makes the login shell read
+/// EIO from its tty, which it treats as EOF, so it exits and ends the ssh
+/// session.
+#[test]
+fn background_run_leaves_tty_foreground_with_shell() {
+    let code = run_in_pty_session(|| {
+        let shell_pgrp = unsafe { libc::getpgrp() };
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return EXIT_RUN_FAILED;
+        }
+        if pid == 0 {
+            unsafe {
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(EXIT_BACKGROUND_RUN_FAILED);
+                }
+            }
+            let code = block_on(async {
+                let name = format!("tty-background-{}", std::process::id());
+                let mut policy = test_policy().with_name(&name);
+                if policy.spawn_interactive(&["sleep", "30"]).await.is_err() {
+                    return EXIT_BACKGROUND_RUN_FAILED;
+                }
+                let stolen = unsafe { libc::tcgetpgrp(0) != shell_pgrp };
+                if policy.kill().is_err() || policy.wait().await.is_err() {
+                    return EXIT_BACKGROUND_RUN_FAILED;
+                }
+                if stolen {
+                    EXIT_FOREGROUND_STOLEN
+                } else {
+                    EXIT_OK
+                }
+            });
+            unsafe { libc::_exit(code) };
+        }
+        let mut status: i32 = 0;
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid || !libc::WIFEXITED(status) {
+            return EXIT_BACKGROUND_RUN_FAILED;
+        }
+        let code = libc::WEXITSTATUS(status);
+        if code != EXIT_OK {
+            return code;
+        }
+        if unsafe { libc::tcgetpgrp(0) != shell_pgrp } {
+            return EXIT_FOREGROUND_STOLEN;
+        }
+        EXIT_OK
+    });
+    assert_eq!(
+        code, EXIT_OK,
+        "helper exit {code} (10=no tty foreground at start, 11=fork failed, \
+         12=background run took the tty foreground from the shell, \
+         15=background spawn/kill/wait failed)"
     );
 }

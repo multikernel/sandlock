@@ -2333,9 +2333,10 @@ impl Sandbox {
 
         // Interactive (fully inherited) stdio on a terminal: the child will
         // take the tty foreground group, and this process must take it back
-        // once the child is reaped.
-        let foreground = stdio.all_inherit();
-        let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
+        // once the child is reaped. Only a caller holding the foreground may
+        // pass it on; a backgrounded run taking it starves the shell's reads.
+        let foreground = stdio.all_inherit()
+            && unsafe { libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp() };
 
         // Claim before fork so a name collision leaves no child to reap.
         let sandbox_name = self.rt().name.clone();
@@ -2478,7 +2479,7 @@ impl Sandbox {
         self.rt_mut()._stderr_read = stderr_p.map(|(r, _w)| r);
 
         self.rt_mut().child_pid = Some(pid);
-        self.rt_mut().tty_foreground_taken = tty_foreground_taken;
+        self.rt_mut().tty_foreground_taken = foreground;
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 

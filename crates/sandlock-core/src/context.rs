@@ -325,13 +325,13 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     }
     let [exec_r, exec_w] = exec_fds;
 
-    // 1. Interactive runs only: if stdin is a terminal, become the
-    //     foreground process group so interactive shells can read from the
-    //     TTY. Captured/piped runs must not: the embedding process keeps
-    //     the terminal (issue #164).
+    // 1. Interactive runs only: when the caller hands over the terminal,
+    //     become the foreground process group so interactive shells can
+    //     read from the TTY. Captured/piped runs must not: the embedding
+    //     process keeps the terminal (issue #164).
     //     Must ignore SIGTTOU first — a background pgrp calling tcsetpgrp
     //     gets stopped by SIGTTOU otherwise.
-    if foreground && unsafe { libc::isatty(0) } == 1 {
+    if foreground {
         unsafe {
             libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(0, libc::getpgrp());
