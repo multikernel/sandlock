@@ -2,11 +2,6 @@ use std::ffi::CString;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
-use super::structs::{
-    LandlockRulesetAttr, SYS_LANDLOCK_ADD_RULE, SYS_LANDLOCK_CREATE_RULESET,
-    SYS_LANDLOCK_RESTRICT_SELF,
-};
-
 // ============================================================
 // Core raw syscall wrappers
 // ============================================================
@@ -104,61 +99,6 @@ pub unsafe fn syscall4(nr: i64, a1: u64, a2: u64, a3: u64, a4: u64) -> io::Resul
 /// Caller must ensure arguments are valid for the given syscall number.
 pub unsafe fn syscall2(nr: i64, a1: u64, a2: u64) -> io::Result<i64> {
     syscall3(nr, a1, a2, 0)
-}
-
-// ============================================================
-// Landlock wrappers
-// ============================================================
-
-/// Create a Landlock ruleset.
-pub fn landlock_create_ruleset(
-    attr: &LandlockRulesetAttr,
-    size: usize,
-    flags: u32,
-) -> io::Result<OwnedFd> {
-    let fd = unsafe {
-        syscall3(
-            SYS_LANDLOCK_CREATE_RULESET,
-            attr as *const _ as u64,
-            size as u64,
-            flags as u64,
-        )?
-    };
-    // SAFETY: kernel returned a valid fd on success
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-}
-
-/// Add a rule to a Landlock ruleset.
-pub fn landlock_add_rule(
-    ruleset_fd: &OwnedFd,
-    rule_type: u32,
-    rule_attr: *const std::ffi::c_void,
-    flags: u32,
-) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        syscall4(
-            SYS_LANDLOCK_ADD_RULE,
-            ruleset_fd.as_raw_fd() as u64,
-            rule_type as u64,
-            rule_attr as u64,
-            flags as u64,
-        )?;
-    }
-    Ok(())
-}
-
-/// Enforce a Landlock ruleset on the calling thread.
-pub fn landlock_restrict_self(ruleset_fd: &OwnedFd, flags: u32) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        syscall2(
-            SYS_LANDLOCK_RESTRICT_SELF,
-            ruleset_fd.as_raw_fd() as u64,
-            flags as u64,
-        )?;
-    }
-    Ok(())
 }
 
 // ============================================================

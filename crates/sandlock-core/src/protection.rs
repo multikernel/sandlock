@@ -34,14 +34,14 @@ pub enum Protection {
 impl Protection {
     /// Minimum Landlock ABI version the host kernel must support for
     /// this protection to be available.
-    pub const fn min_abi(self) -> u32 {
+    pub const fn min_abi(self) -> landlock::ABI {
         match self {
-            Protection::FsRefer => 2,
-            Protection::FsTruncate => 3,
-            Protection::NetTcp => 4,
-            Protection::FsIoctlDev => 5,
-            Protection::SignalScope => 6,
-            Protection::AbstractUnixSocketScope => 6,
+            Protection::FsRefer => landlock::ABI::V2,
+            Protection::FsTruncate => landlock::ABI::V3,
+            Protection::NetTcp => landlock::ABI::V4,
+            Protection::FsIoctlDev => landlock::ABI::V5,
+            Protection::SignalScope => landlock::ABI::V6,
+            Protection::AbstractUnixSocketScope => landlock::ABI::V6,
         }
     }
 
@@ -68,12 +68,15 @@ mod tests {
         // These numbers come from the kernel Landlock documentation
         // (https://docs.kernel.org/userspace-api/landlock.html);
         // they MUST NOT drift.
-        assert_eq!(Protection::FsRefer.min_abi(), 2);
-        assert_eq!(Protection::FsTruncate.min_abi(), 3);
-        assert_eq!(Protection::NetTcp.min_abi(), 4);
-        assert_eq!(Protection::FsIoctlDev.min_abi(), 5);
-        assert_eq!(Protection::SignalScope.min_abi(), 6);
-        assert_eq!(Protection::AbstractUnixSocketScope.min_abi(), 6);
+        assert_eq!(Protection::FsRefer.min_abi(), landlock::ABI::V2);
+        assert_eq!(Protection::FsTruncate.min_abi(), landlock::ABI::V3);
+        assert_eq!(Protection::NetTcp.min_abi(), landlock::ABI::V4);
+        assert_eq!(Protection::FsIoctlDev.min_abi(), landlock::ABI::V5);
+        assert_eq!(Protection::SignalScope.min_abi(), landlock::ABI::V6);
+        assert_eq!(
+            Protection::AbstractUnixSocketScope.min_abi(),
+            landlock::ABI::V6
+        );
     }
 
     #[test]
@@ -171,7 +174,7 @@ impl ProtectionStatus {
     /// tests in the `tests/` directory can drive the resolver directly
     /// with synthetic ABI values; not part of the stable public surface.
     #[doc(hidden)]
-    pub fn resolve(p: Protection, host_abi: u32, pol: &ProtectionPolicy) -> Self {
+    pub fn resolve(p: Protection, host_abi: landlock::ABI, pol: &ProtectionPolicy) -> Self {
         let available = host_abi >= p.min_abi();
         match (pol.state(p), available) {
             (ProtectionState::Disabled, _) => ProtectionStatus::Disabled,

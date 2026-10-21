@@ -892,9 +892,10 @@ impl Sandbox {
     pub fn active_protections(
         &self,
     ) -> Result<Vec<(Protection, ProtectionStatus)>, crate::error::SandlockError> {
-        let host_abi = crate::landlock::abi_version().map_err(|e| {
+        let host_abi = crate::landlock_policy::abi_version().map_err(|e| {
             crate::error::SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
+        let host_abi: landlock::ABI = (host_abi as i32).into();
         Ok(Protection::all()
             .map(|p| {
                 (
@@ -1838,7 +1839,7 @@ impl Sandbox {
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
 
-            let _ = crate::landlock::confine(&sandbox_cfg);
+            let _ = crate::landlock_policy::confine(&sandbox_cfg);
 
             let deny = crate::context::blocklist_syscall_numbers(&sandbox_cfg);
             let args = crate::context::arg_filters(&sandbox_cfg);

@@ -9,15 +9,9 @@
 //! genuinely confined child to cover the end-to-end degrade path on a
 //! real low-ABI kernel; it self-skips where Landlock is unavailable.
 
-use sandlock_core::landlock::compute_fs_mask;
+use landlock::AccessFs;
+use sandlock_core::landlock_policy::compute_fs_mask;
 use sandlock_core::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
-
-// Landlock FS access constants (kernel ABI, stable). Kept local to the
-// test so we don't need to expose `crate::sys::structs`. These are bit
-// positions defined by `linux/landlock.h`.
-const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
-const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
 // ----------------------------------------------------------------------
 // ProtectionStatus::resolve() — Strict
@@ -28,7 +22,7 @@ fn strict_on_supporting_host_resolves_to_active() {
     // SignalScope needs ABI v6; host claims v6.
     let pol = ProtectionPolicy::strict_all();
     assert_eq!(
-        ProtectionStatus::resolve(Protection::SignalScope, 6, &pol),
+        ProtectionStatus::resolve(Protection::SignalScope, landlock::ABI::V6, &pol),
         ProtectionStatus::Active,
         "Strict + available host must resolve to Active"
     );
@@ -38,7 +32,7 @@ fn strict_on_supporting_host_resolves_to_active() {
 fn strictly_unavailable_returns_protection_unavailable() {
     // SignalScope needs ABI v6; host only has v5.
     let pol = ProtectionPolicy::strict_all();
-    let r = ProtectionStatus::resolve(Protection::SignalScope, 5, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, landlock::ABI::V5, &pol);
     assert_eq!(
         r,
         ProtectionStatus::Unavailable,
@@ -54,7 +48,7 @@ fn strict_all_on_v6_host_resolves_every_protection_active() {
     let pol = ProtectionPolicy::strict_all();
     for p in Protection::all() {
         assert_eq!(
-            ProtectionStatus::resolve(p, 6, &pol),
+            ProtectionStatus::resolve(p, landlock::ABI::V6, &pol),
             ProtectionStatus::Active,
             "{:?} under strict_all on v6 host must be Active",
             p
@@ -70,7 +64,7 @@ fn strict_all_on_v6_host_resolves_every_protection_active() {
 fn degradable_on_unavailable_host_resolves_to_degraded() {
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::SignalScope, ProtectionState::Degradable);
-    let r = ProtectionStatus::resolve(Protection::SignalScope, 5, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, landlock::ABI::V5, &pol);
     assert_eq!(
         r,
         ProtectionStatus::Degraded,
@@ -84,7 +78,7 @@ fn degradable_on_supporting_host_resolves_to_active() {
     pol.set(Protection::FsTruncate, ProtectionState::Degradable);
     // FsTruncate needs v3.
     assert_eq!(
-        ProtectionStatus::resolve(Protection::FsTruncate, 6, &pol),
+        ProtectionStatus::resolve(Protection::FsTruncate, landlock::ABI::V6, &pol),
         ProtectionStatus::Active,
         "Degradable + available host must enforce (Active)"
     );
@@ -98,7 +92,7 @@ fn degradable_on_supporting_host_resolves_to_active() {
 fn disabled_on_supporting_host_resolves_to_disabled() {
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::SignalScope, ProtectionState::Disabled);
-    let r = ProtectionStatus::resolve(Protection::SignalScope, 6, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, landlock::ABI::V6, &pol);
     assert_eq!(
         r,
         ProtectionStatus::Disabled,
@@ -110,7 +104,7 @@ fn disabled_on_supporting_host_resolves_to_disabled() {
 fn disabled_on_unavailable_host_resolves_to_disabled() {
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::SignalScope, ProtectionState::Disabled);
-    let r = ProtectionStatus::resolve(Protection::SignalScope, 5, &pol);
+    let r = ProtectionStatus::resolve(Protection::SignalScope, landlock::ABI::V5, &pol);
     assert_eq!(
         r,
         ProtectionStatus::Disabled,
@@ -129,27 +123,27 @@ fn strict_all_on_v4_host_fails_only_for_v5_plus_protections() {
     // AbstractUnixSocketScope (v6).
     let pol = ProtectionPolicy::strict_all();
     assert_eq!(
-        ProtectionStatus::resolve(Protection::FsRefer, 4, &pol),
+        ProtectionStatus::resolve(Protection::FsRefer, landlock::ABI::V4, &pol),
         ProtectionStatus::Active
     );
     assert_eq!(
-        ProtectionStatus::resolve(Protection::FsTruncate, 4, &pol),
+        ProtectionStatus::resolve(Protection::FsTruncate, landlock::ABI::V4, &pol),
         ProtectionStatus::Active
     );
     assert_eq!(
-        ProtectionStatus::resolve(Protection::NetTcp, 4, &pol),
+        ProtectionStatus::resolve(Protection::NetTcp, landlock::ABI::V4, &pol),
         ProtectionStatus::Active
     );
     assert_eq!(
-        ProtectionStatus::resolve(Protection::FsIoctlDev, 4, &pol),
+        ProtectionStatus::resolve(Protection::FsIoctlDev, landlock::ABI::V4, &pol),
         ProtectionStatus::Unavailable
     );
     assert_eq!(
-        ProtectionStatus::resolve(Protection::SignalScope, 4, &pol),
+        ProtectionStatus::resolve(Protection::SignalScope, landlock::ABI::V4, &pol),
         ProtectionStatus::Unavailable
     );
     assert_eq!(
-        ProtectionStatus::resolve(Protection::AbstractUnixSocketScope, 4, &pol),
+        ProtectionStatus::resolve(Protection::AbstractUnixSocketScope, landlock::ABI::V4, &pol),
         ProtectionStatus::Unavailable
     );
 }
@@ -164,7 +158,7 @@ fn fully_degradable_policy_never_returns_strictly_unavailable_even_on_v1() {
         pol.set(p, ProtectionState::Degradable);
     }
     for p in Protection::all() {
-        let r = ProtectionStatus::resolve(p, 1, &pol);
+        let r = ProtectionStatus::resolve(p, landlock::ABI::V1, &pol);
         assert!(
             matches!(r, ProtectionStatus::Active | ProtectionStatus::Degraded),
             "{:?} on v1 host with Degradable must not be StrictlyUnavailable, got {:?}",
@@ -190,21 +184,20 @@ fn fully_degradable_policy_never_returns_strictly_unavailable_even_on_v1() {
 #[test]
 fn degradable_fs_truncate_on_v1_host_masks_off_truncate_bit() {
     // FsTruncate needs ABI v3; host claims v1. Marking it Degradable
-    // must drop LANDLOCK_ACCESS_FS_TRUNCATE from the handled-fs mask
-    // (it shouldn't be there from base_fs_access(1) either, but we
+    // must drop AccessFs::Truncate from the handled-fs mask
+    // (it shouldn't be there from base_fs_access(landlock::ABI::V1) either, but we
     // assert the post-mask invariant directly).
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsTruncate, ProtectionState::Degradable);
     // Sanity: the protection resolves Degraded on this host.
     assert_eq!(
-        ProtectionStatus::resolve(Protection::FsTruncate, 1, &pol),
+        ProtectionStatus::resolve(Protection::FsTruncate, landlock::ABI::V1, &pol),
         ProtectionStatus::Degraded
     );
-    let mask = compute_fs_mask(1, &pol);
-    assert_eq!(
-        mask & LANDLOCK_ACCESS_FS_TRUNCATE,
-        0,
-        "Degraded FsTruncate must not leave its bit in handled_access_fs (mask=0x{:x})",
+    let mask = compute_fs_mask(landlock::ABI::V1, &pol);
+    assert!(
+        !mask.contains(AccessFs::Truncate),
+        "Degraded FsTruncate must not leave its bit in handled_access_fs (mask={:?})",
         mask
     );
 }
@@ -212,18 +205,17 @@ fn degradable_fs_truncate_on_v1_host_masks_off_truncate_bit() {
 #[test]
 fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
     // FsRefer needs ABI v2; host claims v1. Marking it Degradable
-    // must drop LANDLOCK_ACCESS_FS_REFER from the handled-fs mask.
+    // must drop AccessFs::Refer from the handled-fs mask.
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsRefer, ProtectionState::Degradable);
     assert_eq!(
-        ProtectionStatus::resolve(Protection::FsRefer, 1, &pol),
+        ProtectionStatus::resolve(Protection::FsRefer, landlock::ABI::V1, &pol),
         ProtectionStatus::Degraded
     );
-    let mask = compute_fs_mask(1, &pol);
-    assert_eq!(
-        mask & LANDLOCK_ACCESS_FS_REFER,
-        0,
-        "Degraded FsRefer must not leave its bit in handled_access_fs (mask=0x{:x})",
+    let mask = compute_fs_mask(landlock::ABI::V1, &pol);
+    assert!(
+        !mask.contains(AccessFs::Refer),
+        "Degraded FsRefer must not leave its bit in handled_access_fs (mask={:?})",
         mask
     );
 }
@@ -231,18 +223,17 @@ fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
 #[test]
 fn degradable_fs_ioctl_dev_on_v4_host_masks_off_ioctl_dev_bit() {
     // FsIoctlDev needs ABI v5; host claims v4. Marking it Degradable
-    // must drop LANDLOCK_ACCESS_FS_IOCTL_DEV from the handled-fs mask.
+    // must drop AccessFs::IoctlDev from the handled-fs mask.
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsIoctlDev, ProtectionState::Degradable);
     assert_eq!(
-        ProtectionStatus::resolve(Protection::FsIoctlDev, 4, &pol),
+        ProtectionStatus::resolve(Protection::FsIoctlDev, landlock::ABI::V4, &pol),
         ProtectionStatus::Degraded
     );
-    let mask = compute_fs_mask(4, &pol);
-    assert_eq!(
-        mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
-        0,
-        "Degraded FsIoctlDev must not leave its bit in handled_access_fs (mask=0x{:x})",
+    let mask = compute_fs_mask(landlock::ABI::V4, &pol);
+    assert!(
+        !mask.contains(AccessFs::IoctlDev),
+        "Degraded FsIoctlDev must not leave its bit in handled_access_fs (mask={:?})",
         mask
     );
 }
@@ -410,7 +401,7 @@ fn confine_filesystem_succeeds_in_child(sandbox: &sandlock_core::Sandbox) -> i32
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             unsafe { libc::_exit(2) };
         }
-        let code = match sandlock_core::landlock::confine_filesystem(sandbox) {
+        let code = match sandlock_core::landlock_policy::confine_filesystem(sandbox) {
             Ok(()) => 0,
             Err(_) => 1,
         };
@@ -427,7 +418,7 @@ fn disable_fs_protection_with_writable_path_does_not_einval() {
     // Needs a real v6+ host: the default policy keeps the v6 scope
     // protections Strict, so confine_filesystem would otherwise abort
     // with ProtectionUnavailable before reaching the FS rules.
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -530,12 +521,12 @@ async fn degraded_policy_confines_and_runs_below_v6() {
 
     // Below ABI 6, every scope the host cannot provide must resolve to
     // Degraded — not Unavailable, which is what makes `confine` refuse.
-    if abi < 6 {
+    if abi < landlock::ABI::V6 as u32 {
         let states = sandbox
             .active_protections()
             .expect("resolve protections against host ABI");
         for (p, status) in &states {
-            if p.min_abi() > abi {
+            if p.min_abi() as u32 > abi {
                 assert_eq!(
                     *status,
                     ProtectionStatus::Degraded,

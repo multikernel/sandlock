@@ -342,7 +342,7 @@ async fn test_path_rule_on_fifo_does_not_block() {
 
 #[tokio::test]
 async fn test_isolate_ipc() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -443,7 +443,7 @@ async fn test_isolate_ipc() {
 // So a pass attributes the block to the scope and nothing else.
 #[tokio::test]
 async fn test_abstract_unix_socket_contained() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -563,7 +563,7 @@ async fn test_abstract_unix_socket_contained() {
 // so the connect must fail with EACCES.
 #[tokio::test]
 async fn test_named_unix_socket_connect_denied_without_fs_write() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -666,7 +666,7 @@ async fn test_named_unix_socket_connect_denied_without_fs_write() {
 // a future regression from turning the gate into a blanket deny-all.
 #[tokio::test]
 async fn test_named_unix_socket_connect_allowed_with_fs_write() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -755,7 +755,7 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
 // is ungranted, so the connect must be denied with EACCES.
 #[tokio::test]
 async fn test_named_unix_socket_symlink_escape_denied() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -861,7 +861,7 @@ async fn test_named_unix_socket_symlink_escape_denied() {
 // under an fs-write grant must be denied with EACCES.
 #[tokio::test]
 async fn test_named_unix_dgram_sendto_denied_without_fs_write() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -948,7 +948,7 @@ async fn test_named_unix_dgram_sendto_denied_without_fs_write() {
 // named socket outside the fs-write grants must be denied with EACCES.
 #[tokio::test]
 async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -1037,7 +1037,7 @@ async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
 // an IP destination rule so the same delivery can be asserted with a destination
 // policy active.
 async fn dgram_allow_delivers(which: &str, tag: &str, net_allow: Option<&str>) {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -1198,7 +1198,7 @@ async fn test_named_unix_dgram_sendto_delivers_under_destination_policy() {
 // grants must be denied (EACCES).
 #[tokio::test]
 async fn test_named_unix_dgram_sendmmsg_denied_without_fs_write() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -1313,7 +1313,7 @@ fn sendmmsg_ctypes_preamble() -> &'static str {
 // sendmmsg_named_unix_on_behalf's success path, which the deny test misses).
 #[tokio::test]
 async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -1410,7 +1410,7 @@ async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
 
 #[tokio::test]
 async fn test_isolate_signals_blocks_parent() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -1463,7 +1463,7 @@ async fn test_isolate_signals_blocks_parent() {
 
 #[tokio::test]
 async fn test_isolate_signals_allows_self() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
@@ -1647,7 +1647,7 @@ async fn test_deny_openat2_does_not_bypass() {
 /// nothing.
 #[tokio::test]
 async fn test_abstract_unix_dgram_sendto_refused_under_destination_policy() {
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < landlock::ABI::V6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }

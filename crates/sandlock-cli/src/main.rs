@@ -447,7 +447,7 @@ async fn main() -> Result<()> {
                     println!();
                     println!("Per-protection availability (host Landlock ABI v{}):", v);
                     for p in sandlock_core::Protection::all() {
-                        let available = v >= p.min_abi();
+                        let available = v >= p.min_abi() as u32;
                         let marker = if available {
                             "available"
                         } else {

@@ -951,7 +951,7 @@ fn try_protection_from_raw(raw: u32) -> Option<Protection> {
 #[no_mangle]
 pub extern "C" fn sandlock_protection_min_abi(protection: u32) -> u32 {
     match try_protection_from_raw(protection) {
-        Some(p) => p.min_abi(),
+        Some(p) => p.min_abi() as u32,
         None => 0,
     }
 }

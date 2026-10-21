@@ -1,32 +1,6 @@
 // Kernel struct definitions matching ABI exactly for x86_64
 
 // ============================================================
-// Landlock structs
-// ============================================================
-
-/// Ruleset attributes for landlock_create_ruleset (24 bytes)
-#[repr(C)]
-pub struct LandlockRulesetAttr {
-    pub handled_access_fs: u64,
-    pub handled_access_net: u64,
-    pub scoped: u64,
-}
-
-/// Path beneath attribute for landlock_add_rule (12 bytes, packed)
-#[repr(C, packed)]
-pub struct LandlockPathBeneathAttr {
-    pub allowed_access: u64,
-    pub parent_fd: i32,
-}
-
-/// Network port attribute for landlock_add_rule (16 bytes)
-#[repr(C)]
-pub struct LandlockNetPortAttr {
-    pub allowed_access: u64,
-    pub port: u64,
-}
-
-// ============================================================
 // Seccomp structs
 // ============================================================
 
@@ -95,51 +69,7 @@ unsafe impl Sync for SockFprog {}
 // ============================================================
 
 pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
-pub const SYS_LANDLOCK_ADD_RULE: i64 = 445;
-pub const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
 pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
-
-// ============================================================
-// Landlock FS access flags (bits 0-15)
-// ============================================================
-
-pub const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
-pub const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
-pub const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
-pub const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
-pub const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
-pub const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
-pub const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
-pub const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
-pub const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
-pub const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
-pub const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
-pub const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
-pub const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
-pub const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
-pub const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-pub const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
-
-// ============================================================
-// Landlock net access flags
-// ============================================================
-
-pub const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
-pub const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
-
-// ============================================================
-// Landlock rule types
-// ============================================================
-
-pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
-pub const LANDLOCK_RULE_NET_PORT: u32 = 2;
-
-// ============================================================
-// Landlock scope flags
-// ============================================================
-
-pub const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
-pub const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
 
 // ============================================================
 // Seccomp constants

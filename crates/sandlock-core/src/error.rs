@@ -75,8 +75,8 @@ pub enum ConfinementError {
     #[error("required protection {protection:?} is not available: host Landlock ABI is v{host_abi}, requires v{required_abi}")]
     ProtectionUnavailable {
         protection: crate::protection::Protection,
-        required_abi: u32,
-        host_abi: u32,
+        required_abi: landlock::ABI,
+        host_abi: landlock::ABI,
     },
 
     #[error("landlock error: {0}")]
@@ -84,6 +84,9 @@ pub enum ConfinementError {
 
     #[error("seccomp error: {0}")]
     Seccomp(#[from] SeccompError),
+
+    #[error("ruleset error: {0}")]
+    Ruleset(#[from] landlock::RulesetError),
 }
 
 #[derive(Debug, Error)]
@@ -143,3 +146,9 @@ pub enum BranchError {
 
 /// Convenience type alias.
 pub type Result<T> = std::result::Result<T, SandlockError>;
+
+impl From<landlock::RulesetError> for SandlockError {
+    fn from(value: landlock::RulesetError) -> Self {
+        Self::Runtime(SandboxRuntimeError::Confinement(value.into()))
+    }
+}

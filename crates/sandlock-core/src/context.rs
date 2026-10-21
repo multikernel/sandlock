@@ -450,9 +450,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     // 8. Apply Landlock confinement (IRREVERSIBLE)
     let confined = if no_supervisor {
-        crate::landlock::confine(sandbox)
+        crate::landlock_policy::confine(sandbox)
     } else {
-        crate::landlock::confine_supervised(sandbox)
+        crate::landlock_policy::confine_supervised(sandbox)
     };
     if let Err(e) = confined {
         fail!(format!("landlock: {}", e));
