@@ -671,15 +671,15 @@ later from any thread; see [deferred approval](../docs/policy-fn.md#deferred-app
 Use `policy_fn` to make per-syscall decisions at runtime:
 
 ```python
-from sandlock import Sandbox, PolicyFn, SyscallEvent, PolicyContext
+from sandlock import Sandbox, PolicyFn, SyscallEvent, PolicyContext, Allow, Deny
 
 def my_policy(event: SyscallEvent, ctx: PolicyContext):
     if event.category == "network" and event.host == "evil.com":
-        return True   # deny
+        return Deny()
     if event.category == "filesystem" and "/secrets" in (event.path or ""):
         ctx.deny_path("/secrets")
-        return True   # deny
-    return False      # allow
+        return Deny()
+    return Allow()
 
 sb = Sandbox(..., policy_fn=PolicyFn(my_policy))
 ```
@@ -725,11 +725,13 @@ Callback return values:
 
 | Return | Meaning |
 |--------|---------|
-| `None`, `False`, `0` | Allow |
-| `True`, `-1` | Deny (EPERM) |
-| positive `int` | Deny with that errno |
-| `"audit"`, `-2` | Allow but flag for audit |
+| `Allow()`, `None` | Allow |
+| `Deny()` | Deny (EPERM) |
+| `Deny(errno)` | Deny with that errno |
+| `Audit()` | Allow but flag for audit |
 | `Grant(net_allow=specs)` | Widen the network within `approvable`, then allow |
+
+Any other return value raises `TypeError` and denies the syscall.
 
 ### Fork
 

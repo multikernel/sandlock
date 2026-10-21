@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from sandlock import Sandbox, PolicyFn, Permissions, Grant, SyscallEvent, PolicyContext
+from sandlock import Sandbox, PolicyFn, Permissions, Allow, Audit, Deny, Grant, SyscallEvent, PolicyContext
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -202,7 +202,7 @@ class TestPolicyFnRestrict:
         def restrict_to_64mb(event, ctx):
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_max_memory(64 * 1024 * 1024)
-            return 0
+            return Allow()
 
         # Restricted: 128 MiB exceeds the tightened 64 MiB limit -> killed.
         restricted = _policy(max_memory="256M", policy_fn=PolicyFn(restrict_to_64mb)).run(
@@ -241,7 +241,7 @@ class TestPolicyFnRestrict:
         def restrict_to_1(event, ctx):
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_max_processes(1)
-            return 0
+            return Allow()
 
         restricted = _policy(policy_fn=PolicyFn(restrict_to_1)).run(
             [sys.executable, "-c", fork_once], timeout=15
@@ -253,7 +253,7 @@ class TestPolicyFnRestrict:
         assert "FORK_DENIED 11" in out, out          # EAGAIN from the limit
 
         # Control: no restriction -> the same fork succeeds.
-        baseline = _policy(policy_fn=PolicyFn(lambda e, ctx: 0)).run(
+        baseline = _policy(policy_fn=PolicyFn(lambda e, ctx: Allow())).run(
             [sys.executable, "-c", fork_once], timeout=15
         )
         assert baseline.success, baseline.error
@@ -266,7 +266,7 @@ class TestPolicyFnRestrict:
 
 class TestPolicyFnVerdict:
     def test_deny_with_errno(self):
-        """Returning a positive int denies with *that* errno — attributable to policy_fn.
+        """Deny(errno) denies with *that* errno — attributable to policy_fn.
 
         The previous version connected to 127.0.0.1:1, which is outside the
         ``net_allow`` allowlist, so Landlock denies it with the same errno 13 —
@@ -278,8 +278,8 @@ class TestPolicyFnVerdict:
 
         def on_event(event, ctx):
             if event.syscall == "connect":
-                return errno.EACCES  # 13
-            return 0
+                return Deny(errno.EACCES)
+            return Allow()
 
         with _loopback_listener() as (host, port):
             script = (
@@ -299,29 +299,31 @@ class TestPolicyFnVerdict:
         assert out == "ERR:13", f"expected policy_fn EACCES (13), got: {out!r}"
 
     def test_audit_allows(self):
-        """Return 'audit' or -2 to allow but flag."""
+        """Audit() allows but flags."""
         def on_event(event, ctx):
             if event.category == "filesystem":
-                return "audit"
-            return 0
+                return Audit()
+            return Allow()
 
         result = _policy(policy_fn=PolicyFn(on_event)).run(
             ["cat", "/etc/hostname"]
         )
         assert result.success, "audit should allow the syscall"
 
-    def test_unrecognized_return_fails_closed(self):
-        """An unrecognized return value denies rather than silently allowing."""
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+    @pytest.mark.parametrize("bogus", ["bogus", 0, False, True, -1, -2, 13, "audit"])
+    def test_unrecognized_return_fails_closed(self, bogus):
+        """Anything but a verdict or None denies rather than being guessed at."""
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
-                return "bogus"  # not a recognized verdict
-            return 0
+                return bogus
+            return Allow()
 
         result = _policy(policy_fn=PolicyFn(on_event)).run(["echo", "should-not-run"])
         assert not result.success, "unrecognized verdict must fail closed (deny)"
 
     def test_deny_returns_true(self):
-        """Returning True denies connect with EPERM — and the process keeps running.
+        """Deny() denies connect with EPERM — and the process keeps running.
 
         The target is a live listener on an allowlisted port, so without the
         policy_fn deny the connect would *succeed*. EPERM (errno 1) therefore
@@ -329,8 +331,7 @@ class TestPolicyFnVerdict:
         kill the process (the backward-compat contract).
         """
         def on_event(event, ctx):
-            # True only for connect (deny); allow everything else.
-            return event.syscall == "connect"
+            return Deny() if event.syscall == "connect" else Allow()
 
         with _loopback_listener() as (host, port):
             script = (
@@ -360,7 +361,7 @@ class TestPolicyFnVerdict:
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
                 ctx.deny_path("/etc/hostname")
-            return 0
+            return Allow()
 
         result = _policy(policy_fn=PolicyFn(on_event)).run(
             ["python3", "-c",
@@ -414,22 +415,22 @@ class TestPolicyFnPerPid:
 @pytest.mark.parametrize("verdict_timeout", [-1, float("inf"), float("nan"), 1e30])
 def test_invalid_verdict_timeout(verdict_timeout):
     with pytest.raises(ValueError, match="verdict_timeout"):
-        PolicyFn(lambda event, ctx: 0, verdict_timeout=verdict_timeout)
+        PolicyFn(lambda event, ctx: Allow(), verdict_timeout=verdict_timeout)
 
 
 @pytest.mark.parametrize("events", [set(), {"bogus"}, {"network", "dns"}])
 def test_invalid_events(events):
     with pytest.raises(ValueError, match="events"):
-        PolicyFn(lambda event, ctx: 0, events=events)
+        PolicyFn(lambda event, ctx: Allow(), events=events)
 
 
 def test_events_rejects_bare_string():
     with pytest.raises(TypeError, match="events"):
-        PolicyFn(lambda event, ctx: 0, events="network")
+        PolicyFn(lambda event, ctx: Allow(), events="network")
 
 
 def test_events_default_to_all_categories():
-    assert PolicyFn(lambda event, ctx: 0).events == {"filesystem", "network", "process"}
+    assert PolicyFn(lambda event, ctx: Allow()).events == {"filesystem", "network", "process"}
 
 
 def test_network_events_only():
@@ -442,7 +443,7 @@ def test_network_events_only():
             ctx.deny_path("/etc/hostname")
         except RuntimeError as e:
             deny_errors.append(e)
-        return 0
+        return Allow()
 
     with _loopback_listener() as (host, port):
         result = _policy(
@@ -466,7 +467,7 @@ def test_verdict_timeout_denies_late_allow():
     def on_event(event, ctx):
         if event.syscall == "execve":
             time.sleep(0.15)
-        return 0
+        return Allow()
 
     result = _policy(policy_fn=PolicyFn(on_event, verdict_timeout=0.02)).run(["/bin/true"])
     assert not result.success
@@ -486,7 +487,7 @@ def test_shutdown_cancels_unlimited_approval():
                 time.sleep(0.001)
             if ctx.is_cancelled():
                 cancelled.set()
-        return 0
+        return Allow()
 
     result = _policy(policy_fn=PolicyFn(on_event, verdict_timeout=None)).run(
         ["/bin/true"], timeout=0.2,
@@ -503,7 +504,13 @@ def test_policy_fn_requires_callable():
 
 def test_sandbox_requires_policy_fn_configuration():
     with pytest.raises(TypeError, match="PolicyFn"):
-        Sandbox(policy_fn=lambda event, ctx: 0)
+        Sandbox(policy_fn=lambda event, ctx: Allow())
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5])
+def test_deny_rejects_bad_errno(bad):
+    with pytest.raises(ValueError):
+        Deny(bad)
 
 
 def _approve_from_thread(verdict):
@@ -521,7 +528,7 @@ def _approve_from_thread(verdict):
     return approvals, worker
 
 
-@pytest.mark.parametrize("verdict, success", [(None, True), (13, False), (True, False)])
+@pytest.mark.parametrize("verdict, success", [(None, True), (Allow(), True), (Deny(13), False), (Deny(), False)])
 def test_deferred_approval_resolved_from_another_thread(verdict, success):
     approvals, worker = _approve_from_thread(verdict)
 
@@ -688,7 +695,7 @@ def test_sync_callback_returns_grant():
     def on_event(event, ctx):
         if event.syscall == "connect":
             return Grant(net_allow=["127.0.0.1:*"])
-        return 0
+        return Allow()
 
     with _loopback_listener("127.0.0.1") as (_, port):
         result = _policy(policy_fn=PolicyFn(

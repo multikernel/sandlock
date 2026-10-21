@@ -203,6 +203,29 @@ class Permissions:
         object.__setattr__(self, "net_allow", tuple(self.net_allow))
 
 
+@dataclass(frozen=True)
+class Allow:
+    """A verdict that lets the syscall proceed. Returning None also allows."""
+
+
+@dataclass(frozen=True)
+class Audit:
+    """A verdict that allows the syscall and flags it for audit."""
+
+
+@dataclass(frozen=True)
+class Deny:
+    """A verdict that denies the syscall with ``errno``, EPERM by default."""
+
+    errno: int | None = None
+
+    def __post_init__(self):
+        if self.errno is not None and (
+            type(self.errno) is not int or self.errno <= 0
+        ):
+            raise ValueError(f"errno must be a positive int, got {self.errno!r}")
+
+
 @dataclass(frozen=True, kw_only=True)
 class Grant(Permissions):
     """A verdict that widens the live rules for good, within

@@ -12,17 +12,17 @@ returns a verdict to allow, deny, or audit.
 ## Python
 
 ```python
-from sandlock import Sandbox, PolicyFn
+from sandlock import Sandbox, PolicyFn, Allow, Audit, Deny
 import errno
 
 def on_event(event, ctx):
     # Block download tools by argv
     if event.syscall == "execve" and event.argv_contains("curl"):
-        return True  # deny
+        return Deny()
 
     # Deny connections to a specific IP
     if event.syscall == "connect" and event.host == "10.0.0.5":
-        return errno.EACCES
+        return Deny(errno.EACCES)
 
     # Lock down once the program has finished starting up
     if event.syscall == "execve":
@@ -31,9 +31,9 @@ def on_event(event, ctx):
 
     # Audit every filesystem access (allow but flag)
     if event.category == "filesystem":
-        return "audit"
+        return Audit()
 
-    return 0  # allow
+    return Allow()
 
 sandbox = Sandbox(
     fs_readable=["/usr", "/lib", "/etc"],
@@ -43,10 +43,10 @@ sandbox = Sandbox(
 result = sandbox.run(["python3", "agent.py"])
 ```
 
-**Verdicts:** `0`/`False` = allow, `True`/`-1` = deny (EPERM),
-positive int = deny with errno, `"audit"`/`-2` = allow + flag,
-`Grant(net_allow=[...])` = widen the network, then allow (see
-[Approve network on demand](#approve-network-on-demand)).
+**Verdicts:** `Allow()` (or `None`), `Deny()` (EPERM), `Deny(errno)`,
+`Audit()` = allow + flag, `Grant(net_allow=[...])` = widen the network, then
+allow (see [Approve network on demand](#approve-network-on-demand)). Any other
+return value raises `TypeError` and denies.
 
 **Event fields:** `syscall`, `category` (filesystem/network/process),
 `pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
@@ -209,8 +209,8 @@ sandbox = Sandbox(policy_fn=PolicyFn(on_event, deferred=True, verdict_timeout=No
 | Go | `PolicyFn{Deferred: cb}` | `Resolve(decision)` | `Close()` | `IsCancelled()` |
 | C | `sandlock_sandbox_builder_policy_fn_deferred` | `sandlock_approval_resolve` | `sandlock_approval_free` | `sandlock_approval_is_cancelled` |
 
-`resolve` takes the same verdict encoding as a synchronous callback's return
-value.
+`resolve` takes the same verdicts a synchronous callback returns; in C that
+is the integer encoding `0` allow, `-1` deny, `-2` audit, positive errno.
 
 ## Approve network on demand
 
@@ -224,14 +224,14 @@ returns it and a deferred one resolves its approval with it.
 
 ```python
 import errno
-from sandlock import Sandbox, PolicyFn, Permissions, Grant
+from sandlock import Sandbox, PolicyFn, Permissions, Allow, Deny, Grant
 
 def on_event(event, ctx):
     if event.syscall != "connect":
-        return 0
+        return Allow()
     if ask_human(f"{event.host}:{event.port}?"):
         return Grant(net_allow=["*:*"])   # widen for good, then allow this one
-    return errno.ECONNREFUSED
+    return Deny(errno.ECONNREFUSED)
 
 sandbox = Sandbox(
     net_deny=["169.254.169.254"],

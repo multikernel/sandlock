@@ -768,19 +768,16 @@ class PolicyContext:
         _lib.sandlock_ctx_allow_path(self._ptr, _encode(path))
 
 
-def _verdict_code(result) -> int:
-    """Encode a callback verdict: None/False/0 allow, True/-1 deny (EPERM),
-    a positive int denies with that errno, "audit"/-2 audits. Anything else
-    fails closed."""
-    if result is None or result is False or result == 0:
+def _verdict_code(verdict) -> int:
+    from .sandbox import Allow, Audit, Deny
+
+    if verdict is None or isinstance(verdict, Allow):
         return 0
-    if result is True or result == -1:
-        return -1
-    if result == "audit" or result == -2:
+    if isinstance(verdict, Audit):
         return -2
-    if isinstance(result, int) and result > 0:
-        return result
-    return -1
+    if isinstance(verdict, Deny):
+        return verdict.errno or -1
+    raise TypeError(f"not a policy_fn verdict: {verdict!r}")
 
 
 class Approval:
@@ -797,25 +794,33 @@ class Approval:
         return ptr
 
     def resolve(self, verdict) -> None:
-        """Answer with a value a synchronous callback could return. A refused
-        ``Grant`` denies the operation, then raises."""
+        """Answer with a verdict a synchronous callback could return. A refused
+        ``Grant`` or a value that is not a verdict denies, then raises."""
         from .sandbox import Grant
 
-        if isinstance(verdict, Grant):
-            arr, n = _spec_array(list(verdict.net_allow))
         ptr = self._take()
         if ptr is None:
             raise RuntimeError("approval already answered")
+        try:
+            if isinstance(verdict, Grant):
+                arr, n = _spec_array(list(verdict.net_allow))
+            else:
+                code = _verdict_code(verdict)
+        except BaseException:
+            _lib.sandlock_approval_free(ptr)
+            raise
         if isinstance(verdict, Grant):
             _check_grant(_lib.sandlock_approval_grant_net_allow(ptr, arr, n))
         else:
-            _lib.sandlock_approval_resolve(ptr, _verdict_code(verdict))
+            _lib.sandlock_approval_resolve(ptr, code)
 
     def allow(self) -> None:
         self.resolve(None)
 
     def deny(self, errno: int | None = None) -> None:
-        self.resolve(errno if errno else True)
+        from .sandbox import Deny
+
+        self.resolve(Deny(errno))
 
     @property
     def cancelled(self) -> bool:
