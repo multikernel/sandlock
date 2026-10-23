@@ -1413,6 +1413,7 @@ name = "sandlock-ffi"
 version = "0.9.0"
 dependencies = [
  "libc",
+ "log",
  "ring",
  "sandlock-core",
  "serde_json",

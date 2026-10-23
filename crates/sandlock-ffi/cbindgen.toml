@@ -56,6 +56,7 @@ include = [
     "sandlock_action_kind_t",
     "sandlock_exception_policy_t",
     "sandlock_policy_ud_drop_t",
+    "sandlock_log_fn_t",
 ]
 exclude = [
     "SandboxBuilder",

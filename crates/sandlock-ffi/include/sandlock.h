@@ -66,6 +66,31 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 #define SANDLOCK_INJECT_NO_CLOEXEC (1 << 1)
 
 /**
+ * `level` of an error record, and the `max_level` that keeps only errors.
+ */
+#define SANDLOCK_LOG_ERROR 1
+
+/**
+ * `level` of a warning record.
+ */
+#define SANDLOCK_LOG_WARN 2
+
+/**
+ * `level` of an informational record.
+ */
+#define SANDLOCK_LOG_INFO 3
+
+/**
+ * `level` of a debug record.
+ */
+#define SANDLOCK_LOG_DEBUG 4
+
+/**
+ * `level` of a trace record.
+ */
+#define SANDLOCK_LOG_TRACE 5
+
+/**
  * Why a sandboxed process terminated. `EXITED` carries an exit code
  * (`sandlock_result_exit_code`); `SIGNALED` carries the signal number
  * (`sandlock_result_signal`). Linux bottoms both a timeout and an OOM kill out
@@ -379,6 +404,12 @@ typedef struct {
  * callback reference.
  */
 typedef void (*sandlock_policy_ud_drop_t)(void *user_data);
+
+/**
+ * C log sink. `level` is a `SANDLOCK_LOG_*` value; `message` is UTF-8 and
+ * valid only for the call.
+ */
+typedef void (*sandlock_log_fn_t)(uint32_t level, const char *message, void *user_data);
 
 #ifdef __cplusplus
 extern "C" {
@@ -1886,6 +1917,22 @@ sandlock_result_t *sandlock_run_interactive_with_handlers(const sandlock_sandbox
                                                           uint32_t argc,
                                                           const sandlock_handler_registration_t *registrations,
                                                           uintptr_t nregistrations);
+
+/**
+ * Send sandlock's diagnostics up to `max_level` (a `SANDLOCK_LOG_*` value, 0
+ * for none) to `cb`, or stop sending them when `cb` is NULL. Without a
+ * logger the library is silent. Records arrive on a sandlock thread and are
+ * dropped while the sink falls behind. Returns 0, or `-EBUSY` when another
+ * `log` logger already owns this process.
+ *
+ * # Safety
+ * `cb` must stay callable and `user_data` usable from another thread until a
+ * later call replaces them; once that call returns, neither is used again.
+ * `cb` must not call `sandlock_set_logger` and must not unwind.
+ */
+int sandlock_set_logger(void (*cb)(uint32_t level, const char *message, void *user_data),
+                        uint32_t max_level,
+                        void *user_data);
 
 #ifdef __cplusplus
 }  // extern "C"

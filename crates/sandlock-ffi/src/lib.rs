@@ -13,6 +13,7 @@ use sandlock_core::sandbox::{BranchAction, SandboxBuilder};
 use sandlock_core::{ExitStatus, Protection, RunResult, Sandbox, StdioMode};
 
 pub mod handler;
+pub mod logging;
 pub mod notif_repr;
 mod runtime;
 
@@ -1342,8 +1343,8 @@ pub unsafe extern "C" fn sandlock_popen(
         _ => {
             // Fail loud, not into an indistinguishable NULL: name the offending
             // discriminant(s) so the binding author sees why the handle is null.
-            eprintln!(
-                "sandlock: sandlock_popen rejected an unknown StdioMode \
+            log::error!(
+                "sandlock_popen rejected an unknown StdioMode \
                  (stdin={stdin_mode}, stdout={stdout_mode}, stderr={stderr_mode}); \
                  valid values are 0=inherit, 1=piped, 2=null"
             );

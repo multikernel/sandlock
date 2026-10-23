@@ -22,8 +22,8 @@ thread_local! {
     static RT: OnceCell<Runtime> = const { OnceCell::new() };
 }
 
-/// Build a fresh `current_thread` Tokio runtime. Logs the error to
-/// stderr on failure so environment-incompatibility cases (e.g. seccomp
+/// Build a fresh `current_thread` Tokio runtime. Logs the error on
+/// failure so environment-incompatibility cases (e.g. seccomp
 /// blocking a syscall the runtime needs at startup) surface to the
 /// caller instead of being swallowed into a NULL pointer return.
 pub(crate) fn build_runtime() -> Option<Runtime> {
@@ -95,9 +95,9 @@ pub(crate) fn with_runtime_unwind<R>(f: impl FnOnce(&Runtime) -> R) -> Option<R>
 }
 
 fn log_build_error(e: &io::Error) {
-    eprintln!("sandlock: failed to build tokio runtime: {e}");
+    log::error!("failed to build tokio runtime: {e}");
 }
 
 fn log_runtime_panic() {
-    eprintln!("sandlock: tokio runtime panicked while driving an FFI call");
+    log::error!("tokio runtime panicked while driving an FFI call");
 }
