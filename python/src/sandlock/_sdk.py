@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import ctypes.util
 import datetime
 import errno
 import json
+import logging
 import os
 import signal
 import sys
@@ -54,6 +56,29 @@ def _find_lib() -> str:
     )
 
 _lib = ctypes.CDLL(_find_lib())
+
+# The native library never writes to stderr; its diagnostics go to the
+# "sandlock" logger, silent until the application configures logging.
+_logger = logging.getLogger("sandlock")
+_logger.addHandler(logging.NullHandler())
+
+_LOG_FN_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_void_p)
+_lib.sandlock_set_logger.restype = ctypes.c_int
+_lib.sandlock_set_logger.argtypes = [_LOG_FN_TYPE, ctypes.c_uint32, ctypes.c_void_p]
+
+_SANDLOCK_LOG_DEBUG = 4
+_LOG_LEVELS = {1: logging.ERROR, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}
+
+
+@_LOG_FN_TYPE
+def _forward_log(level: int, message: bytes, _user_data: int) -> None:
+    _logger.log(_LOG_LEVELS.get(level, logging.DEBUG), message.decode(errors="replace"))
+
+
+_lib.sandlock_set_logger(_forward_log, _SANDLOCK_LOG_DEBUG, None)
+# Detach before finalization: a record delivered after it would call into a
+# dying interpreter. The call waits out a record still in flight.
+atexit.register(_lib.sandlock_set_logger, _LOG_FN_TYPE(), 0, None)
 
 # ----------------------------------------------------------------
 # C function signatures
