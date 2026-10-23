@@ -119,6 +119,10 @@ fn checked(result: i32) -> io::Result<i32> {
     }
 }
 
+fn token_hex(token: [u8; 16]) -> String {
+    format!("{:032x}", u128::from_be_bytes(token))
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -280,7 +284,7 @@ impl Catalog {
         let catalog = Self { lock, metadata };
         let directory = catalog.directory()?;
         if initialize {
-            let salt = uuid::Uuid::new_v4().as_u128();
+            let salt: u128 = rand::random();
             directory.put(0, salt as u64);
             directory.put(1, (salt >> 64) as u64);
             initialize_signature(lock, HEADER)?;
@@ -355,7 +359,7 @@ impl Catalog {
             directory.put(4, bucket as u64);
             directory.put(3, reference);
         }
-        let token = *uuid::Uuid::new_v4().as_bytes();
+        let token: [u8; 16] = rand::random();
         let mut record = Record {
             name: [0; NAME_BYTES],
             token,
@@ -386,7 +390,7 @@ impl Catalog {
             token,
             entry: Entry {
                 name: name.into(),
-                token: uuid::Uuid::from_bytes(token).simple().to_string(),
+                token: token_hex(token),
                 supervisor: owner,
                 child: None,
             },
@@ -551,7 +555,7 @@ impl Registry {
         Ok(Some(Entry {
             name: String::from_utf8(record.name[..record.len as usize].to_vec())
                 .map_err(|_| invalid())?,
-            token: uuid::Uuid::from_bytes(record.token).simple().to_string(),
+            token: token_hex(record.token),
             supervisor,
             child,
         }))
@@ -584,7 +588,7 @@ impl Registry {
                 "control name must contain 1 to 64 bytes",
             ));
         }
-        let token = *uuid::Uuid::new_v4().as_bytes();
+        let token: [u8; 16] = rand::random();
         let _lock = self.lock()?;
         let owners = self.values()?;
         let mut metadata = Mapping::attach(self.1, false)?;
@@ -630,7 +634,7 @@ impl Registry {
         let owner = unsafe { libc::getpid() };
         let entry = Entry {
             name: name.into(),
-            token: uuid::Uuid::from_bytes(token).simple().to_string(),
+            token: token_hex(token),
             supervisor: owner,
             child: None,
         };
@@ -771,7 +775,7 @@ mod tests {
             let metadata = open_memory(libc::IPC_PRIVATE, DIRECTORY_BYTES, true).unwrap();
             let catalog = Catalog { lock, metadata };
             let directory = catalog.directory().unwrap();
-            let salt = uuid::Uuid::new_v4().as_u128();
+            let salt: u128 = rand::random();
             directory.put(0, salt as u64);
             directory.put(1, (salt >> 64) as u64);
             initialize_signature(lock, HEADER).unwrap();

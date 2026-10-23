@@ -639,3 +639,56 @@ async fn a_finished_capture_survives_a_cancellation_at_the_sibling_join() {
         "a capture that finished before the cancellation must still be parked",
     );
 }
+
+#[test]
+fn timestamp_parses_offsets_and_fractions() {
+    let at = |s| parse_timestamp("t", s).unwrap();
+    let epoch = |secs: u64, nanos: u32| SystemTime::UNIX_EPOCH + Duration::new(secs, nanos);
+    assert_eq!(at("1970-01-01T00:00:00Z"), SystemTime::UNIX_EPOCH);
+    assert_eq!(at("2026-01-01T00:00:00Z"), epoch(1767225600, 0));
+    assert_eq!(
+        at("2026-01-01T08:00:00.5+08:00"),
+        epoch(1767225600, 500_000_000)
+    );
+    assert_eq!(at("2025-12-31t19:00:00-05:00"), epoch(1767225600, 0));
+    assert_eq!(at("2024-02-29 00:00:00Z"), epoch(1709164800, 0));
+    assert_eq!(
+        at("1969-12-31T23:59:59.25Z"),
+        SystemTime::UNIX_EPOCH - Duration::from_millis(750)
+    );
+}
+
+#[test]
+fn timestamp_rejects_malformed_instants() {
+    for s in [
+        "1767225600",
+        "2026-01-01",
+        "2026-01-01T00:00:00",
+        "2026-02-29T00:00:00Z",
+        "2026-04-31T00:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "2026-01-01T24:00:00Z",
+        "2026-01-01T00:00:00.Z",
+        "2026-01-01T00:00:00.1234567890Z",
+        "2026-01-01T00:00:00+0800",
+        "2026-01-01T00:00:00Zjunk",
+        "+2026-01-01T00:00:00Z",
+    ] {
+        assert!(parse_timestamp("t", s).is_err(), "{s} must be refused");
+    }
+}
+
+#[test]
+fn timestamp_formats_in_utc_and_round_trips() {
+    for s in [
+        "1969-07-20T20:17:00Z",
+        "2026-01-01T00:00:00.9999999Z",
+        "0000-03-01T00:00:00Z",
+        "9999-12-31T23:59:59.000000001Z",
+    ] {
+        let t = parse_timestamp("t", s).unwrap();
+        assert_eq!(format_timestamp(t).as_deref(), Some(s));
+    }
+    let t = parse_timestamp("t", "2026-01-01T08:00:00+08:00").unwrap();
+    assert_eq!(format_timestamp(t).as_deref(), Some("2026-01-01T00:00:00Z"));
+}

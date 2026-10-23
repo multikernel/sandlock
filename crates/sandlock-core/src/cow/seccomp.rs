@@ -947,7 +947,7 @@ impl SeccompCowBranch {
                 unsafe { libc::geteuid() },
             )?,
         };
-        let branch_id = uuid::Uuid::new_v4().to_string();
+        let branch_id = format!("{:032x}", rand::random::<u128>());
         let branch_dir = storage_base.join(&branch_id);
         let upper = branch_dir.join("upper");
 
@@ -2743,7 +2743,7 @@ impl SeccompCowBranch {
         //
         // The marker is now guaranteed on disk while the `remove_dir_all` that
         // takes it away is not, so a power loss just after a fully successful
-        // commit would otherwise resurrect `<base>/<uuid>/PRESERVED` with
+        // commit would otherwise resurrect `<base>/<id>/PRESERVED` with
         // `reason=merge-interrupted` over an already-merged workdir — and after
         // a reboot the pid gate cannot help, because the pid is dead either
         // way. What survives a crash mid-teardown must be an unmarked orphan,
@@ -2776,7 +2776,7 @@ impl Drop for SeccompCowBranch {
     /// failure (see [`PreserveReason`]) and is kept. Only [`BranchState::Open`],
     /// i.e. no disposition was ever attempted, reclaims here.
     ///
-    /// `remove_dir_all` is idempotent and scoped to this branch's own uuid dir,
+    /// `remove_dir_all` is idempotent and scoped to this branch's own id dir,
     /// never to a caller-supplied `fs_storage` base.
     fn drop(&mut self) {
         if self.state == BranchState::Open {

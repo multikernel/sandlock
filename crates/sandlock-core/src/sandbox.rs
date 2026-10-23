@@ -81,15 +81,128 @@ impl ByteSize {
 /// the one spelling every surface (flag, profile, C ABI) accepts. `knob`
 /// names the surface the value came through, for the error.
 pub fn parse_timestamp(knob: &str, s: &str) -> Result<SystemTime, SandboxError> {
-    let ts: jiff::Timestamp = s
-        .parse()
-        .map_err(|e| SandboxError::Invalid(format!("{knob}: invalid timestamp {s:?}: {e}")))?;
-    Ok(ts.into())
+    parse_rfc3339(s).ok_or_else(|| {
+        SandboxError::Invalid(format!(
+            "{knob}: invalid timestamp {s:?}: expected RFC 3339 such as 2026-01-01T00:00:00Z"
+        ))
+    })
 }
 
 /// Render `t` in the grammar [`parse_timestamp`] reads, losing nothing.
 pub fn format_timestamp(t: SystemTime) -> Option<String> {
-    jiff::Timestamp::try_from(t).ok().map(|ts| ts.to_string())
+    let (secs, nanos) = match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => (i64::try_from(d.as_secs()).ok()?, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            let secs = -i64::try_from(d.as_secs()).ok()?;
+            match d.subsec_nanos() {
+                0 => (secs, 0),
+                n => (secs - 1, 1_000_000_000 - n),
+            }
+        }
+    };
+    let (year, month, day) = civil_from_days(secs.div_euclid(86400));
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
+    let tod = secs.rem_euclid(86400);
+    let mut out = format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        tod / 3600,
+        tod / 60 % 60,
+        tod % 60
+    );
+    if nanos > 0 {
+        out.push_str(format!(".{nanos:09}").trim_end_matches('0'));
+    }
+    out.push('Z');
+    Some(out)
+}
+
+fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    let b = s.as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let digits = b.get(r)?;
+        digits
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then(|| digits.iter().fold(0, |n, c| n * 10 + i64::from(c - b'0')))
+    };
+    let at = |i: usize, set: &[u8]| b.get(i).is_some_and(|c| set.contains(c));
+    if !(at(4, b"-") && at(7, b"-") && at(10, b"Tt ") && at(13, b":") && at(16, b":")) {
+        return None;
+    }
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    let mut i = 19;
+    let mut nanos = 0;
+    if at(i, b".") {
+        let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if !(1..=9).contains(&digits) {
+            return None;
+        }
+        nanos = num(i + 1..i + 1 + digits)? as u64 * 10u64.pow(9 - digits as u32);
+        i += 1 + digits;
+    }
+    let offset = match &b[i..] {
+        b"Z" | b"z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (h, m) = (num(i + 1..i + 3)?, num(i + 4..i + 6)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            if *sign == b'-' {
+                -(h * 3600 + m * 60)
+            } else {
+                h * 3600 + m * 60
+            }
+        }
+        _ => return None,
+    };
+    let secs = days * 86400 + hour * 3600 + minute * 60 + second - offset;
+    let whole = Duration::from_secs(secs.unsigned_abs());
+    let base = if secs >= 0 {
+        SystemTime::UNIX_EPOCH + whole
+    } else {
+        SystemTime::UNIX_EPOCH - whole
+    };
+    Some(base + Duration::from_nanos(nanos))
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let yoe = year.rem_euclid(400);
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    year.div_euclid(400) * 146097 + doe - 719468
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        z.div_euclid(146097) * 400 + yoe + i64::from(month <= 2),
+        month,
+        day,
+    )
 }
 
 /// Identity to run the sandboxed process as.
