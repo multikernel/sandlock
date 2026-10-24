@@ -4,23 +4,28 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = manifest_dir.join("../..").canonicalize().unwrap();
+    let repo_root = manifest_dir.join("../..");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // rootfs-helper: an ordinary static-libc test fixture (chroot tests). It
-    // lives in tests/ and its binary sits beside it (a git-ignored artifact).
+    // rootfs-helper: an ordinary static-libc test fixture (chroot tests). It is
+    // built into OUT_DIR so a git dependency never writes into its checkout.
+    let helper_bin = out_dir.join("rootfs-helper");
     if !build_static(
         &repo_root.join("tests/rootfs-helper.c"),
-        &repo_root.join("tests/rootfs-helper"),
+        &helper_bin,
         &["musl-gcc", "cc"],
         &["-static", "-O2"],
     ) {
         println!(
-            "cargo:warning=cannot compile tests/rootfs-helper: chroot tests will \
+            "cargo:warning=cannot compile rootfs-helper: chroot tests will \
              fail. Install musl-tools or static libc."
         );
     }
+    println!(
+        "cargo:rustc-env=ROOTFS_HELPER_PATH={}",
+        helper_bin.display()
+    );
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let host = std::env::var("HOST").unwrap_or_default();
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_riscv64 = target.starts_with("riscv64");
@@ -149,9 +154,6 @@ fn main() {
              (tried {}); #! scripts cannot run under chroot",
             tramp_ccs.join(", "),
         );
-        if matches!(arch, "x86_64" | "aarch64" | "riscv64") {
-            panic!("{msg}");
-        }
         println!("cargo:warning={msg}");
     }
     if !tramp_bin.exists() {

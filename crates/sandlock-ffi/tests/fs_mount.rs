@@ -249,12 +249,23 @@ fn builder_fs_mount_refuses_unusable_paths_exactly_like_fs_mount_ro() {
 // End-to-end: what a read-only mount enforces on a real guest
 // ----------------------------------------------------------------
 
-/// Path to the static rootfs-helper binary (compiled by sandlock-core's
-/// build.rs, which has already run because this crate depends on it).
+/// The static rootfs-helper that sandlock-core's build.rs compiles into its
+/// OUT_DIR; that env is private to sandlock-core, so find it in the target dir.
 fn helper_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/rootfs-helper")
-        .canonicalize()
+    let profile_dir = std::env::current_exe().unwrap();
+    let profile_dir = profile_dir.parent().and_then(Path::parent).unwrap();
+    fs::read_dir(profile_dir.join("build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("sandlock-core-")
+        })
+        .map(|e| e.path().join("out/rootfs-helper"))
+        .filter(|p| p.is_file())
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
         .expect("rootfs-helper not found; sandlock-core's build.rs should have compiled it")
 }
 

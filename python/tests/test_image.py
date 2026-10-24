@@ -9,24 +9,20 @@ from pathlib import Path
 
 import pytest
 
+from _rootfs_helper import rootfs_helper
 from sandlock import Image, ImageConfig, Sandbox, SandlockError, pull_image
-
-_HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
 
 
 def _write_helper_image(layout: Path) -> None:
     """An OCI layout holding the static rootfs-helper, with a config that
     sets env and a working directory the layer does not contain."""
-    if not _HELPER_BIN.exists():
-        pytest.skip("rootfs-helper not built (sandlock-core's build.rs compiles it)")
-
     layer = io.BytesIO()
     with tarfile.open(fileobj=layer, mode="w", format=tarfile.GNU_FORMAT) as tar:
         for d in ("usr", "usr/bin", "proc", "dev", "tmp"):
             info = tarfile.TarInfo(d)
             info.type, info.mode = tarfile.DIRTYPE, 0o755
             tar.addfile(info)
-        data = _HELPER_BIN.read_bytes()
+        data = rootfs_helper().read_bytes()
         info = tarfile.TarInfo("usr/bin/rootfs-helper")
         info.mode, info.size = 0o755, len(data)
         tar.addfile(info, io.BytesIO(data))

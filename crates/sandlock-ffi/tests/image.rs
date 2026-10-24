@@ -35,12 +35,30 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
+/// The static rootfs-helper that sandlock-core's build.rs compiles into its
+/// OUT_DIR; that env is private to sandlock-core, so find it in the target dir.
+fn helper_binary() -> PathBuf {
+    let profile_dir = std::env::current_exe().unwrap();
+    let profile_dir = profile_dir.parent().and_then(Path::parent).unwrap();
+    fs::read_dir(profile_dir.join("build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("sandlock-core-")
+        })
+        .map(|e| e.path().join("out/rootfs-helper"))
+        .filter(|p| p.is_file())
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+        .expect("rootfs-helper not found; sandlock-core's build.rs should have compiled it")
+}
+
 /// An OCI layout holding one image: the static rootfs-helper plus a config
 /// that sets Env and a WorkingDir the layer does not contain.
 fn helper_image_layout(dir: &Path) {
-    let helper =
-        fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper"))
-            .expect("rootfs-helper not built; sandlock-core's build.rs compiles it");
+    let helper = fs::read(helper_binary()).unwrap();
 
     let mut layer = tar::Builder::new(Vec::new());
     for d in ["usr/", "usr/bin/", "proc/", "dev/", "tmp/"] {

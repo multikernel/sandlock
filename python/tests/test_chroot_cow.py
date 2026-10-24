@@ -13,14 +13,12 @@ import os
 import shutil
 import threading
 import tempfile
-from pathlib import Path
 
 import pytest
 
+from _rootfs_helper import rootfs_helper
 from sandlock import Sandbox
 
-
-_HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
 
 _FS_READABLE = ["/usr", "/usr/bin", "/bin", "/sbin", "/etc", "/proc", "/dev"]
 
@@ -43,10 +41,11 @@ def rootfs(tmp_path):
 
     # Copy helper binary
     helper_dst = tmp_path / "usr" / "bin" / "rootfs-helper"
+    helper = rootfs_helper()
     try:
-        os.link(_HELPER_BIN, helper_dst)  # hard-link: atomic, avoids ETXTBSY
+        os.link(helper, helper_dst)  # hard-link: atomic, avoids ETXTBSY
     except OSError:
-        shutil.copy2(_HELPER_BIN, helper_dst)
+        shutil.copy2(helper, helper_dst)
 
     # Busybox-style symlinks
     for name in ("sh", "cat", "echo", "ls", "pwd", "readlink", "stat",

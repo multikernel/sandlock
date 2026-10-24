@@ -686,12 +686,27 @@ fn which(prog: &str) -> bool {
     })
 }
 
-/// Path to the prebuilt static `rootfs-helper` (compiled by sandlock-core's
-/// build.rs). It is a self-contained, busybox-style binary the chroot
-/// integration tests drop into a rootfs; building `sandlock-oci` pulls in
-/// `sandlock-core`, so the binary is available here too.
+/// The static rootfs-helper that sandlock-core's build.rs compiles into its
+/// OUT_DIR; that env is private to sandlock-core, so find it in the target dir.
 fn rootfs_helper() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper")
+    let profile_dir = std::env::current_exe().unwrap();
+    let profile_dir = profile_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    std::fs::read_dir(profile_dir.join("build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("sandlock-core-")
+        })
+        .map(|e| e.path().join("out/rootfs-helper"))
+        .filter(|p| p.is_file())
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+        .unwrap_or_default()
 }
 
 /// End-to-end proof that `sandlock-oci exec` runs an extra process inside the

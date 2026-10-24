@@ -870,9 +870,7 @@ async fn test_chroot() {
     let _ = std::fs::create_dir_all(chroot_dir.join("usr/bin"));
     let _ = std::fs::create_dir_all(chroot_dir.join("tmp"));
 
-    // Static helper binary (compiled by build.rs)
-    let helper =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper");
+    let helper = std::path::PathBuf::from(env!("ROOTFS_HELPER_PATH"));
     if !helper.exists() {
         eprintln!("chroot test skipped (rootfs-helper not compiled by build.rs)");
         return;
