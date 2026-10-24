@@ -748,6 +748,87 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
     let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
+// A server that authorizes clients by SO_PEERCRED must see the sandboxed
+// caller, not the supervisor (issue #311). Needs Landlock to gate the connect
+// itself; before ABI v9 the supervisor connects on-behalf.
+#[tokio::test]
+async fn test_named_unix_socket_connect_peer_is_caller() {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 9 {
+        eprintln!("Skipping: Landlock ABI v9 required");
+        return;
+    }
+
+    let dirs = socket_dirs("named-unixsock-peer");
+    let sock_path = dirs.sock.join("svc.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    let peer_file = dirs.out.join("peer");
+    let child_file = dirs.out.join("child");
+    let ready_file = dirs.out.join("ready");
+
+    let listener_script = format!(
+        concat!(
+            "import socket, struct\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "s.bind('{sock}')\n",
+            "s.listen(1)\n",
+            "s.settimeout(15)\n",
+            "open('{ready}', 'w').write('ready')\n",
+            "c, _ = s.accept()\n",
+            "cred = c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)\n",
+            "open('{peer}', 'w').write(str(struct.unpack('3i', cred)[0]))\n",
+        ),
+        sock = sock_path.display(),
+        ready = ready_file.display(),
+        peer = peer_file.display(),
+    );
+    let mut listener_proc = spawn_listener(&listener_script);
+    await_listener_ready(&mut listener_proc, &ready_file);
+
+    let child_script = format!(
+        concat!(
+            "import os, socket\n",
+            "open('{child}', 'w').write(str(os.getpid()))\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "s.connect('{sock}')\n",
+            "s.close()\n",
+        ),
+        sock = sock_path.display(),
+        child = child_file.display(),
+    );
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(dirs.out.to_str().unwrap())
+        .fs_write(dirs.sock.to_str().unwrap())
+        .build()
+        .unwrap();
+
+    policy
+        .clone()
+        .run_interactive(&["python3", "-c", &child_script])
+        .await
+        .unwrap();
+    let _ = listener_proc.wait();
+
+    let child = std::fs::read_to_string(&child_file).unwrap_or_default();
+    let peer = std::fs::read_to_string(&peer_file).unwrap_or_default();
+    assert!(!child.is_empty(), "child did not record its pid");
+    assert_eq!(
+        peer,
+        child,
+        "SO_PEERCRED must name the sandboxed caller, not the supervisor ({})",
+        std::process::id()
+    );
+
+    let _ = std::fs::remove_dir_all(&dirs.base);
+}
+
 // Allow-path hardening (stage 2): a symlink inside a WRITE-granted directory
 // whose real target is a socket OUTSIDE the grants must not be a bypass. A
 // lexical check on the symlink's own path would see only the in-grant location

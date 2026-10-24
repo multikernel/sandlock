@@ -42,6 +42,17 @@ fn present_gpu_indices() -> Vec<u32> {
     out
 }
 
+/// First ABI whose Landlock gates connect() and addressed sends to named unix
+/// sockets (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`).
+const RESOLVE_UNIX_ABI: u32 = 9;
+
+/// Whether the host's Landlock gates named unix sockets itself. When it does,
+/// the caller connects in its own name, so peers see its credentials instead
+/// of the supervisor's.
+pub(crate) fn gates_named_unix() -> bool {
+    abi_version().is_ok_and(|abi| abi >= RESOLVE_UNIX_ABI)
+}
+
 // ============================================================
 // ABI version detection
 // ============================================================
@@ -200,6 +211,9 @@ pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
     }
     if abi >= 5 {
         mask |= AccessFs::IoctlDev;
+    }
+    if abi >= RESOLVE_UNIX_ABI {
+        mask |= AccessFs::ResolveUnix;
     }
     if matches!(
         ProtectionStatus::resolve(Protection::FsRefer, abi, pol),
@@ -777,8 +791,9 @@ mod mask_contract_tests {
             (3, 0x7fff),
             (4, 0x7fff),
             (5, 0xffff),
-            (9, 0xffff),
-            (u32::MAX, 0xffff),
+            (8, 0xffff),
+            (9, 0x1ffff),
+            (u32::MAX, 0x1ffff),
         ] {
             assert_eq!(compute_fs_mask(abi, &pol), expected, "ABI {abi}");
         }
