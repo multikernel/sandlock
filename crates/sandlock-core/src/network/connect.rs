@@ -114,8 +114,11 @@ pub(super) async fn connect_on_behalf(
         .held_if(held)
     } else {
         // Non-IP family. A NAMED (pathname) AF_UNIX connect is a gap Landlock
-        // cannot close (it has no access right for unix-socket connect), so a
-        // netns-less sandbox could reach a host service socket and escape.
+        // before ABI v9 cannot close (it has no access right for unix-socket
+        // connect), so a netns-less sandbox could reach a host service socket
+        // and escape. Connecting on-behalf hands the peer the supervisor's
+        // SO_PEERCRED: with RESOLVE_UNIX the kernel gates the child's own
+        // connect instead, so the peer sees the real caller.
         // Connecting is a WRITE on the socket inode (kernel: unix_find_other ->
         // path_permission(MAY_WRITE)), so require the path to be covered by an
         // fs-write grant, mirroring the kernel's own DAC; otherwise deny with
@@ -123,7 +126,7 @@ pub(super) async fn connect_on_behalf(
         // never return Continue on the deny path, so it is TOCTOU-safe.
         // Abstract sockets (no path) are handled by the Landlock abstract scope.
         match named_unix_socket_path(&addr_bytes) {
-            Some(path) if ctx.policy.has_unix_fs_gate => {
+            Some(path) if ctx.policy.supervises_unix_connect() => {
                 if ctx.policy.chroot_root.is_some() {
                     // Chroot mode: the child's paths are virtual, so a lexical
                     // check against the (virtual) write grants is consistent,

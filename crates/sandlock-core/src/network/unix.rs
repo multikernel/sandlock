@@ -1,7 +1,7 @@
 // Named AF_UNIX gate subsystem, shared by the connect and send handlers.
 //
-// Landlock has no access right for unix-socket connect, so a named
-// (pathname) target is gated on the fs-write grants: the path is resolved
+// Landlock before ABI v9 has no access right for unix-socket connect, so a
+// named (pathname) target is gated on the fs-write grants: the path is resolved
 // to its real inode in the child's root view, pinned with an O_PATH fd,
 // and the syscall runs on-behalf against `/proc/self/fd/<pin>` so the
 // checked inode is the one acted on (TOCTOU- and symlink-safe).

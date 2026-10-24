@@ -110,7 +110,7 @@ pub(super) async fn sendto_on_behalf(
         // sendto to a named socket is a WRITE on its inode, so deny unless the
         // resolved real target is under an fs-write grant.
         match named_unix_socket_path(&addr_bytes) {
-            Some(path) if ctx.policy.has_unix_fs_gate => {
+            Some(path) if ctx.policy.supervises_unix_send() => {
                 if ctx.policy.chroot_root.is_some() {
                     if path_under_any(&path, &ctx.policy.chroot_writable) {
                         NotifAction::Continue
@@ -241,7 +241,7 @@ pub(super) async fn sendmsg_on_behalf(
     // Named-unix datagram gate. A named AF_UNIX `msg_name` is handled here; the
     // IP path below only covers AF_INET/AF_INET6, and would pass a unix target
     // straight through.
-    if ctx.policy.has_unix_fs_gate {
+    if ctx.policy.supervises_unix_send() {
         if let Some(action) = unix_sendmsg_gate(notif, ctx, notif_fd, sockfd, msghdr_ptr, flags) {
             return action;
         }
@@ -465,7 +465,7 @@ pub(super) async fn sendmmsg_on_behalf(
     // whole batch here: the existing prescan below would Continue the entire
     // call on the first non-IP entry, which would let a unix entry bypass the
     // gate.
-    if ctx.policy.has_unix_fs_gate {
+    if ctx.policy.supervises_unix_send() {
         let mut named_unix = false;
         for i in 0..vlen {
             let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
