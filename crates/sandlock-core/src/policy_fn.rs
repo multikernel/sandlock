@@ -430,16 +430,8 @@ pub struct Approval {
 
 impl Approval {
     /// Answer the held syscall. A refused [`Verdict::Grant`] denies it and
-    /// is logged; use [`Approval::try_resolve`] to see why.
-    pub fn resolve(self, verdict: Verdict) {
-        if let Err(e) = self.try_resolve(verdict) {
-            log::warn!("policy_fn grant refused, operation denied: {e}");
-        }
-    }
-
-    /// Like [`Approval::resolve`], but reports a refused grant. The syscall
-    /// is answered either way.
-    pub fn try_resolve(self, verdict: Verdict) -> Result<(), PolicyFnError> {
+    /// returns why; the syscall is answered either way.
+    pub fn resolve(self, verdict: Verdict) -> Result<(), PolicyFnError> {
         let (verdict, result) = match verdict {
             Verdict::Grant(p) => match self.grant(&p) {
                 Ok(()) => (Verdict::Allow, Ok(())),
@@ -452,11 +444,11 @@ impl Approval {
     }
 
     pub fn allow(self) {
-        self.resolve(Verdict::Allow);
+        let _ = self.resolve(Verdict::Allow);
     }
 
     pub fn deny(self) {
-        self.resolve(Verdict::Deny);
+        let _ = self.resolve(Verdict::Deny);
     }
 
     fn grant(&self, p: &Permissions) -> Result<(), PolicyFnError> {
@@ -503,11 +495,14 @@ impl PolicyFn {
         Self::deferred(move |event, ctx, approval| {
             let verdict = callback(event, ctx);
             if let Some(approval) = approval {
-                approval.resolve(if ctx.is_cancelled() {
+                let verdict = if ctx.is_cancelled() {
                     Verdict::Deny
                 } else {
                     verdict
-                });
+                };
+                if let Err(e) = approval.resolve(verdict) {
+                    log::warn!("policy_fn grant refused, operation denied: {e}");
+                }
             }
         })
     }

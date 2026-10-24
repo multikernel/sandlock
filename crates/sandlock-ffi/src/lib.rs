@@ -2607,7 +2607,7 @@ pub unsafe extern "C" fn sandlock_approval_grant_net_allow(
             return e;
         }
     };
-    match a.try_resolve(sandlock_core::policy_fn::Verdict::Grant(p)) {
+    match a.resolve(sandlock_core::policy_fn::Verdict::Grant(p)) {
         Ok(()) => 0,
         Err(e) => policy_fn_errno(&e),
     }
@@ -2625,7 +2625,7 @@ pub unsafe extern "C" fn sandlock_approval_resolve(
 ) {
     if !approval.is_null() {
         if let Some(a) = Box::from_raw(approval).approval {
-            a.resolve(policy_ret_to_verdict(verdict));
+            let _ = a.resolve(policy_ret_to_verdict(verdict));
         }
     }
 }

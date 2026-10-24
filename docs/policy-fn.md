@@ -259,7 +259,7 @@ Each destination falls in one class:
 A grant outside `approvable`, or after `ctx.restrict()` narrowed it, denies the
 operation and changes nothing. A returned grant is logged; resolving an
 approval with one also reports it (Python raises `PermissionError`, Go returns
-`ErrNotApprovable`, Rust `try_resolve` returns `PolicyFnError::NotApprovable`,
+`ErrNotApprovable`, Rust `resolve` returns `PolicyFnError::NotApprovable`,
 C returns `-EPERM`). A held
 operation that times out or is closed is refused with `ECONNREFUSED`. As in
 `net_allow`, `*:*` covers TCP and UDP but not ICMP; add `icmp://*` to approve

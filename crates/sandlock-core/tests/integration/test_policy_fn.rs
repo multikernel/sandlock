@@ -1655,7 +1655,7 @@ fn grant_first(specs: &'static str) -> impl Fn(usize, Approval) + Send + 'static
     move |i, approval| {
         if i == 0 {
             approval
-                .try_resolve(Verdict::Grant(Permissions::new().net_allow(specs)))
+                .resolve(Verdict::Grant(Permissions::new().net_allow(specs)))
                 .expect("grant within approvable");
         } else {
             approval.allow();
@@ -1736,8 +1736,7 @@ async fn grant_outside_approvable_denies() {
     let refused = Arc::new(Mutex::new(Vec::new()));
     let record = refused.clone();
     let (policy_fn, _) = approver(move |_, approval| {
-        let result =
-            approval.try_resolve(Verdict::Grant(Permissions::new().net_allow("10.0.0.0/8:*")));
+        let result = approval.resolve(Verdict::Grant(Permissions::new().net_allow("10.0.0.0/8:*")));
         record
             .lock()
             .unwrap()
@@ -1763,7 +1762,7 @@ async fn grant_after_restrict_denies() {
     std::thread::spawn(move || {
         for approval in rx.iter() {
             let result =
-                approval.try_resolve(Verdict::Grant(Permissions::new().net_allow("127.0.0.1:*")));
+                approval.resolve(Verdict::Grant(Permissions::new().net_allow("127.0.0.1:*")));
             record
                 .lock()
                 .unwrap()
