@@ -91,7 +91,7 @@ fn metadata(entry: net::NetEntry, symlink: bool, created_at: std::time::Duration
     };
     st.st_size = if symlink { 8 } else { 0 };
     st.st_blksize = 1024;
-    st.st_atime = created_at.as_secs() as libc::time_t;
+    st.st_atime = created_at.as_secs() as _;
     st.st_atime_nsec = created_at.subsec_nanos() as libc::c_long;
     st.st_mtime = st.st_atime;
     st.st_mtime_nsec = st.st_atime_nsec;

@@ -9,7 +9,7 @@ readme = "../../README.md"
 description = "Lightweight process sandbox using Landlock, seccomp-bpf, and seccomp user notification"
 
 [dependencies]
-libc = "0.2"
+libc = "0.2.191"
 log = "0.4"
 syscalls = { version = "0.8", default-features = false }
 nix = { version = "0.29", features = ["process", "signal", "fs", "ioctl", "poll", "user"] }

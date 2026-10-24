@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	sandlock "github.com/multikernel/sandlock/go"
 )
@@ -22,10 +23,7 @@ import (
 // layer does not contain.
 func writeHelperImage(t *testing.T, dir string) {
 	t.Helper()
-	helper, err := os.ReadFile("../tests/rootfs-helper")
-	if err != nil {
-		t.Skipf("rootfs-helper not built (sandlock-core's build.rs compiles it): %v", err)
-	}
+	helper := rootfsHelper(t)
 
 	var layer bytes.Buffer
 	tw := tar.NewWriter(&layer)
@@ -33,7 +31,7 @@ func writeHelperImage(t *testing.T, dir string) {
 		must(t, tw.WriteHeader(&tar.Header{Name: d, Typeflag: tar.TypeDir, Mode: 0o755}))
 	}
 	must(t, tw.WriteHeader(&tar.Header{Name: "usr/bin/rootfs-helper", Mode: 0o755, Size: int64(len(helper))}))
-	_, err = tw.Write(helper)
+	_, err := tw.Write(helper)
 	must(t, err)
 	must(t, tw.Close())
 
@@ -67,6 +65,33 @@ func must(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// rootfsHelper reads the static rootfs-helper that sandlock-core's build.rs
+// compiles into its OUT_DIR.
+func rootfsHelper(t *testing.T) []byte {
+	t.Helper()
+	var found []string
+	for _, pattern := range []string{
+		"../target/*/build/sandlock-core-*/out/rootfs-helper",
+		"../target/*/*/build/sandlock-core-*/out/rootfs-helper",
+	} {
+		m, _ := filepath.Glob(pattern)
+		found = append(found, m...)
+	}
+	var newest string
+	var newestTime time.Time
+	for _, p := range found {
+		if fi, err := os.Stat(p); err == nil && fi.ModTime().After(newestTime) {
+			newest, newestTime = p, fi.ModTime()
+		}
+	}
+	if newest == "" {
+		t.Skip("rootfs-helper not built (sandlock-core's build.rs compiles it)")
+	}
+	helper, err := os.ReadFile(newest)
+	must(t, err)
+	return helper
 }
 
 func TestPullImageAndRunInIt(t *testing.T) {

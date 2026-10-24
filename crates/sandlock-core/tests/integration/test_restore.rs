@@ -7,10 +7,12 @@ use std::path::PathBuf;
 /// exercises the full restore engine (memory, registers, reopened fd) plus vDSO
 /// relocation without any embedded C in the test.
 fn helper_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/rootfs-helper")
-        .canonicalize()
-        .expect("rootfs-helper not found — build.rs should have compiled it")
+    let helper = PathBuf::from(env!("ROOTFS_HELPER_PATH"));
+    assert!(
+        helper.is_file(),
+        "rootfs-helper not found; build.rs should have compiled it"
+    );
+    helper
 }
 
 /// The address range the restore-stub's own image is linked into. Must match

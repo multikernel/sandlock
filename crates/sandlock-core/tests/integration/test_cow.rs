@@ -12,10 +12,12 @@ fn temp_dir(name: &str) -> PathBuf {
 
 /// Path to the static rootfs-helper binary (compiled by build.rs).
 fn helper_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/rootfs-helper")
-        .canonicalize()
-        .expect("rootfs-helper not found — build.rs should have compiled it")
+    let helper = PathBuf::from(env!("ROOTFS_HELPER_PATH"));
+    assert!(
+        helper.is_file(),
+        "rootfs-helper not found; build.rs should have compiled it"
+    );
+    helper
 }
 
 // ============================================================

@@ -16,10 +16,7 @@ import (
 // reachable as /bin/cat and /bin/write.
 func helperRootfs(t *testing.T) string {
 	t.Helper()
-	helper, err := os.ReadFile("../tests/rootfs-helper")
-	if err != nil {
-		t.Skipf("rootfs-helper not built (sandlock-core's build.rs compiles it): %v", err)
-	}
+	helper := rootfsHelper(t)
 	root := t.TempDir()
 	bin := filepath.Join(root, "bin")
 	must(t, os.MkdirAll(bin, 0o755))

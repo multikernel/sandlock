@@ -4,26 +4,33 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = manifest_dir.join("../..").canonicalize().unwrap();
-
-    // rootfs-helper: an ordinary static-libc test fixture (chroot tests). It
-    // lives in tests/ and its binary sits beside it (a git-ignored artifact).
-    if !build_static(
-        &repo_root.join("tests/rootfs-helper.c"),
-        &repo_root.join("tests/rootfs-helper"),
-        &["musl-gcc", "cc"],
-        &["-static", "-O2"],
-    ) {
-        println!(
-            "cargo:warning=cannot compile tests/rootfs-helper: chroot tests will \
-             fail. Install musl-tools or static libc."
-        );
-    }
-
+    let repo_root = manifest_dir.join("../..");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let host = std::env::var("HOST").unwrap_or_default();
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_riscv64 = target.starts_with("riscv64");
+    let arch = target.split('-').next().unwrap_or_default();
+    let arch = if is_riscv64 { "riscv64" } else { arch };
+
+    // rootfs-helper: an ordinary static-libc test fixture (chroot tests). It is
+    // built into OUT_DIR so a git dependency never writes into its checkout.
+    let helper_bin = out_dir.join("rootfs-helper");
+    if !build_static(
+        &repo_root.join("tests/rootfs-helper.c"),
+        &helper_bin,
+        &target_compilers(&target, &host, arch, &["musl-gcc", "cc"]),
+        &["-static", "-O2"],
+    ) {
+        println!(
+            "cargo:warning=cannot compile rootfs-helper: chroot tests will \
+             fail. Install musl-tools or static libc."
+        );
+    }
+    println!(
+        "cargo:rustc-env=ROOTFS_HELPER_PATH={}",
+        helper_bin.display()
+    );
+
     #[cfg(feature = "checkpoint")]
     {
         // restore-stub: a core component of the restore engine (the supervisor execs
@@ -37,41 +44,18 @@ fn main() {
         // text and stack have to sit outside the address range programs occupy. The
         // default -no-pie base (0x400000) is exactly where a static ET_EXEC workload
         // loads, so the checkpoint's own text would be mapped over the running stub.
-        //
-        // Cross-compilation: when TARGET is riscv64gc-unknown-linux-gnu (or any
-        // riscv64* variant), look for a riscv64 cross-compiler. On the host it
-        // uses plain `cc` as before.
         let stub_src = manifest_dir.join("src/checkpoint/restore-stub.c");
         let stub_bin = out_dir.join("restore-stub");
         // Checkpoint restore is claimed only on x86_64 and riscv64 (see
         // `restore_interactive`); on those arches a stub build failure is fatal, not
         // a silent skip — a green build with no stub is how regressions slip past CI.
         let is_restore_arch = target.starts_with("x86_64") || is_riscv64;
-        let (ccs, fail_msg) = if is_riscv64 {
-            if host.starts_with("riscv64") {
-                (
-                    &[
-                        "cc",
-                        "riscv64-linux-gnu-gcc",
-                        "riscv64-unknown-linux-gnu-gcc",
-                    ][..],
-                    "failed to compile restore-stub for riscv64: no working C compiler \
-                     (install gcc); checkpoint restore is unavailable",
-                )
-            } else {
-                (
-                    &["riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
-                    "failed to compile restore-stub for riscv64: no working cross-compiler \
-                     (install riscv64-linux-gnu-gcc); checkpoint restore is unavailable",
-                )
-            }
-        } else {
-            (
-                &["cc"][..],
-                "failed to compile restore-stub: no working C compiler \
-                 (install cc/gcc); checkpoint restore is unavailable",
-            )
-        };
+        let stub_ccs = target_compilers(&target, &host, arch, &["cc"]);
+        let fail_msg = format!(
+            "failed to compile restore-stub for {arch}: no working C compiler \
+             (tried {}); checkpoint restore is unavailable",
+            stub_ccs.join(", "),
+        );
         // The link address must match restore_blob::STUB_BASE and must sit below
         // the Sv39 user ceiling (256 GiB) on riscv64.  x86_64 uses 0x300_0000_0000.
         let text_segment = if is_riscv64 {
@@ -82,7 +66,7 @@ fn main() {
         if !build_static(
             &stub_src,
             &stub_bin,
-            ccs,
+            &stub_ccs,
             &[
                 "-static",
                 "-nostdlib",
@@ -120,16 +104,7 @@ fn main() {
     // source). Freestanding, so any compiler for the target arch will do.
     let tramp_src = manifest_dir.join("src/chroot/shebang-trampoline.c");
     let tramp_bin = out_dir.join("shebang-trampoline");
-    let arch = target.split('-').next().unwrap_or_default();
-    let arch = if is_riscv64 { "riscv64" } else { arch };
-    let mut tramp_ccs = vec![
-        format!("{arch}-linux-gnu-gcc"),
-        format!("{arch}-unknown-linux-gnu-gcc"),
-    ];
-    if host.starts_with(arch) {
-        tramp_ccs.insert(0, "cc".to_string());
-    }
-    let tramp_ccs: Vec<&str> = tramp_ccs.iter().map(String::as_str).collect();
+    let tramp_ccs = target_compilers(&target, &host, arch, &["cc"]);
     if !build_static(
         &tramp_src,
         &tramp_bin,
@@ -149,9 +124,6 @@ fn main() {
              (tried {}); #! scripts cannot run under chroot",
             tramp_ccs.join(", "),
         );
-        if matches!(arch, "x86_64" | "aarch64" | "riscv64") {
-            panic!("{msg}");
-        }
         println!("cargo:warning={msg}");
     }
     if !tramp_bin.exists() {
@@ -169,7 +141,7 @@ fn main() {
 /// source is present, stale, and no compiler in `ccs` succeeded; a missing
 /// source (a packaged crate) or an up-to-date `bin` reports success. The caller
 /// decides whether that failure is a hard error or a warning.
-fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
+fn build_static(src: &Path, bin: &Path, ccs: &[String], args: &[&str]) -> bool {
     println!("cargo:rerun-if-changed={}", src.display());
     if !src.exists() {
         return true;
@@ -182,7 +154,12 @@ fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
         }
     }
     for cc in ccs {
-        let ok = Command::new(cc)
+        let mut words = cc.split_whitespace();
+        let Some(program) = words.next() else {
+            continue;
+        };
+        let ok = Command::new(program)
+            .args(words)
             .args(args)
             .arg("-o")
             .arg(bin)
@@ -195,4 +172,38 @@ fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
         }
     }
     false
+}
+
+/// C compilers to try for `target`. A configured one is the only candidate, so a
+/// broken setting fails instead of silently falling back to another compiler.
+fn target_compilers(target: &str, host: &str, arch: &str, native: &[&str]) -> Vec<String> {
+    let mut vars = vec![
+        format!("CC_{target}"),
+        format!("CC_{}", target.replace('-', "_")),
+        "TARGET_CC".to_string(),
+    ];
+    if host == target {
+        vars.push("CC".to_string());
+    }
+    for var in &vars {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    if let Some(cc) = vars.iter().find_map(|v| std::env::var(v).ok()) {
+        return vec![cc];
+    }
+
+    let mut ccs = Vec::new();
+    if host.split('-').next() == target.split('-').next() {
+        ccs.extend(native.iter().map(|cc| cc.to_string()));
+    }
+    let env = target.rsplit('-').next().unwrap_or_default();
+    for env in [env, "gnu"] {
+        for vendor in ["", "unknown-"] {
+            let cc = format!("{arch}-{vendor}linux-{env}-gcc");
+            if !ccs.contains(&cc) {
+                ccs.push(cc);
+            }
+        }
+    }
+    ccs
 }

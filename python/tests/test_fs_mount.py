@@ -6,14 +6,12 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-from pathlib import Path
 
 import pytest
 
+from _rootfs_helper import rootfs_helper
 from sandlock import Sandbox
 
-
-_HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
 
 _FS_READABLE = ["/usr", "/usr/bin", "/bin", "/sbin", "/etc", "/proc", "/dev"]
 
@@ -25,10 +23,11 @@ def rootfs(tmp_path):
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
 
     helper_dst = tmp_path / "usr" / "bin" / "rootfs-helper"
+    helper = rootfs_helper()
     try:
-        os.link(_HELPER_BIN, helper_dst)
+        os.link(helper, helper_dst)
     except OSError:
-        shutil.copy2(_HELPER_BIN, helper_dst)
+        shutil.copy2(helper, helper_dst)
 
     for name in ("sh", "cat", "echo", "ls", "pwd", "readlink", "stat",
                   "mkdir", "rmdir", "chmod", "ln", "rm", "mv", "true",
