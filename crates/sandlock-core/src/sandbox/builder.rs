@@ -1066,11 +1066,11 @@ impl SandboxBuilder {
         // `env:` vars are stripped from the child and `fd:` is read through a
         // dup, but a secret file sitting inside any grant that lets the child
         // reach it is `cat`-able directly. We can't safely auto-deny (the grant
-        // is often a broad dir the workload needs), so warn on the overlap. Every
+        // is often a broad dir the workload needs), so refuse the overlap. Every
         // exposing grant is covered: read grants, write grants (write access
         // includes read), bind-mounted host dirs, and the chroot root (visible
-        // regardless of Landlock). An fs-deny covering the file suppresses the
-        // warning, so following its own advice actually silences it.
+        // regardless of Landlock). An fs-deny covering the file lifts the
+        // refusal, so following the error's own advice resolves it.
         for c in &self.credentials {
             let Some(path) = c.split_once('=').and_then(|(_, s)| s.strip_prefix("file:")) else {
                 continue;
@@ -1087,14 +1087,14 @@ impl SandboxBuilder {
                 &self.fs_denied,
                 self.chroot.as_deref(),
             ) {
-                log::warn!(
+                return Err(SandboxError::Invalid(format!(
                     "credential file {} is inside the sandbox grant {}; \
-                     the sandboxed child can read the secret directly; keep it outside every \
-                     fs grant (or add `--fs-deny {}` to close it)",
+                     the sandboxed child could read the secret directly; keep it outside every \
+                     fs grant or add `--fs-deny {}`",
                     path,
                     exposure.grant.display(),
                     exposure.deny_target.display(),
-                );
+                )));
             }
         }
         // Resolve credentials + injection rules, loading each secret into the
@@ -1255,12 +1255,12 @@ struct Exposure {
 
 /// The first fs grant that exposes `secret` to the sandboxed child, or `None`
 /// when no grant reaches it or an fs-deny covers it (the deny closes the hole,
-/// so no warning is due). Best-effort: canonicalize where possible.
+/// so nothing is exposed). Best-effort: canonicalize where possible.
 ///
 /// `chroot` is the jail root when running chrooted. In that mode `--fs-deny`
 /// values are matched as in-jail (virtual) prefixes, not host paths, so the
 /// deny suppression and the advised deny path are computed in the virtual
-/// namespace: a host-path deny like `/jail/etc/token` would silence the warning
+/// namespace: a host-path deny like `/jail/etc/token` would lift the refusal
 /// here yet never fire at runtime (the child opens `/etc/token`).
 fn exposing_grant<'a>(
     secret: &std::path::Path,
@@ -1428,10 +1428,10 @@ mod tests {
         // Inside a read grant: the exposing grant is reported.
         assert_eq!(found(&[]), Some(dir.clone()));
         // An fs-deny on the file itself, or on a covering directory, closes the
-        // hole: following the warning's own advice must silence it.
+        // hole: following the error's own advice must lift it.
         assert_eq!(found(std::slice::from_ref(&secret)), None);
         assert_eq!(found(std::slice::from_ref(&dir)), None);
-        // A deny elsewhere does not suppress the warning.
+        // A deny elsewhere does not lift the refusal.
         assert_eq!(
             found(&[PathBuf::from("/nonexistent-deny")]),
             Some(dir.clone())
@@ -1467,7 +1467,7 @@ mod tests {
         assert_eq!(exposure.deny_target, virtual_path);
 
         // Denying the in-jail path (what the notif layer actually matches, and
-        // what the warning now advises) suppresses it.
+        // what the error now advises) lifts it.
         assert!(exposing_grant(&secret, grants.iter(), &[virtual_path.clone()], chroot).is_none());
         // Denying a covering in-jail directory also suppresses.
         assert!(exposing_grant(&secret, grants.iter(), &[PathBuf::from("/etc")], chroot).is_none());

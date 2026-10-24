@@ -685,6 +685,7 @@ async fn test_credential_injected_into_upstream() {
         .http_allow("GET 127.0.0.1/*")
         .http_port(port)
         .credential("api", &format!("file:{}", secret_file.display()))
+        .fs_deny(&secret_file)
         .http_auth("GET 127.0.0.1/* bearer api")
         .build()
         .unwrap();
@@ -734,6 +735,7 @@ async fn test_denied_request_does_not_inject_credential() {
         .http_allow("GET 127.0.0.1/allowed")
         .http_port(port)
         .credential("api", &format!("file:{}", secret_file.display()))
+        .fs_deny(&secret_file)
         .http_auth("GET 127.0.0.1/* bearer api")
         .build()
         .unwrap();
