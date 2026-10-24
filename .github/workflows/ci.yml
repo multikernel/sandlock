@@ -154,6 +154,31 @@ jobs:
           CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
         run: cargo build --release --target riscv64gc-unknown-linux-gnu
 
+  rust-musl:
+    name: Rust musl (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # libc defines fewer items for musl, so glibc-only code passes every
+      # other job; the registry tests run the SysV IPC calls built against it.
+      - name: Build
+        run: cargo build --release --workspace --target x86_64-unknown-linux-musl
+
+      - name: Run control registry tests
+        run: cargo test --release -p sandlock-core --target x86_64-unknown-linux-musl --lib 'control::'
+
   cbindgen-header:
     name: cbindgen header up to date
     runs-on: ubuntu-latest
