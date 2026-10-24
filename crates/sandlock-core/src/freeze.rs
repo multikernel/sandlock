@@ -364,8 +364,8 @@ pub(crate) fn reap_pending(pending: &[i32]) {
                 }
             }
             if std::time::Instant::now() >= deadline {
-                eprintln!(
-                    "sandlock: tid {tid} never left its kernel wait; \
+                log::warn!(
+                    "tid {tid} never left its kernel wait; \
                      abandoning its ptrace attachment"
                 );
                 break;

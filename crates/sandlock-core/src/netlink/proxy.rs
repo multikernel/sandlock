@@ -40,7 +40,7 @@ pub fn spawn_responder(
     tokio::spawn(async move {
         let _registration = registration;
         if let Err(e) = responder_loop(fd, reply_pid).await {
-            eprintln!("sandlock netlink responder error: {e}");
+            log::warn!("netlink responder error: {e}");
         }
     })
 }

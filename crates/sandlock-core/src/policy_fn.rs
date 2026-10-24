@@ -433,7 +433,7 @@ impl Approval {
     /// is logged; use [`Approval::try_resolve`] to see why.
     pub fn resolve(self, verdict: Verdict) {
         if let Err(e) = self.try_resolve(verdict) {
-            eprintln!("sandlock: policy_fn grant refused, operation denied: {e}");
+            log::warn!("policy_fn grant refused, operation denied: {e}");
         }
     }
 

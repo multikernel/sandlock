@@ -21,6 +21,7 @@ pub mod http;
 #[cfg(feature = "image")]
 pub mod image;
 pub mod landlock;
+pub mod logging;
 pub mod netlink;
 pub(crate) mod network;
 pub(crate) mod pgroup;

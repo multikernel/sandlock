@@ -10,6 +10,7 @@ description = "Lightweight process sandbox using Landlock, seccomp-bpf, and secc
 
 [dependencies]
 libc = "0.2"
+log = "0.4"
 syscalls = { version = "0.8", default-features = false }
 nix = { version = "0.29", features = ["process", "signal", "fs", "ioctl", "poll", "user"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util", "fs"] }

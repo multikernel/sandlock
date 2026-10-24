@@ -269,6 +269,7 @@ struct SandboxStatus {
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
+    sandlock_core::logging::log_to_stderr();
     let cli = Cli::parse();
 
     match cli.command {

@@ -237,6 +237,7 @@ fn write_error_log(path: &std::path::Path, format: LogFormat, err: &anyhow::Erro
 }
 
 fn main() {
+    sandlock_core::logging::log_to_stderr();
     let cli = Cli::parse();
     // Capture the log destination before `cli.command` is consumed by `run`.
     let log = cli.log.clone();

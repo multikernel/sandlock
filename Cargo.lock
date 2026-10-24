@@ -1383,6 +1383,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "libc",
+ "log",
  "nix",
  "pathdiff",
  "rand",

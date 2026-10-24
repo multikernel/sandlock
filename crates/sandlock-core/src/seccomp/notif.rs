@@ -2798,8 +2798,8 @@ async fn run_deferred_within(deferred: Deferred, limit: std::time::Duration) -> 
     match tokio::time::timeout(limit, deferred.run()).await {
         Ok(action) => finalize_deferred(action),
         Err(_) => {
-            eprintln!(
-                "sandlock: deferred handler exceeded {:?}; failing syscall with EIO",
+            log::warn!(
+                "deferred handler exceeded {:?}; failing syscall with EIO",
                 limit
             );
             NotifAction::Errno(libc::EIO)
@@ -2946,10 +2946,11 @@ fn freeze_exec(
         Ok(freeze) if read_exec_image(notif, fd) == *judged => (NotifAction::Continue, freeze),
         Ok(freeze) => (NotifAction::Errno(libc::EPERM), freeze),
         Err(e) => {
-            eprintln!(
-                "sandlock: argv-safety freeze failed for pid {}: {}; \
+            log::warn!(
+                "argv-safety freeze failed for pid {}: {}; \
                  denying execve to preserve TOCTOU invariant",
-                notif.pid, e
+                notif.pid,
+                e
             );
             // Rollback could not release tasks that had not entered
             // ptrace-stop yet; carry them to the post-send reap.
@@ -3012,10 +3013,11 @@ async fn finish_notification(
                 creation_trace = Some(trace);
             }
             Err(e) => {
-                eprintln!(
-                    "sandlock: process-creation tracking failed for pid {}: {} \
+                log::warn!(
+                    "process-creation tracking failed for pid {}: {} \
                      — denying fork-like syscall to preserve argv TOCTOU invariant",
-                    notif.pid, e
+                    notif.pid,
+                    e
                 );
                 if fork_counted {
                     crate::resource::rollback_fork_count(&ctx.resource).await;
@@ -3084,9 +3086,10 @@ async fn finish_notification(
                 }
                 Err(e) => {
                     crate::resource::rollback_fork_count(&ctx.resource).await;
-                    eprintln!(
-                        "sandlock: process-creation tracking completion failed for pid {}: {}",
-                        notif.pid, e
+                    log::warn!(
+                        "process-creation tracking completion failed for pid {}: {}",
+                        notif.pid,
+                        e
                     );
                 }
             }

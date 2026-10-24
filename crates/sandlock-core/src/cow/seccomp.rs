@@ -2103,20 +2103,22 @@ impl SeccompCowBranch {
             // commit. Contention and a broken workdir are distinct — do not
             // collapse them into one message.
             Err(CommitError::Contended(waited)) => {
-                eprintln!(
-                    "sandlock: commit deferred: workdir lock on {} contended for {:?}; \
+                log::warn!(
+                    "commit deferred: workdir lock on {} contended for {:?}; \
                      upper preserved for recovery",
-                    self.workdir_str, waited
+                    self.workdir_str,
+                    waited
                 );
                 Err(BranchError::Operation(
                     "commit deferred: workdir lock contended".into(),
                 ))
             }
             Err(CommitError::Lock(e)) => {
-                eprintln!(
-                    "sandlock: commit deferred: workdir lock on {} could not be taken ({}); \
+                log::warn!(
+                    "commit deferred: workdir lock on {} could not be taken ({}); \
                      upper preserved for recovery",
-                    self.workdir_str, e
+                    self.workdir_str,
+                    e
                 );
                 Err(BranchError::Operation(format!(
                     "commit deferred: workdir lock error: {e}"

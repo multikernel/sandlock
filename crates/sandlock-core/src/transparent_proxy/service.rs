@@ -235,9 +235,12 @@ impl AclService {
                         // Rendering failed (e.g. the secret has bytes illegal in a
                         // header) — fail the request rather than forward it with no
                         // credential, which would look like an auth bug to the caller.
-                        eprintln!(
-                            "sandlock: credential {:?} could not be rendered for {} {}{} — rejecting",
-                            r.name, method, host, path
+                        log::warn!(
+                            "credential {:?} could not be rendered for {} {}{} — rejecting",
+                            r.name,
+                            method,
+                            host,
+                            path
                         );
                         return text_response(
                             StatusCode::BAD_GATEWAY,
@@ -247,25 +250,32 @@ impl AclService {
                     Ok(crate::credential::Applied::Skipped) => {
                         // add-only and the caller already set the target — keep
                         // theirs and record it truthfully (not as an injection).
-                        eprintln!(
-                            "sandlock: kept caller-supplied credential {:?} for {} {}{} (add-only)",
-                            r.name, method, host, path
+                        log::info!(
+                            "kept caller-supplied credential {:?} for {} {}{} (add-only)",
+                            r.name,
+                            method,
+                            host,
+                            path
                         );
                     }
                     Ok(crate::credential::Applied::Injected) => {
-                        eprintln!(
-                            "sandlock: injected credential {:?} for {} {}{}",
-                            r.name, method, host, path
+                        log::info!(
+                            "injected credential {:?} for {} {}{}",
+                            r.name,
+                            method,
+                            host,
+                            path
                         );
                         // Fires for any caller (library/API, not just the CLI) since the
                         // proxy is in core: the scheme is only known here at request time.
                         // Once per run — over cleartext the secret is exposed on the wire.
                         if first_cleartext_warn(scheme, &self.cleartext_warned) {
-                            eprintln!(
-                                "sandlock: warning: credential {:?} injected over cleartext HTTP (no TLS) \
+                            log::warn!(
+                                "credential {:?} injected over cleartext HTTP (no TLS) \
                                  to {} — the secret is exposed on the wire; prefer an HTTPS host \
                                  (configure MITM via --http-ca / --http-inject-ca)",
-                                r.name, host
+                                r.name,
+                                host
                             );
                         }
                     }

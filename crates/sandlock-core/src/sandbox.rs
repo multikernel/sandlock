@@ -2417,7 +2417,7 @@ impl Sandbox {
                     Some(branch)
                 }
                 Err(e) => {
-                    eprintln!("sandlock: seccomp COW branch creation failed: {}", e);
+                    log::warn!("seccomp COW branch creation failed: {}", e);
                     None
                 }
             }
@@ -2480,10 +2480,11 @@ impl Sandbox {
             {
                 // Nested policies may deny AF_UNIX or SysV IPC; execution can
                 // still proceed without introspection.
-                eprintln!(
-                    "sandlock: control socket setup failed for '{}': {} \
+                log::warn!(
+                    "control socket setup failed for '{}': {} \
                      (introspection unavailable for this sandbox)",
-                    sandbox_name, e
+                    sandbox_name,
+                    e
                 );
                 None
             }
@@ -2656,8 +2657,8 @@ impl Sandbox {
                     .time_start
                     .map(|t| crate::time::calculate_time_offset(t));
                 if let Err(e) = crate::vdso::patch(pid, time_offset, self.random_seed.is_some()) {
-                    eprintln!(
-                        "sandlock: pre-exec vDSO patching failed (will retry after exec): {}",
+                    log::debug!(
+                        "pre-exec vDSO patching failed (will retry after exec): {}",
                         e
                     );
                 }

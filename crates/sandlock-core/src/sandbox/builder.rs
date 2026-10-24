@@ -1056,8 +1056,8 @@ impl SandboxBuilder {
         // fires — the request bypasses the proxy and goes out uncredentialed. We
         // can't know a rule's scheme at build time, so warn rather than reject.
         if !self.http_auth.is_empty() && self.http_ca.is_none() && self.http_inject_ca.is_empty() {
-            eprintln!(
-                "sandlock: warning: --http-auth with no CA (--http-ca/--http-inject-ca) only \
+            log::warn!(
+                "--http-auth with no CA (--http-ca/--http-inject-ca) only \
                  injects into plaintext HTTP (port 80); requests to HTTPS hosts bypass the proxy \
                  and are sent without the credential"
             );
@@ -1087,8 +1087,8 @@ impl SandboxBuilder {
                 &self.fs_denied,
                 self.chroot.as_deref(),
             ) {
-                eprintln!(
-                    "sandlock: warning: credential file {} is inside the sandbox grant {}; \
+                log::warn!(
+                    "credential file {} is inside the sandbox grant {}; \
                      the sandboxed child can read the secret directly; keep it outside every \
                      fs grant (or add `--fs-deny {}` to close it)",
                     path,
