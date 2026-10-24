@@ -108,7 +108,15 @@ pub(crate) struct Entry {
 union SemArg {
     value: libc::c_int,
     array: *mut libc::c_ushort,
-    stat: *mut libc::semid_ds,
+    stat: *mut SemidDs,
+}
+
+// libc has no semid_ds for musl, and only sem_perm, its first member, sits at
+// the same offset across libcs and arches; the tail covers the kernel's struct.
+#[repr(C)]
+struct SemidDs {
+    sem_perm: libc::ipc_perm,
+    _rest: [libc::c_ulong; 8],
 }
 
 fn checked(result: i32) -> io::Result<i32> {
@@ -149,10 +157,11 @@ fn open_semaphores(key: libc::key_t, count: usize, create: bool) -> io::Result<i
             0o600 | if create { libc::IPC_CREAT } else { 0 },
         )
     })?;
-    let mut stat: libc::semid_ds = unsafe { std::mem::zeroed() };
+    let mut stat: SemidDs = unsafe { std::mem::zeroed() };
     checked(unsafe { libc::semctl(id, 0, libc::IPC_STAT, SemArg { stat: &mut stat }) })?;
     validate_permissions(&stat.sem_perm)?;
-    if stat.sem_nsems as usize != count {
+    let exists = |num: usize| unsafe { libc::semctl(id, num as i32, libc::GETVAL) } >= 0;
+    if !exists(count - 1) || exists(count) {
         return Err(invalid());
     }
     Ok(id)
