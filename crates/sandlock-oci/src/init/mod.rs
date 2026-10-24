@@ -21,6 +21,8 @@ pub use proto::{Req, Resp, CONTROL_FD};
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 
+use sandlock_core::child_env::ChildEnv;
+
 fn send(fd: RawFd, resp: &Resp) {
     if let Ok(mut v) = serde_json::to_vec(resp) {
         v.push(b'\n');
@@ -38,6 +40,13 @@ fn spawn(
     cwd: &Option<String>,
     stdio: Option<[RawFd; 3]>,
 ) -> i32 {
+    // init is a fork of the multi-threaded supervisor and may have inherited
+    // std's env lock held, so std::env is off limits here.
+    let mut child_env = unsafe { ChildEnv::from_environ() };
+    for (k, v) in env {
+        let _ = child_env.set(k, v);
+    }
+    let envp = child_env.envp();
     let pid = unsafe { libc::fork() };
     if pid != 0 {
         return pid;
@@ -64,9 +73,7 @@ fn spawn(
             }
         }
     }
-    for (k, v) in env {
-        std::env::set_var(k, v);
-    }
+    unsafe { envp.install() };
     let cargv: Vec<CString> = argv
         .iter()
         .filter_map(|a| CString::new(a.as_str()).ok())
