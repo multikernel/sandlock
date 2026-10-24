@@ -119,6 +119,7 @@ pub const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
 pub const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 pub const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 pub const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+pub const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 
 // ============================================================
 // Landlock net access flags

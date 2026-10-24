@@ -358,11 +358,11 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Network (conditional on has_net_destination_policy || has_unix_fs_gate;
-    // the latter traps connect() to gate named unix sockets). has_http_acl is
-    // already subsumed by has_net_destination_policy, so it isn't listed.
+    // Network (conditional on has_net_destination_policy or the supervisor
+    // gating named unix sockets). has_http_acl is already subsumed by
+    // has_net_destination_policy, so it isn't listed.
     // ------------------------------------------------------------------
-    if policy.has_net_destination_policy || policy.has_unix_fs_gate {
+    if policy.has_net_destination_policy || policy.supervises_unix_connect() {
         for &nr in &[
             libc::SYS_connect,
             libc::SYS_sendto,
@@ -1273,6 +1273,7 @@ mod handler_tests {
                 has_net_destination_policy: false,
                 has_bind_denylist: false,
                 has_unix_fs_gate: false,
+                landlock_unix_gate: false,
                 has_random_seed: false,
                 has_time_start: false,
                 time_offset: 0,
