@@ -87,35 +87,6 @@ async fn test_fork_cow_sharing() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
-/// Test CLONE_ID environment variable.
-#[tokio::test]
-async fn test_fork_clone_id_env() {
-    let out_dir = std::env::temp_dir().join(format!("sandlock-fork-env-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&out_dir);
-    let out = out_dir.clone();
-
-    let mut sb = base_policy().with_init_fn(|| {}).with_work_fn(move |_| {
-        let id = std::env::var("CLONE_ID").unwrap_or_default();
-        let _ = std::fs::write(out.join(&id), &id);
-    });
-
-    let mut clones = sb.fork(3).await.unwrap();
-    for c in clones.iter_mut() {
-        let _ = async {
-            c.wait().await?;
-            c.shutdown().await
-        }
-        .await;
-    }
-
-    for i in 0..3u32 {
-        let content = std::fs::read_to_string(out_dir.join(format!("{}", i))).unwrap_or_default();
-        assert_eq!(content, i.to_string());
-    }
-
-    let _ = std::fs::remove_dir_all(&out_dir);
-}
-
 /// Test map-reduce: clone stdout flows via pipes to reducer stdin.
 #[tokio::test]
 async fn test_fork_reduce() {

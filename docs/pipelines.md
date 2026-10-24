@@ -112,4 +112,5 @@ let result = reducer.reduce(
 
 Map and reduce run in separate sandboxes with independent configs:
 the mapper has data access, the reducer doesn't. Each clone inherits
-Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
+Landlock + seccomp confinement. The work function receives the clone id
+(`0..N-1`) as its argument.

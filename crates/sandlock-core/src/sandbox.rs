@@ -1083,7 +1083,8 @@ impl Sandbox {
 
     /// Set the COW-fork work function and return `self`.
     ///
-    /// The work function runs in each COW clone (`fork(N)` produces N clones).
+    /// The work function runs in each COW clone (`fork(N)` produces N clones)
+    /// and receives the clone id (`0..N-1`) as its argument.
     pub fn with_work_fn(mut self, f: impl Fn(u32) + Send + Sync + 'static) -> Self {
         self.work_fn = Some(Arc::new(f));
         self

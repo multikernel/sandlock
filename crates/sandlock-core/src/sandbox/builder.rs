@@ -863,7 +863,8 @@ impl SandboxBuilder {
 
     /// Set the COW-fork work function.
     ///
-    /// The work function runs in each COW clone (`fork(N)` produces N clones).
+    /// The work function runs in each COW clone (`fork(N)` produces N clones)
+    /// and receives the clone id (`0..N-1`) as its argument.
     /// Required for `Sandbox::fork()`.
     pub fn work_fn(mut self, f: impl Fn(u32) + Send + Sync + 'static) -> Self {
         self.work_fn = Some(Arc::new(f));

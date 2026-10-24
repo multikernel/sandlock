@@ -3,7 +3,7 @@
 //! The template process runs `init_cmd` to load expensive state, then
 //! enters a fork-ready loop. The parent calls `fork(N)` to create N
 //! COW clones that share memory pages with the template. Each clone
-//! receives `CLONE_ID=0..N-1` and execs `work_cmd`.
+//! runs `work_fn(clone_id)` with `clone_id` in `0..N`.
 //!
 //! Uses raw `fork()` syscall (NR 57 on x86_64). The supervisor
 //! intercepts fork-like syscalls for process accounting and, when
@@ -81,7 +81,6 @@ pub(crate) fn fork_ready_loop_fn(
                     }
                 }
                 unsafe { libc::setpgid(0, 0) };
-                std::env::set_var("CLONE_ID", i.to_string());
 
                 work_fn(i);
                 unsafe { libc::fflush(std::ptr::null_mut()) };
