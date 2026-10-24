@@ -5,6 +5,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use crate::child_env::ChildEnv;
 use crate::resolved::ResolvedSandbox;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf;
@@ -239,6 +240,7 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// Terminal action after confinement: `execve` a command or run a fn
     /// in-process. See [`ChildEntry`].
     pub entry: ChildEntry<'a>,
+    pub env: &'a ChildEnv,
     pub pipes: &'a PipePair,
     /// Skip the user-notification supervisor: child installs a kernel-only
     /// deny filter, parent reads `notif_fd_num = 0` and never starts a
@@ -299,6 +301,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let ChildSpawnArgs {
         sandbox,
         entry,
+        env,
         pipes,
         no_supervisor,
         keep_fds,
@@ -551,38 +554,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     close_fds_above(2, &fds_to_keep);
 
     // 13. Apply environment
-    if sandbox.clean_env {
-        // Clear all env vars first
-        for (key, _) in std::env::vars_os() {
-            std::env::remove_var(&key);
-        }
-    }
-    // Remove env vars whose value was loaded into the supervisor as a credential
-    // source, so the agent can't read the real secret straight from its own
-    // environment (this is the child; the mutation is process-local and post-fork).
-    // This runs *before* applying `sandbox.env`, so the inherited real secret is
-    // dropped but a deliberate placeholder the user passes (e.g.
-    // `--env OPENAI_API_KEY=dummy`, which SDKs need set to start) still survives.
-    for name in &sandbox.inject_env_strip {
-        std::env::remove_var(name);
-    }
-    for (key, value) in &sandbox.env {
-        std::env::set_var(key, value);
-    }
-
-    // 13b. GPU device visibility
-    if let Some(ref devices) = sandbox.gpu_devices {
-        if !devices.is_empty() {
-            let vis = devices
-                .iter()
-                .map(|d| d.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            std::env::set_var("CUDA_VISIBLE_DEVICES", &vis);
-            std::env::set_var("ROCR_VISIBLE_DEVICES", &vis);
-        }
-        // Empty list = all GPUs visible, don't set env vars
-    }
+    let envp = env.envp();
+    unsafe { envp.install() };
 
     // 13c. Optional: cap the file-descriptor table.
     //
@@ -652,16 +625,13 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     mark_exec(exec_w, EXEC_REACHED);
 
     if let Some(fd) = exec_fd {
-        extern "C" {
-            static environ: *const *const libc::c_char;
-        }
         unsafe {
             libc::syscall(
                 libc::SYS_execveat,
                 fd,
                 c"".as_ptr(),
                 argv_ptrs.as_ptr(),
-                environ,
+                envp.as_ptr(),
                 libc::AT_EMPTY_PATH,
             )
         };

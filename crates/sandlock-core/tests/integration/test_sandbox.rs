@@ -1117,3 +1117,76 @@ fn test_capture_wait_does_not_park_blocking_pool_threads() {
         assert_eq!(result.stdout.as_deref(), Some(&b"hi\n"[..]));
     });
 }
+
+fn env_policy() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .clean_env(true)
+        .env_var("SANDLOCK_ENV_TEST", "applied")
+}
+
+#[tokio::test]
+async fn test_env_applied_and_path_from_child_env() {
+    let result = env_policy()
+        .build()
+        .unwrap()
+        .run(&["sh", "-c", "echo $SANDLOCK_ENV_TEST ${HOME-unset}"])
+        .await
+        .unwrap();
+    assert!(result.success());
+    assert_eq!(result.stdout_str().unwrap().trim(), "applied unset");
+
+    let result = env_policy()
+        .env_var("PATH", "/nonexistent")
+        .build()
+        .unwrap()
+        .run(&["sh", "-c", "true"])
+        .await
+        .unwrap();
+    assert!(!result.success(), "PATH lookup must use the child's PATH");
+}
+
+// A host thread holding std's env lock at fork must not hang the child (#312).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spawn_while_host_reads_env() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::black_box(std::env::vars().count());
+                }
+            })
+        })
+        .collect();
+
+    let spawners: Vec<_> = (0..4)
+        .map(|_| {
+            tokio::spawn(async {
+                for _ in 0..50 {
+                    let result = env_policy().build().unwrap().run(&["true"]).await.unwrap();
+                    assert!(result.success());
+                }
+            })
+        })
+        .collect();
+    let all = async {
+        for s in spawners {
+            s.await.unwrap();
+        }
+    };
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(120), all).await;
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        r.join().unwrap();
+    }
+    outcome.expect("sandbox spawn hung");
+}

@@ -2,6 +2,8 @@ pub(crate) mod arch;
 pub(crate) mod ca_inject;
 #[cfg(feature = "checkpoint")]
 pub(crate) mod checkpoint;
+#[doc(hidden)]
+pub mod child_env;
 pub(crate) mod chroot;
 pub mod context;
 pub mod control;

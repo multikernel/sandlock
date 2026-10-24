@@ -2313,6 +2313,9 @@ impl Sandbox {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let child_env = crate::child_env::ChildEnv::for_sandbox(self)
+            .map_err(|e| SandboxRuntimeError::Child(format!("environment: {}", e)))?;
+
         let no_supervisor = self.no_supervisor;
 
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
@@ -2580,6 +2583,7 @@ impl Sandbox {
             context::confine_child(context::ChildSpawnArgs {
                 sandbox: self,
                 entry,
+                env: &child_env,
                 pipes: &pipes,
                 no_supervisor,
                 keep_fds: &gather_keep_fds,
