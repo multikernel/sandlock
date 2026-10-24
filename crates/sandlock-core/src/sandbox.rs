@@ -2393,34 +2393,28 @@ impl Sandbox {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
-            match crate::cow::seccomp::SeccompCowBranch::create(
+            let mut branch = crate::cow::seccomp::SeccompCowBranch::create(
                 &workdir,
                 storage.as_deref(),
                 max_disk,
-            ) {
-                Ok(mut branch) => {
-                    // `Keep` must survive a sandbox that is never `wait()`ed:
-                    // the branch only reaches `Sandbox`'s own disposition after
-                    // a completed `wait()`, and the branch's `Drop` would
-                    // otherwise reclaim the upper the caller asked to keep.
-                    // Commit and Abort are NOT carried over that way — an
-                    // abandoned run has no exit status and merging its writes
-                    // is not something it can ask for, so those keep the
-                    // reclaiming default. With no exit status there is also no
-                    // choice between the two actions, so either one asking for
-                    // `Keep` preserves.
-                    branch.set_keep_if_abandoned(
-                        self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
-                    );
-                    self.fs_readable.push(branch.upper_dir().to_path_buf());
-                    self.cow_upper = Some(branch.upper_dir().to_path_buf());
-                    Some(branch)
-                }
-                Err(e) => {
-                    log::warn!("seccomp COW branch creation failed: {}", e);
-                    None
-                }
-            }
+            )
+            .map_err(SandboxRuntimeError::Branch)?;
+            // `Keep` must survive a sandbox that is never `wait()`ed:
+            // the branch only reaches `Sandbox`'s own disposition after
+            // a completed `wait()`, and the branch's `Drop` would
+            // otherwise reclaim the upper the caller asked to keep.
+            // Commit and Abort are NOT carried over that way — an
+            // abandoned run has no exit status and merging its writes
+            // is not something it can ask for, so those keep the
+            // reclaiming default. With no exit status there is also no
+            // choice between the two actions, so either one asking for
+            // `Keep` preserves.
+            branch.set_keep_if_abandoned(
+                self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
+            );
+            self.fs_readable.push(branch.upper_dir().to_path_buf());
+            self.cow_upper = Some(branch.upper_dir().to_path_buf());
+            Some(branch)
         } else {
             None
         };

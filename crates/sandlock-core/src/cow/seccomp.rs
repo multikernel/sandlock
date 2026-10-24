@@ -2102,28 +2102,15 @@ impl SeccompCowBranch {
             // deferral observable so it is recoverable rather than a silent lost
             // commit. Contention and a broken workdir are distinct — do not
             // collapse them into one message.
-            Err(CommitError::Contended(waited)) => {
-                log::warn!(
-                    "commit deferred: workdir lock on {} contended for {:?}; \
-                     upper preserved for recovery",
-                    self.workdir_str,
-                    waited
-                );
-                Err(BranchError::Operation(
-                    "commit deferred: workdir lock contended".into(),
-                ))
-            }
-            Err(CommitError::Lock(e)) => {
-                log::warn!(
-                    "commit deferred: workdir lock on {} could not be taken ({}); \
-                     upper preserved for recovery",
-                    self.workdir_str,
-                    e
-                );
-                Err(BranchError::Operation(format!(
-                    "commit deferred: workdir lock error: {e}"
-                )))
-            }
+            Err(CommitError::Contended(waited)) => Err(BranchError::Operation(format!(
+                "commit deferred: workdir lock contended for {waited:?} on {}; \
+                 upper preserved for recovery",
+                self.workdir_str
+            ))),
+            Err(CommitError::Lock(e)) => Err(BranchError::Operation(format!(
+                "commit deferred: workdir lock error: {e} on {}; upper preserved for recovery",
+                self.workdir_str
+            ))),
         }
     }
 
