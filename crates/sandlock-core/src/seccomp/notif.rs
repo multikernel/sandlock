@@ -1262,10 +1262,13 @@ pub struct NotifPolicy {
     pub has_bind_denylist: bool,
     /// Named (pathname) `AF_UNIX` connect gate. When true, `connect()` to a
     /// named unix socket whose path is not covered by an fs-write grant is
-    /// denied with EACCES. Landlock has no access right for unix-socket
-    /// connect, so the seccomp layer closes the escape; abstract sockets are
-    /// handled by `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` instead.
+    /// denied with EACCES. Abstract sockets are handled by
+    /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` instead.
     pub has_unix_fs_gate: bool,
+    /// The host's Landlock enforces [`Self::has_unix_fs_gate`] itself
+    /// (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), so the caller can connect in its
+    /// own name.
+    pub landlock_unix_gate: bool,
     pub has_random_seed: bool,
     pub has_time_start: bool,
     /// Argv-safety gate: the supervisor must freeze every task that
@@ -1309,6 +1312,19 @@ pub struct NotifPolicy {
 }
 
 impl NotifPolicy {
+    /// Whether a named unix `connect()` is decided by the supervisor. It then
+    /// connects on-behalf, so the peer's `SO_PEERCRED` names the supervisor.
+    pub(crate) fn supervises_unix_connect(&self) -> bool {
+        self.has_unix_fs_gate && !self.landlock_unix_gate
+    }
+
+    /// Whether a named unix send is decided by the supervisor. A destination
+    /// policy keeps sends on-behalf even under Landlock: a `Continue` would let
+    /// a racing `dup2` move the send onto an IP socket.
+    pub(crate) fn supervises_unix_send(&self) -> bool {
+        self.has_unix_fs_gate && (!self.landlock_unix_gate || self.has_net_destination_policy)
+    }
+
     /// Whether an open may land on something the supervisor answers for
     /// whatever the spelling: procfs, which is never a Landlock rule while a
     /// supervisor runs, or a virtualized file inside a read grant.

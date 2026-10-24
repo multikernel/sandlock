@@ -153,8 +153,20 @@ must pass the allowlist and must not match the denylist. Because Landlock is
 allowlist-only, a deny-bind relaxes the Landlock `BIND_TCP` hook and enforces
 the denylist on the on-behalf seccomp `bind()` path instead.
 
-**AF_UNIX sockets** are governed by Landlock's
-`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, independent from `--net-allow`.
+**AF_UNIX sockets** are governed independently from `--net-allow`. Abstract
+sockets are confined by Landlock's `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
+Connecting or sending to a named (pathname) socket requires the socket to be
+under an fs-write grant. On kernels with Landlock ABI v9 or later, Landlock
+enforces this through `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` and the sandboxed
+process connects in its own name. Older kernels cannot gate it, so the
+supervisor checks the target and connects on the child's behalf, and the
+server then sees the supervisor as the peer: `SO_PEERCRED`, `SO_PEERPIDFD` and
+`SCM_CREDENTIALS` name the supervisor process (the embedding application when
+sandlock is used as a library), not the sandboxed caller. The same holds on
+any kernel for datagrams sent to a named socket while a destination policy
+(`--net-allow`, `--net-deny`, `--http-allow`, a policy function) is active.
+Services that authorize clients by peer credentials must treat the
+supervisor's pid as untrusted.
 
 ## HTTP ACL and credentials
 

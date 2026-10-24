@@ -2138,8 +2138,7 @@ impl Sandbox {
 
     /// Whether named (pathname) `AF_UNIX` connects should be gated by the
     /// fs-write grants (`has_unix_fs_gate`). Active whenever the sandbox
-    /// confines the filesystem; Landlock cannot gate unix-socket connect, so
-    /// the seccomp layer does. Single source of truth for both the
+    /// confines the filesystem. Single source of truth for both the
     /// `NotifPolicy` flag and the `notif_syscalls` BPF set.
     pub(crate) fn has_unix_fs_gate(&self) -> bool {
         !self.fs_readable.is_empty() || !self.fs_writable.is_empty()
@@ -2671,6 +2670,7 @@ impl Sandbox {
                 has_net_destination_policy: resolved.features.network_destination_policy,
                 has_bind_denylist: resolved.features.bind_denylist,
                 has_unix_fs_gate: resolved.features.unix_fs_gate,
+                landlock_unix_gate: resolved.features.landlock_unix_gate,
                 has_random_seed: resolved.features.random_seed,
                 has_time_start: resolved.features.time_start,
                 argv_safety_required: resolved.features.argv_safety_required,

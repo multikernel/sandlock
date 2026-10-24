@@ -10,10 +10,10 @@ use crate::sys::structs::{
     LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO, LANDLOCK_ACCESS_FS_MAKE_REG,
     LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM, LANDLOCK_ACCESS_FS_READ_DIR,
     LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REMOVE_DIR,
-    LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_WRITE_FILE,
-    LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP, LANDLOCK_CREATE_RULESET_VERSION,
-    LANDLOCK_RULE_NET_PORT, LANDLOCK_RULE_PATH_BENEATH, LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
-    LANDLOCK_SCOPE_SIGNAL, SYS_LANDLOCK_CREATE_RULESET,
+    LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_RESOLVE_UNIX, LANDLOCK_ACCESS_FS_TRUNCATE,
+    LANDLOCK_ACCESS_FS_WRITE_FILE, LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP,
+    LANDLOCK_CREATE_RULESET_VERSION, LANDLOCK_RULE_NET_PORT, LANDLOCK_RULE_PATH_BENEATH,
+    LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET, LANDLOCK_SCOPE_SIGNAL, SYS_LANDLOCK_CREATE_RULESET,
 };
 use crate::sys::syscall;
 
@@ -33,7 +33,8 @@ const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
     | LANDLOCK_ACCESS_FS_WRITE_FILE
     | LANDLOCK_ACCESS_FS_READ_FILE
     | LANDLOCK_ACCESS_FS_TRUNCATE
-    | LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    | LANDLOCK_ACCESS_FS_IOCTL_DEV
+    | LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
 
 /// Build the full FS access bitmask for the given ABI version.
 fn base_fs_access(abi: u32) -> u64 {
@@ -61,6 +62,9 @@ fn base_fs_access(abi: u32) -> u64 {
     if abi >= 5 {
         mask |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
+    if abi >= RESOLVE_UNIX_ABI {
+        mask |= LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
+    }
     mask
 }
 
@@ -87,7 +91,21 @@ fn write_access(abi: u32) -> u64 {
     if abi >= 5 {
         mask |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
+    if abi >= RESOLVE_UNIX_ABI {
+        mask |= LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
+    }
     mask
+}
+
+/// First ABI whose Landlock gates connect() and addressed sends to named unix
+/// sockets (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`).
+const RESOLVE_UNIX_ABI: u32 = 9;
+
+/// Whether the host's Landlock gates named unix sockets itself. When it does,
+/// the caller connects in its own name, so peers see its credentials instead
+/// of the supervisor's.
+pub(crate) fn gates_named_unix() -> bool {
+    abi_version().is_ok_and(|abi| abi >= RESOLVE_UNIX_ABI)
 }
 
 /// Indices N for which `/dev/nvidiaN` exists. Used for the "all GPUs"
