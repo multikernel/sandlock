@@ -6,8 +6,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use landlock::{
-    AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, Ruleset,
-    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
+    make_bitflags, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
+    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use crate::error::{ConfinementError, SandlockError};
@@ -15,6 +15,8 @@ use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
 use crate::sandbox::Sandbox;
 use crate::sys::structs::{LANDLOCK_CREATE_RULESET_VERSION, SYS_LANDLOCK_CREATE_RULESET};
 use crate::sys::syscall;
+
+const READ_ACCESS: BitFlags<AccessFs> = make_bitflags!(AccessFs::{Execute | ReadFile | ReadDir});
 
 /// Indices N for which `/dev/nvidiaN` exists. Used for the "all GPUs"
 /// (`gpu_devices == []`) case. Matches `nvidia<digits>` exactly, so the
@@ -111,8 +113,7 @@ fn add_read_rules_around_shadowed(
             ruleset = add_read_rules_around_shadowed(ruleset, &path)?;
         } else {
             // An entry that vanished or cannot be referenced costs only itself.
-            let _ =
-                add_path_beneath_rule(&mut ruleset, path, AccessFs::from_read(landlock::ABI::V1));
+            let _ = add_path_beneath_rule(&mut ruleset, path, READ_ACCESS);
         }
     }
     Ok(ruleset)
@@ -420,10 +421,9 @@ fn confine_inner(
     // The PT_INTERP patching in handle_chroot_exec ensures the kernel loads
     // the image's ELF interpreter via an injected fd, not a host path.
     let chroot_root = policy.chroot.as_deref();
-    // Use the resolved handled set for writable-path grants so disabled or
-    // degraded rights cannot be reintroduced. path_beneath_rule further
+    // Writable-path grants use the resolved handled set so disabled or
+    // degraded rights cannot be reintroduced. add_path_beneath_rule further
     // removes directory-only rights for non-directory paths.
-    let fs_write_mask = handled_access_fs;
     for path in &policy.fs_writable {
         if supervised && chroot_root.is_none() && crate::procfs::is_supervised_proc_grant(path) {
             continue;
@@ -439,7 +439,7 @@ fn confine_inner(
             path.as_path()
         };
 
-        ruleset = add_path_beneath_rule(ruleset, rule_path, fs_write_mask)?;
+        ruleset = add_path_beneath_rule(ruleset, rule_path, handled_access_fs)?;
     }
 
     for path in &policy.fs_readable {
@@ -467,8 +467,7 @@ fn confine_inner(
             path.as_path()
         };
 
-        ruleset =
-            add_path_beneath_rule(ruleset, rule_path, AccessFs::from_read(landlock::ABI::V1))?;
+        ruleset = add_path_beneath_rule(ruleset, rule_path, READ_ACCESS)?;
     }
 
     // GPU device paths (when gpu_devices is set)
@@ -477,7 +476,7 @@ fn confine_inner(
         // (nvidiactl = RM control channel; uvm = unified memory.)
         for path in &["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"] {
             // Ignore errors — nodes may not exist (e.g. uvm before first use)
-            let _ = add_path_beneath_rule(&mut ruleset, path, fs_write_mask);
+            let _ = add_path_beneath_rule(&mut ruleset, path, handled_access_fs);
         }
 
         // Per-GPU render nodes. Each physical GPU N is a distinct node
@@ -492,7 +491,7 @@ fn confine_inner(
         };
         for idx in indices {
             let node = format!("/dev/nvidia{idx}");
-            let _ = add_path_beneath_rule(&mut ruleset, node, fs_write_mask);
+            let _ = add_path_beneath_rule(&mut ruleset, node, handled_access_fs);
         }
 
         // DRM render nodes. /dev/dri is a directory of per-GPU card*/renderD*
@@ -501,17 +500,16 @@ fn confine_inner(
         // /dev/dri, so only grant it for the all-GPUs case; per-index DRM
         // mapping would need a PCI-BDF -> renderD* lookup (future work).
         if devices.is_empty() {
-            let _ = add_path_beneath_rule(&mut ruleset, "/dev/dri", fs_write_mask);
+            let _ = add_path_beneath_rule(&mut ruleset, "/dev/dri", handled_access_fs);
         }
 
         // Read-only access to GPU sysfs/procfs
-        let fs_read_mask = AccessFs::from_read((abi as i32).into());
         for path in &[
             "/proc/driver/nvidia",
             "/sys/bus/pci/devices",
             "/sys/module/nvidia",
         ] {
-            let _ = add_path_beneath_rule(&mut ruleset, path, fs_read_mask);
+            let _ = add_path_beneath_rule(&mut ruleset, path, READ_ACCESS);
         }
     }
 
@@ -520,7 +518,7 @@ fn confine_inner(
     // degraded on a host without TCP network hooks) — `handled_access_net`
     // is 0 in that case and the kernel would reject any rule with EINVAL.
     let net_tcp_active =
-        ProtectionStatus::resolve(Protection::NetTcp, abi as u32, pol) == ProtectionStatus::Active;
+        ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     // `BindPorts::All` installs no rules: BIND_TCP was dropped from the
     // handled set, so every bind is already allowed. A listed port `0` is
     // installed verbatim: Landlock permits only a `bind(0)` request with it

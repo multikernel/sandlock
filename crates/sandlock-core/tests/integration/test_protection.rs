@@ -418,7 +418,7 @@ fn disable_fs_protection_with_writable_path_does_not_einval() {
     // Needs a real v6+ host: the default policy keeps the v6 scope
     // protections Strict, so confine_filesystem would otherwise abort
     // with ProtectionUnavailable before reaching the FS rules.
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 as u32 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }
