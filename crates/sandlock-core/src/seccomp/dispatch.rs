@@ -1278,6 +1278,7 @@ mod handler_tests {
                 time_offset: 0,
                 num_cpus: None,
                 argv_safety_required: false,
+                notif_wait_killable: true,
                 port_remap: false,
                 cow_enabled: false,
                 chroot_root: None,

@@ -488,6 +488,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), 0) {
             fail!(format!("write no-supervisor signal: {}", e));
         }
+        if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), 0) {
+            fail!(format!("write notif wait: {}", e));
+        }
     } else {
         let deny = blocklist_syscall_numbers(sandbox);
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
@@ -507,8 +510,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
         };
-        let notif_fd = match bpf::install_filter(&filter) {
-            Ok(fd) => fd,
+        let listener = match bpf::install_filter(&filter) {
+            Ok(listener) => listener,
             Err(e) => {
                 // EBUSY here means another seccomp filter on this task already
                 // owns the SECCOMP_FILTER_FLAG_NEW_LISTENER slot. The kernel
@@ -528,11 +531,14 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
                 fail!(format!("seccomp install: {}", e));
             }
         };
-        keep_fd = notif_fd.as_raw_fd();
+        keep_fd = listener.fd.as_raw_fd();
         if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), keep_fd as u32) {
             fail!(format!("write notif fd: {}", e));
         }
-        std::mem::forget(notif_fd);
+        if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), listener.wait_killable as u32) {
+            fail!(format!("write notif wait: {}", e));
+        }
+        std::mem::forget(listener.fd);
     }
 
     if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), exec_r as u32) {

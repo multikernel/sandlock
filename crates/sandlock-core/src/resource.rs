@@ -997,6 +997,7 @@ mod tests {
             has_random_seed: false,
             has_time_start: false,
             argv_safety_required,
+            notif_wait_killable: true,
             time_offset: 0,
             num_cpus: None,
             port_remap: false,

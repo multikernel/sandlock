@@ -171,19 +171,16 @@ pub fn install_deny_filter(prog: &[SockFilter]) -> std::io::Result<()> {
 
 /// Install a cBPF seccomp filter on the calling thread with `NEW_LISTENER`.
 ///
-/// `WAIT_KILLABLE_RECV` (Linux 5.19+) is preferred for reliable notification
-/// delivery, but we fall back to `NEW_LISTENER`-only on older kernels that
-/// reject the bit with `EINVAL`. The fallback matches the pre-Rust Python
-/// implementation (`commit 50d5eb9`) and only trades a robustness flag —
-/// the security boundary (kept by `NEW_LISTENER`) is unaffected.
-///
-/// Returns the seccomp notification file descriptor.
-pub fn install_filter(prog: &[SockFilter]) -> std::io::Result<OwnedFd> {
+/// `WAIT_KILLABLE_RECV` (Linux 5.19+) is preferred, with a fallback to
+/// `NEW_LISTENER` alone on kernels that reject it with `EINVAL`. The
+/// supervisor must learn which one it got: only a killable wait keeps a task
+/// whose notification it holds out of user space.
+pub fn install_filter(prog: &[SockFilter]) -> std::io::Result<Listener> {
     let fprog = SockFprog {
         len: prog.len() as u16,
         filter: prog.as_ptr(),
     };
-    let fd = install_with_einval_fallback(
+    let (fd, flags) = install_with_einval_fallback(
         SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
         SECCOMP_FILTER_FLAG_NEW_LISTENER,
         |flags| {
@@ -194,11 +191,21 @@ pub fn install_filter(prog: &[SockFilter]) -> std::io::Result<OwnedFd> {
             )
         },
     )?;
-    // SAFETY: kernel returns a valid fd on success
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    Ok(Listener {
+        // SAFETY: kernel returns a valid fd on success
+        fd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+        wait_killable: flags & SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0,
+    })
+}
+
+/// A seccomp notification fd and the kind of wait its notifications get.
+pub struct Listener {
+    pub fd: OwnedFd,
+    pub wait_killable: bool,
 }
 
 /// Call `install` with `preferred_flags`; on `EINVAL`, retry with `fallback_flags`.
+/// Returns the fd and the flags it was installed with.
 ///
 /// Extracted as a generic helper so the EINVAL-retry control flow can be
 /// unit-tested without the real `seccomp(2)` syscall.
@@ -206,13 +213,15 @@ pub(crate) fn install_with_einval_fallback<F>(
     preferred_flags: u64,
     fallback_flags: u64,
     mut install: F,
-) -> std::io::Result<i64>
+) -> std::io::Result<(i64, u64)>
 where
     F: FnMut(u64) -> std::io::Result<i64>,
 {
     match install(preferred_flags) {
-        Ok(fd) => Ok(fd),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => install(fallback_flags),
+        Ok(fd) => Ok((fd, preferred_flags)),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            Ok((install(fallback_flags)?, fallback_flags))
+        }
         Err(e) => Err(e),
     }
 }
@@ -474,7 +483,7 @@ mod tests {
             Ok(42)
         })
         .expect("should succeed");
-        assert_eq!(fd, 42);
+        assert_eq!(fd, (42, PREFERRED));
         assert_eq!(calls, vec![PREFERRED], "must not retry on success");
     }
 
@@ -490,7 +499,7 @@ mod tests {
             }
         })
         .expect("fallback must succeed");
-        assert_eq!(fd, 99);
+        assert_eq!(fd, (99, FALLBACK));
         assert_eq!(
             calls,
             vec![PREFERRED, FALLBACK],

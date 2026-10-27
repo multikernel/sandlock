@@ -1275,6 +1275,9 @@ pub struct NotifPolicy {
     /// Also gates ptrace fork-event tracking so `ProcessIndex` is
     /// complete when the freeze enumerates it.
     pub argv_safety_required: bool,
+    /// The child's listener holds a received notification's caller until it
+    /// is answered (`WAIT_KILLABLE_RECV`); the exec freeze relies on that.
+    pub notif_wait_killable: bool,
     pub time_offset: i64,
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
