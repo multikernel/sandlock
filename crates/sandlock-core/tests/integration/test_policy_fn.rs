@@ -1923,3 +1923,72 @@ async fn held_sendmmsg_mixed_batch() {
     assert!(r2.recv_from(&mut buf).is_ok());
     assert_eq!(*approvals.lock().unwrap(), 1);
 }
+
+/// Issue #320: a thread parked in a held open while another process execs
+/// must be left alone by the exec freeze, which cannot release it until
+/// the supervisor answers that open.
+#[tokio::test]
+async fn exec_while_peer_parked_in_held_open() {
+    let held_path = temp_file("parked-open");
+    std::fs::write(&held_path, b"").unwrap();
+    let marker = temp_file("parked-marker");
+    let _ = std::fs::remove_dir(&marker);
+    let out = temp_file("parked-out");
+    let held_name = held_path.file_name().unwrap().to_owned();
+    let marker_name = marker.file_name().unwrap().to_owned();
+    let held: Arc<Mutex<Option<Approval>>> = Arc::new(Mutex::new(None));
+
+    let policy = base_policy()
+        .policy_fn(PolicyFn::deferred(move |event, _ctx, approval| {
+            let name = event.path.as_ref().and_then(|p| p.file_name());
+            if event.syscall == "openat" && name == Some(&held_name) {
+                *held.lock().unwrap() = approval;
+                return;
+            }
+            if event.syscall == "mkdirat" && name == Some(&marker_name) {
+                if let Some(open) = held.lock().unwrap().take() {
+                    open.allow();
+                }
+            }
+            if let Some(approval) = approval {
+                approval.allow();
+            }
+        }))
+        .build()
+        .unwrap();
+
+    let script = format!(
+        concat!(
+            "import os, threading, time\n",
+            "t = threading.Thread(target=lambda: open('{held}').close())\n",
+            "t.start()\n",
+            "time.sleep(0.2)\n",
+            "pid = os.fork()\n",
+            "if pid == 0:\n",
+            "  os.execv('/bin/true', ['true'])\n",
+            "_, st = os.waitpid(pid, 0)\n",
+            "open('{out}', 'w').write('EXIT:%d' % st)\n",
+            "os.mkdir('{marker}')\n",
+            "t.join()\n",
+        ),
+        held = held_path.display(),
+        out = out.display(),
+        marker = marker.display()
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        policy.clone().run_interactive(&["python3", "-c", &script]),
+    )
+    .await;
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&held_path);
+    let _ = std::fs::remove_dir(&marker);
+    let result = result.expect("supervisor hung on a thread parked in a held open");
+    assert!(result.unwrap().success());
+    assert_eq!(
+        content, "EXIT:0",
+        "exec beside a parked thread must succeed"
+    );
+}

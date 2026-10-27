@@ -40,6 +40,20 @@
 //! execution. The freeze function returns the peer TID list for that
 //! purpose; siblings are not returned because they need no follow-up.
 //!
+//! # Tasks parked in a notification
+//!
+//! Where the kernel has `WAIT_KILLABLE_RECV`, a task whose notification the
+//! supervisor has received but not answered sits in a killable seccomp wait
+//! and cannot run user code until the supervisor answers, which it does not
+//! do while a freeze is held. Such tasks are skipped. Seizing one would be
+//! worse than pointless: the interrupt moves it from the interruptible wait
+//! it started in to the killable one, where it cannot stop until the
+//! supervisor, now blocked reaping it, sends the answer.
+//!
+//! Without the flag the wait stays interruptible, so any signal releases
+//! the task and it must be frozen. The interrupt then withdraws its
+//! notification and it stops at once; its syscall restarts after release.
+//!
 //! # Failure modes (strict)
 //!
 //! The freeze is an invariant: if the supervisor exposed argv to
@@ -259,7 +273,8 @@ impl std::fmt::Display for FreezeError {
 ///
 /// Walks every TGID in `processes`, enumerates each TGID's threads via
 /// `/proc/<tgid>/task/`, and `PTRACE_SEIZE` + `PTRACE_INTERRUPT`s
-/// every TID except `caller_tid`. Sibling threads of `caller_tid` and
+/// every TID except `caller_tid` and the `parked` tids the supervisor holds
+/// in unanswered notifications. Sibling threads of `caller_tid` and
 /// peer threads in other TGIDs are both covered. `processes` is
 /// complete for `policy_fn` runs because fork-like syscalls are tracked
 /// before new children can run.
@@ -275,6 +290,7 @@ impl std::fmt::Display for FreezeError {
 pub(crate) fn freeze_sandbox_for_execve(
     processes: &crate::seccomp::state::ProcessIndex,
     caller_tid: i32,
+    parked: &HashSet<i32>,
 ) -> Result<SandboxFreeze, FreezeError> {
     let no_pending = |error| FreezeError {
         error,
@@ -296,7 +312,7 @@ pub(crate) fn freeze_sandbox_for_execve(
             Err(_) => continue,
         };
         for tid in tids {
-            if tid == caller_tid {
+            if tid == caller_tid || parked.contains(&tid) {
                 continue;
             }
             match seize_and_interrupt(tid) {
@@ -506,8 +522,8 @@ mod tests {
             .register(peer_pid)
             .expect("register peer in ProcessIndex");
 
-        let outcome =
-            freeze_sandbox_for_execve(&processes, caller_tid).expect("freeze_sandbox_for_execve");
+        let outcome = freeze_sandbox_for_execve(&processes, caller_tid, &HashSet::new())
+            .expect("freeze_sandbox_for_execve");
 
         // Peer's TID is its own TGID (single-threaded sleep), and it's
         // a different TGID from the execve caller, so it should be in peer_tids.
@@ -602,7 +618,7 @@ mod tests {
             processes.register(*tid).expect("register peer tid");
         }
 
-        let outcome = freeze_sandbox_for_execve(&processes, caller_tid);
+        let outcome = freeze_sandbox_for_execve(&processes, caller_tid, &HashSet::new());
         if let Ok(freeze) = &outcome {
             // Detach before killing: a traced thread that dies stays a
             // zombie until its tracer reaps it, and that would wedge wait().
