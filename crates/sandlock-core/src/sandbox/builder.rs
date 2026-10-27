@@ -1,4 +1,5 @@
 use super::*;
+use std::os::fd::OwnedFd;
 
 /// Fluent builder for `Sandbox`.
 ///
@@ -11,13 +12,13 @@ pub struct SandboxBuilder {
         feature = "cli",
         arg(short = 'r', long = "fs-read", value_name = "PATH")
     )]
-    pub fs_readable: Vec<PathBuf>,
+    pub fs_readable: Vec<Grant>,
 
     #[cfg_attr(
         feature = "cli",
         arg(short = 'w', long = "fs-write", value_name = "PATH")
     )]
-    pub fs_writable: Vec<PathBuf>,
+    pub fs_writable: Vec<Grant>,
 
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
     pub fs_denied: Vec<PathBuf>,
@@ -429,12 +430,35 @@ impl SandboxBuilder {
     }
 
     pub fn fs_write(mut self, path: impl Into<PathBuf>) -> Self {
-        self.fs_writable.push(path.into());
+        self.fs_writable.push(path.into().into());
         self
     }
 
     pub fn fs_read(mut self, path: impl Into<PathBuf>) -> Self {
-        self.fs_readable.push(path.into());
+        self.fs_readable.push(path.into().into());
+        self
+    }
+
+    /// Grant writes beneath what `fd` refers to. The rule is installed on `fd`
+    /// itself, so a root checked through it cannot be swapped before confinement.
+    pub fn fs_write_fd(self, fd: OwnedFd) -> Self {
+        self.fs_pin(fd, true)
+    }
+
+    /// Grant reads beneath what `fd` refers to; see [`fs_write_fd`](Self::fs_write_fd).
+    pub fn fs_read_fd(self, fd: OwnedFd) -> Self {
+        self.fs_pin(fd, false)
+    }
+
+    fn fs_pin(mut self, fd: OwnedFd, writable: bool) -> Self {
+        let grant = Grant::from(fd);
+        if grant.path().is_none() {
+            return self.reject("fd grant has no path in the filesystem".into());
+        }
+        match writable {
+            true => self.fs_writable.push(grant),
+            false => self.fs_readable.push(grant),
+        }
         self
     }
 
@@ -883,6 +907,35 @@ impl SandboxBuilder {
         validate_allow_groups(&self.extra_allow_syscalls)?;
         validate_allow_deny_disjoint(&self.extra_allow_syscalls, &self.extra_deny_syscalls)?;
 
+        let drops_proc_links = crate::landlock_policy::ProcGrants::of(
+            !self.no_supervisor,
+            self.chroot.is_some() || self.image_rootfs.is_some(),
+        ) != crate::landlock_policy::ProcGrants::Landlock;
+        if let Some(link) = self
+            .fs_readable
+            .iter()
+            .chain(&self.fs_writable)
+            .filter_map(Grant::as_path)
+            .find(|path| drops_proc_links && crate::procfs::grant_escapes_proc(path))
+        {
+            return Err(SandboxError::Invalid(format!(
+                "fs grant {} is a /proc link and grants nothing; grant its target, \
+                 or pass the descriptor with fs_read_fd/fs_write_fd",
+                link.display()
+            )));
+        }
+        // A descriptor names a host inode, which has no path in the jail.
+        let has_fd_grant = self
+            .fs_readable
+            .iter()
+            .chain(&self.fs_writable)
+            .any(Grant::is_fd);
+        if has_fd_grant && (self.chroot.is_some() || self.image_rootfs.is_some()) {
+            return Err(SandboxError::Invalid(
+                "fd grants cannot be combined with chroot or an image".into(),
+            ));
+        }
+
         // Reject disable(FsRefer): the kernel denies REFER (cross-directory
         // rename/link) by default in every ruleset even when REFER is not
         // handled. Controlled cross-directory rename within writable areas
@@ -1076,10 +1129,14 @@ impl SandboxBuilder {
             let Some(path) = c.split_once('=').and_then(|(_, s)| s.strip_prefix("file:")) else {
                 continue;
             };
-            let grants = self
+            let grant_paths: Vec<PathBuf> = self
                 .fs_readable
                 .iter()
-                .chain(self.fs_writable.iter())
+                .chain(&self.fs_writable)
+                .filter_map(|grant| grant.path().map(std::borrow::Cow::into_owned))
+                .collect();
+            let grants = grant_paths
+                .iter()
                 .chain(self.fs_mount.iter().map(|(_, host)| host))
                 .chain(self.chroot.as_ref());
             if let Some(exposure) = exposing_grant(

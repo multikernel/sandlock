@@ -45,7 +45,8 @@ pub(crate) async fn access_errno(
             .chroot_readable
             .iter()
             .chain(&policy.chroot_writable)
-            .any(|g| super::own_grant_covers(p, g))
+            .filter_map(|grant| grant.path())
+            .any(|g| super::own_grant_covers(p, &g))
     };
     let mounted = policy.chroot_root.is_some()
         && policy

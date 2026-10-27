@@ -375,7 +375,7 @@ fn root_is_read_only(policy: &NotifPolicy) -> bool {
         && !policy
             .chroot_writable
             .iter()
-            .any(|p| p.as_path() == std::path::Path::new("/"))
+            .any(|grant| grant.is(std::path::Path::new("/")))
 }
 
 /// Generate a virtual /proc/mounts showing only the sandbox's own mounts.
@@ -623,6 +623,14 @@ pub(crate) fn is_supervised_proc_grant(path: &std::path::Path) -> bool {
     path.starts_with("/proc")
 }
 
+/// True for a /proc grant that resolves outside procfs, as a magic link such
+/// as /proc/self/fd/N does. The supervisor judges opens by the path they
+/// reach, which is never the link's, so such a grant admits nothing (#313).
+pub(crate) fn grant_escapes_proc(grant: &std::path::Path) -> bool {
+    is_supervised_proc_grant(grant)
+        && std::fs::canonicalize(grant).is_ok_and(|real| !is_supervised_proc_grant(&real))
+}
+
 /// A path inside the caller's own /proc directory.
 #[derive(Debug, PartialEq)]
 struct OwnProcTarget<'a> {
@@ -637,6 +645,14 @@ impl OwnProcTarget<'_> {
         self.self_forms.iter().any(|form| {
             list.iter()
                 .any(|entry| std::path::Path::new(form).starts_with(entry))
+        })
+    }
+
+    fn is_granted_by(&self, grants: &[crate::grant::Grant]) -> bool {
+        self.self_forms.iter().any(|form| {
+            grants
+                .iter()
+                .any(|grant| grant.covers(std::path::Path::new(form)))
         })
     }
 }
@@ -789,8 +805,8 @@ fn open_own_proc_on_behalf(
     // The deny precheck matches the string the child wrote, which the
     // numeric spelling of its own directory would slip past.
     let is_write = proc_open_is_write(args.flags);
-    let granted = target.is_under_any(&policy.chroot_writable)
-        || (!is_write && target.is_under_any(&policy.chroot_readable));
+    let granted = target.is_granted_by(&policy.chroot_writable)
+        || (!is_write && target.is_granted_by(&policy.chroot_readable));
     if !granted || target.is_under_any(&policy.chroot_denied) {
         return None;
     }
@@ -1526,6 +1542,36 @@ mod tests {
         assert!(is_supervised_proc_grant(Path::new("/proc/1/maps")));
         assert!(!is_supervised_proc_grant(Path::new("/procfs")));
         assert!(!is_supervised_proc_grant(Path::new("/etc")));
+    }
+
+    #[test]
+    fn test_grant_escapes_proc() {
+        use std::os::fd::AsRawFd;
+        use std::path::Path;
+        let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
+        let (pipe_r, _pipe_w) = nix::unistd::pipe().unwrap();
+        for link in [
+            format!("/proc/self/fd/{}", dir.as_raw_fd()),
+            format!("/proc/thread-self/fd/{}", dir.as_raw_fd()),
+            "/proc/self/cwd".into(),
+            "/proc/self/root".into(),
+            "/proc/self/exe".into(),
+        ] {
+            assert!(grant_escapes_proc(Path::new(&link)), "{link}");
+        }
+        for plain in [
+            "/proc".into(),
+            "/proc/self".into(),
+            "/proc/self/fd".into(),
+            "/proc/self/maps".into(),
+            "/proc/net".into(),
+            "/proc/self/ns/net".into(),
+            format!("/proc/self/fd/{}", pipe_r.as_raw_fd()),
+            "/proc/self/fd/999999".into(),
+            "/etc".into(),
+        ] {
+            assert!(!grant_escapes_proc(Path::new(&plain)), "{plain}");
+        }
     }
 
     #[test]

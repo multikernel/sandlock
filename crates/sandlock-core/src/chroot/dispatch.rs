@@ -58,6 +58,7 @@ use tokio::sync::Mutex;
 use crate::chroot::resolve::{
     confine, resolve_existing_in_root, resolve_in_root, resolve_in_root_nofollow,
 };
+use crate::grant::Grant;
 use crate::seccomp::notif::{
     decode_open_args, read_child_mem, write_child_mem, NotifAction, NotifPolicy,
 };
@@ -72,8 +73,8 @@ use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_A
 /// Bundled chroot policy passed to all handlers.
 pub(crate) struct ChrootCtx<'a> {
     pub root: &'a Path,
-    pub readable: &'a [PathBuf],
-    pub writable: &'a [PathBuf],
+    pub readable: &'a [Grant],
+    pub writable: &'a [Grant],
     pub denied: &'a [PathBuf],
     pub mounts: &'a [(PathBuf, PathBuf)],
     /// Virtual paths of read-only mounts: reads allowed, writes denied.
@@ -124,11 +125,9 @@ impl ChrootCtx<'_> {
             || self
                 .readable
                 .iter()
-                .any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
-            || self
-                .writable
-                .iter()
-                .any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
+                .chain(self.writable)
+                .filter_map(|grant| grant.path())
+                .any(|p| virtual_path.starts_with(&p) || p.starts_with(virtual_path))
     }
 
     /// Check if a virtual path falls under a read-only mount.
@@ -151,7 +150,7 @@ impl ChrootCtx<'_> {
         if self.is_mounted(virtual_path) {
             return true;
         }
-        self.writable.iter().any(|p| virtual_path.starts_with(p))
+        self.writable.iter().any(|grant| grant.covers(virtual_path))
     }
 
     /// Check if a virtual path falls under any mount point.
@@ -2894,13 +2893,14 @@ mod self_rewrite_tests {
 #[cfg(test)]
 mod mount_ro_tests {
     use super::{ChrootCtx, ProcessIndex};
+    use crate::grant::Grant;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     fn ctx<'a>(
         mounts: &'a [(PathBuf, PathBuf)],
         mount_ro: &'a [PathBuf],
-        writable: &'a [PathBuf],
+        writable: &'a [Grant],
         processes: &'a Arc<ProcessIndex>,
     ) -> ChrootCtx<'a> {
         ChrootCtx {
@@ -2920,7 +2920,7 @@ mod mount_ro_tests {
         let ro = vec![PathBuf::from("/proc")];
         // Even with a writable rootfs ("/" granted), the read-only /proc mount
         // must still deny writes — this is the host-escape guard.
-        let writable = vec![PathBuf::from("/")];
+        let writable = vec![Grant::from("/")];
         let processes = Arc::new(ProcessIndex::new());
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/proc/version")));
@@ -2932,7 +2932,7 @@ mod mount_ro_tests {
     fn writable_mount_still_allows_writes() {
         let mounts = vec![(PathBuf::from("/data"), PathBuf::from("/host/data"))];
         let ro: Vec<PathBuf> = vec![];
-        let writable = vec![PathBuf::from("/data")];
+        let writable = vec![Grant::from("/data")];
         let processes = Arc::new(ProcessIndex::new());
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));

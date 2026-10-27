@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::context;
 use crate::error::SandboxError;
+pub use crate::grant::Grant;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
 pub use crate::network::{IpCidr, NetAllow, NetDeny, NetRule, NetTarget, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
@@ -404,14 +405,26 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.policy_fn.is_some() {
             unsupported.push("policy_fn");
         }
+        let paths = |grants: &[Grant]| -> Option<Vec<PathBuf>> {
+            grants
+                .iter()
+                .map(|grant| grant.as_path().map(std::path::Path::to_path_buf))
+                .collect()
+        };
+        let (Some(fs_writable), Some(fs_readable)) =
+            (paths(&sandbox.fs_writable), paths(&sandbox.fs_readable))
+        else {
+            unsupported.push("fs_read_fd/fs_write_fd");
+            return Err(SandboxError::UnsupportedForConfine(unsupported.join(", ")));
+        };
 
         if !unsupported.is_empty() {
             return Err(SandboxError::UnsupportedForConfine(unsupported.join(", ")));
         }
 
         Ok(Self {
-            fs_writable: sandbox.fs_writable.clone(),
-            fs_readable: sandbox.fs_readable.clone(),
+            fs_writable,
+            fs_readable,
         })
     }
 }
@@ -622,8 +635,8 @@ impl BindPorts {
 #[derive(Serialize, Deserialize)]
 pub struct Sandbox {
     // Filesystem access
-    pub fs_writable: Vec<PathBuf>,
-    pub fs_readable: Vec<PathBuf>,
+    pub fs_writable: Vec<Grant>,
+    pub fs_readable: Vec<Grant>,
     pub fs_denied: Vec<PathBuf>,
 
     // Extra syscall filtering on top of Sandlock's default blocklist.
@@ -2389,7 +2402,7 @@ impl Sandbox {
         let shared_cow = self.rt().shared_cow.clone();
         #[cfg(feature = "cow")]
         let seccomp_cow_branch = if let Some(ref shared) = shared_cow {
-            self.fs_readable.push(shared.upper_dir.clone());
+            self.fs_readable.push(shared.upper_dir.clone().into());
             self.cow_upper = Some(shared.upper_dir.clone());
             None
         } else if !no_supervisor && self.workdir.is_some() {
@@ -2415,7 +2428,7 @@ impl Sandbox {
             branch.set_keep_if_abandoned(
                 self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
             );
-            self.fs_readable.push(branch.upper_dir().to_path_buf());
+            self.fs_readable.push(branch.upper_dir().into());
             self.cow_upper = Some(branch.upper_dir().to_path_buf());
             Some(branch)
         } else {

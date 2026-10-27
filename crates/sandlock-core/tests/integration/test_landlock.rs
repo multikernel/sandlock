@@ -1843,3 +1843,131 @@ async fn test_abstract_unix_dgram_sendto_refused_under_destination_policy() {
          not be executed by the (undomained) supervisor"
     );
 }
+
+/// A pinned root keeps its grant on the inode it was opened on: swapping its
+/// path for a symlink afterwards must not move the grant to the link's target.
+#[tokio::test]
+async fn test_fd_grant_survives_path_swap() {
+    let base = temp_file("fd-grant");
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("root");
+    let moved = base.join("moved");
+    let decoy = base.join("decoy");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&decoy).unwrap();
+    std::fs::write(root.join("f"), "pinned").unwrap();
+    std::fs::write(decoy.join("f"), "decoy").unwrap();
+
+    let fd: std::os::fd::OwnedFd = std::fs::File::open(&root).unwrap().into();
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read_fd(fd)
+        .build()
+        .unwrap();
+    std::fs::rename(&root, &moved).unwrap();
+    std::os::unix::fs::symlink(&decoy, &root).unwrap();
+
+    let pinned = policy
+        .clone()
+        .run(&["cat", moved.join("f").to_str().unwrap()])
+        .await
+        .unwrap();
+    let swapped = policy
+        .clone()
+        .run(&["cat", root.join("f").to_str().unwrap()])
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert_eq!(pinned.stdout_str().unwrap_or_default(), "pinned");
+    assert!(
+        !swapped.success(),
+        "the symlink swapped in after the pin must not inherit its grant"
+    );
+}
+
+/// A pinned tree holding a file the supervisor generates is granted entry by
+/// entry beneath the descriptor, and the generated file keeps winning.
+#[tokio::test]
+async fn test_fd_grant_around_shadowed_files() {
+    let etc: std::os::fd::OwnedFd = std::fs::File::open("/etc").unwrap().into();
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read_fd(etc)
+        .build()
+        .unwrap();
+    let name = format!("pinned-etc-{}", std::process::id());
+
+    let passwd = policy
+        .clone()
+        .with_name(&name)
+        .run(&["cat", "/etc/passwd"])
+        .await
+        .unwrap();
+    let hostname = policy
+        .clone()
+        .with_name(&name)
+        .run(&["cat", "/etc/hostname"])
+        .await
+        .unwrap();
+
+    assert!(passwd.success(), "a pinned /etc must grant its entries");
+    assert_eq!(hostname.stdout_str().unwrap_or_default().trim(), name);
+}
+
+#[test]
+fn test_proc_magic_link_grant_is_rejected() {
+    use std::os::fd::AsRawFd;
+    let root = std::fs::File::open(std::env::temp_dir()).unwrap();
+    let link = format!("/proc/self/fd/{}", root.as_raw_fd());
+    let err = Sandbox::builder()
+        .fs_read(&link)
+        .build()
+        .expect_err("a grant on a /proc link must not be silently dropped");
+    assert!(err.to_string().contains("fs_read_fd"), "{err}");
+    // Without a supervisor Landlock follows the link, so the grant works.
+    Sandbox::builder()
+        .no_supervisor(true)
+        .fs_read(&link)
+        .build()
+        .expect("plain Landlock honours a /proc link grant");
+}
+
+/// A descriptor grant follows its tree across a rename: the supervisor's
+/// checks must judge the tree by where it is now, not where it was pinned.
+#[tokio::test]
+async fn test_fd_grant_follows_rename() {
+    let base = temp_file("fd-rename");
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("root");
+    let moved = base.join("moved");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("f"), "pinned").unwrap();
+
+    let fd: std::os::fd::OwnedFd = std::fs::File::open(&root).unwrap().into();
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read_fd(fd)
+        .fs_deny(base.join("elsewhere"))
+        .build()
+        .unwrap();
+    std::fs::rename(&root, &moved).unwrap();
+
+    let result = policy
+        .clone()
+        .run(&["cat", moved.join("f").to_str().unwrap()])
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert_eq!(result.stdout_str().unwrap_or_default(), "pinned");
+}

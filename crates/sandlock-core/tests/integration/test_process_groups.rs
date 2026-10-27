@@ -124,7 +124,7 @@ signal.pause()
         pid_file.display(),
         pid_file.display(),
     );
-    sb.fs_writable.push(dir.path().to_path_buf());
+    sb.fs_writable.push(dir.path().into());
     sb.spawn(&["python3", "-c", &script]).await.unwrap();
     for _ in 0..600 {
         if let Ok(text) = std::fs::read_to_string(&pid_file) {
@@ -199,7 +199,7 @@ os.rename("{0}.tmp", "{0}")
         pid_file.display(),
     );
     let mut sb = policy().with_name("pgroup-exit-sweep");
-    sb.fs_writable.push(dir.path().to_path_buf());
+    sb.fs_writable.push(dir.path().into());
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         sb.run(&["python3", "-c", &script]),
@@ -465,7 +465,7 @@ async fn test_drop_after_wait_ends_jobs_in_other_groups() {
         p = pid_file.display()
     );
     let mut sb = policy();
-    sb.fs_writable.push(dir.path().to_path_buf());
+    sb.fs_writable.push(dir.path().into());
     sb.spawn(&["python3", "-c", &script]).await.unwrap();
     sb.wait().await.unwrap();
     let leader: i32 = std::fs::read_to_string(&pid_file)

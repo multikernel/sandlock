@@ -19,6 +19,7 @@ pub mod error;
 pub mod expand;
 pub mod fork;
 pub(crate) mod freeze;
+pub mod grant;
 pub mod http;
 #[cfg(feature = "image")]
 pub mod image;
@@ -58,6 +59,7 @@ pub(crate) mod vdso;
 pub use checkpoint::{Checkpoint, SkippedFd};
 pub use controller::Controller;
 pub use error::SandlockError;
+pub use grant::Grant;
 pub use pipeline::{Gather, Pipeline, Stage};
 pub use policy_fn::PolicyFn;
 pub use protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
@@ -112,7 +114,7 @@ pub fn confine(confinement: &Confinement) -> Result<(), SandlockError> {
         ));
     }
 
-    let mut builder = Sandbox::builder();
+    let mut builder = Sandbox::builder().no_supervisor(true);
     for path in &confinement.fs_readable {
         builder = builder.fs_read(path.clone());
     }

@@ -829,10 +829,16 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
             read: s
                 .fs_readable
                 .iter()
-                .filter(|p| Some(p.as_path()) != s.cow_upper.as_deref())
-                .cloned()
+                .filter_map(|grant| grant.path())
+                .filter(|p| Some(&**p) != s.cow_upper.as_deref())
+                .map(std::borrow::Cow::into_owned)
                 .collect(),
-            write: s.fs_writable.clone(),
+            write: s
+                .fs_writable
+                .iter()
+                .filter_map(|grant| grant.path())
+                .map(std::borrow::Cow::into_owned)
+                .collect(),
             deny: fs_deny,
             chroot: s.chroot.clone(),
             mount: mount_specs,
@@ -1037,11 +1043,11 @@ mod tests {
         let (policy, _spec) = parse_profile(toml).unwrap();
         assert_eq!(
             policy.fs_readable,
-            vec![PathBuf::from(format!("{home}/src"))]
+            vec![crate::Grant::from(format!("{home}/src"))]
         );
         assert_eq!(
             policy.fs_writable,
-            vec![PathBuf::from(format!("{home}/out"))]
+            vec![crate::Grant::from(format!("{home}/out"))]
         );
         assert_eq!(policy.cwd, Some(PathBuf::from(format!("{home}/src"))));
     }
@@ -1076,7 +1082,7 @@ mod tests {
             read = ["/usr/lib"]
         "#;
         let (policy, _spec) = parse_profile(toml).unwrap();
-        assert_eq!(policy.fs_readable, vec![PathBuf::from("/usr/lib")]);
+        assert_eq!(policy.fs_readable, vec![crate::Grant::from("/usr/lib")]);
     }
 
     #[test]
@@ -1085,7 +1091,7 @@ mod tests {
         // cow_upper recording which entry is internal.
         let mut sb = crate::Sandbox::builder().fs_read("/usr").build().unwrap();
         let upper = PathBuf::from("/run/user/1000/sandlock-cow/deadbeef/upper");
-        sb.fs_readable.push(upper.clone());
+        sb.fs_readable.push(upper.clone().into());
         sb.cow_upper = Some(upper.clone());
 
         let profile = sandbox_to_profile(&sb, &[]);

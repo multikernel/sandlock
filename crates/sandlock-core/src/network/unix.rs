@@ -76,7 +76,7 @@ fn pin_child_unix_target(
 fn resolve_named_unix_target(
     child_pid: u32,
     sun_path: &std::path::Path,
-    writable: &[std::path::PathBuf],
+    writable: &[crate::grant::Grant],
 ) -> Result<OwnedFd, NotifAction> {
     let pinned = pin_child_unix_target(child_pid, sun_path)?;
 
@@ -126,7 +126,7 @@ pub(super) fn connect_named_unix_on_behalf(
     child_pid: u32,
     sockfd: i32,
     sun_path: &std::path::Path,
-    writable: &[std::path::PathBuf],
+    writable: &[crate::grant::Grant],
 ) -> NotifAction {
     let pinned = match resolve_named_unix_target(child_pid, sun_path, writable) {
         Ok(fd) => fd,
@@ -169,7 +169,7 @@ pub(super) fn sendto_named_unix_on_behalf(
     buf_len: usize,
     flags: i32,
     sun_path: &std::path::Path,
-    writable: &[std::path::PathBuf],
+    writable: &[crate::grant::Grant],
 ) -> NotifAction {
     let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
         Ok(fd) => fd,
@@ -318,7 +318,7 @@ fn sendmsg_named_unix_on_behalf(
     msghdr_ptr: u64,
     flags: i32,
     sun_path: &std::path::Path,
-    writable: &[std::path::PathBuf],
+    writable: &[crate::grant::Grant],
 ) -> NotifAction {
     match send_named_unix_msghdr(notif, notif_fd, sockfd, msghdr_ptr, sun_path, writable) {
         Ok((dup_fd, m)) => {
@@ -341,7 +341,7 @@ fn send_named_unix_msghdr(
     sockfd: i32,
     msghdr_ptr: u64,
     sun_path: &std::path::Path,
-    writable: &[std::path::PathBuf],
+    writable: &[crate::grant::Grant],
 ) -> Result<(OwnedFd, MaterializedMsg), i32> {
     let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
         Ok(fd) => fd,
@@ -402,7 +402,7 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
     msgvec_ptr: u64,
     vlen: usize,
     flags: i32,
-    writable: &[std::path::PathBuf],
+    writable: &[crate::grant::Grant],
 ) -> NotifAction {
     let mut entries = Vec::new();
     let mut batch_bytes = 0usize;

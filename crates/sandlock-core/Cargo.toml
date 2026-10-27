@@ -13,7 +13,7 @@ landlock = { version = "0.4.7", default-features = false }
 libc = "0.2.191"
 log = "0.4"
 syscalls = { version = "0.8", default-features = false }
-nix = { version = "0.29", features = ["user"] }
+nix = { version = "0.29", features = ["dir", "user"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util", "fs"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

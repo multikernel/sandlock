@@ -564,12 +564,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     let mut builder = if let Some(base) = base_from_profile {
         // Rebuild builder from loaded profile as base
         let mut b = Sandbox::builder();
-        for p in &base.fs_readable {
-            b = b.fs_read(p);
-        }
-        for p in &base.fs_writable {
-            b = b.fs_write(p);
-        }
+        b.fs_readable.extend(base.fs_readable.iter().cloned());
+        b.fs_writable.extend(base.fs_writable.iter().cloned());
         for p in &base.fs_denied {
             b = b.fs_deny(p);
         }
@@ -694,12 +690,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     };
 
     // CLI overrides — fields from flattened SandboxBuilder
-    for p in &pb.fs_readable {
-        builder = builder.fs_read(p);
-    }
-    for p in &pb.fs_writable {
-        builder = builder.fs_write(p);
-    }
+    builder.fs_readable.extend(pb.fs_readable.iter().cloned());
+    builder.fs_writable.extend(pb.fs_writable.iter().cloned());
     if let Some(n) = pb.max_processes {
         builder = builder.max_processes(n);
     }
