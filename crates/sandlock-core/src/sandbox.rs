@@ -2616,6 +2616,9 @@ impl Sandbox {
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
+        let notif_wait_killable = read_u32_fd(pipes.notif_r.as_raw_fd()).map_err(|e| {
+            SandboxRuntimeError::Child(format!("read notif wait from child: {}", e))
+        })? != 0;
         let exec_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd()).map_err(|e| {
             SandboxRuntimeError::Child(format!("read exec pipe fd from child: {}", e))
         })?;
@@ -2679,6 +2682,7 @@ impl Sandbox {
                 has_random_seed: resolved.features.random_seed,
                 has_time_start: resolved.features.time_start,
                 argv_safety_required: resolved.features.argv_safety_required,
+                notif_wait_killable,
                 time_offset: time_offset_val,
                 num_cpus: self.num_cpus,
                 port_remap: resolved.features.port_remap,
