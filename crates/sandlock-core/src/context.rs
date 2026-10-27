@@ -473,9 +473,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // wrapping sandbox) keeps tightening this layer too.
         //
         // Uses the relaxed `no_supervisor_blocklist_syscall_numbers` deny
-        // list (which leaves `ptrace`, `unshare`, `process_vm_*`, etc.
-        // alone) so an inner full-supervisor sandlock nested under this
-        // one still has the syscalls its supervisor needs.
+        // list (which leaves `ptrace`, `process_vm_*`, etc. alone) so an
+        // inner full-supervisor sandlock nested under this one still has
+        // the syscalls its supervisor needs.
         let deny = no_supervisor_blocklist_syscall_numbers(sandbox);
         let filter = match bpf::assemble_filter(&[], &deny, &args) {
             Ok(f) => f,
