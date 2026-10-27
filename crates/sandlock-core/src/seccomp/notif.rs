@@ -2818,7 +2818,51 @@ enum Parked {
     Deferred(u64, NotifAction),
 }
 
-type ParkedSet = tokio::task::JoinSet<Parked>;
+/// Parked notifications and the tids waiting on them, which the exec freeze
+/// must not seize (see `crate::freeze`).
+struct ParkedSet {
+    tasks: tokio::task::JoinSet<Parked>,
+    callers: HashMap<tokio::task::Id, (i32, u64)>,
+}
+
+impl ParkedSet {
+    fn new() -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+            callers: HashMap::new(),
+        }
+    }
+
+    fn spawn(&mut self, notif: &SeccompNotif, task: impl Future<Output = Parked> + Send + 'static) {
+        let handle = self.tasks.spawn(task);
+        self.callers
+            .insert(handle.id(), (notif.pid as i32, notif.id));
+    }
+
+    async fn join_next(&mut self) -> Option<Parked> {
+        loop {
+            match self.tasks.join_next_with_id().await? {
+                Ok((id, parked)) => {
+                    self.callers.remove(&id);
+                    return Some(parked);
+                }
+                Err(e) => {
+                    self.callers.remove(&e.id());
+                }
+            }
+        }
+    }
+
+    /// The callers still parked: one that died since leaves its tid free for
+    /// reuse, and only its still-valid notification proves the tid is it.
+    fn callers(&self, fd: RawFd) -> Vec<(i32, u64)> {
+        self.callers
+            .values()
+            .copied()
+            .filter(|&(_, id)| id_valid(fd, id).is_ok())
+            .collect()
+    }
+}
 
 /// A dispatched notification waiting for its policy verdict, if any.
 struct Prepared {
@@ -2830,11 +2874,12 @@ struct Prepared {
 
 fn park_deferred(
     parked: &mut ParkedSet,
-    id: u64,
+    notif: &SeccompNotif,
     deferred: Deferred,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    parked.spawn(async move {
+    let id = notif.id;
+    parked.spawn(notif, async move {
         let _permit = permit;
         let action = match deferred.patient {
             true => finalize_deferred(deferred.run().await),
@@ -2928,7 +2973,8 @@ async fn handle_notification(
     };
     match wait {
         Some(wait) => {
-            parked.spawn(async move {
+            let notif = prepared.notif;
+            parked.spawn(&notif, async move {
                 let verdict = wait.await;
                 Parked::Approval(Box::new(prepared), verdict)
             });
@@ -2944,9 +2990,22 @@ fn freeze_exec(
     judged: &ExecImage,
     ctx: &super::ctx::SupervisorCtx,
     fd: RawFd,
+    parked: &ParkedSet,
 ) -> (NotifAction, crate::freeze::SandboxFreeze) {
-    match crate::freeze::freeze_sandbox_for_execve(&ctx.processes, notif.pid as i32) {
-        Ok(freeze) if read_exec_image(notif, fd) == *judged => (NotifAction::Continue, freeze),
+    // Without a killable wait any signal releases a parked caller, so the
+    // freeze must stop it like any other task.
+    let held = match ctx.policy.notif_wait_killable {
+        true => parked.callers(fd),
+        false => Vec::new(),
+    };
+    let skipped = held.iter().map(|&(tid, _)| tid).collect();
+    // A skipped caller that died during the freeze could have had its tid
+    // reused by a task the freeze then left running.
+    let still_parked = || held.iter().all(|&(_, id)| id_valid(fd, id).is_ok());
+    match crate::freeze::freeze_sandbox_for_execve(&ctx.processes, notif.pid as i32, &skipped) {
+        Ok(freeze) if still_parked() && read_exec_image(notif, fd) == *judged => {
+            (NotifAction::Continue, freeze)
+        }
         Ok(freeze) => (NotifAction::Errno(libc::EPERM), freeze),
         Err(e) => {
             log::warn!(
@@ -3045,7 +3104,7 @@ async fn finish_notification(
             return;
         }
         match Arc::clone(defer_sem).try_acquire_owned() {
-            Ok(permit) => park_deferred(parked, notif.id, deferred, permit),
+            Ok(permit) => park_deferred(parked, &notif, deferred, permit),
             // Too many deferrals in flight: fail fast with EAGAIN rather than
             // blocking the loop or letting unbounded workers accrete.
             Err(_) => {
@@ -3059,7 +3118,7 @@ async fn finish_notification(
     // thread, and the loop must not release any parked task meanwhile.
     let mut exec_freeze = None;
     if let (NotifAction::Continue, Some(judged)) = (&action, &exec_image) {
-        let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd);
+        let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd, parked);
         action = frozen_action;
         exec_freeze = Some(freeze);
     }
@@ -3195,9 +3254,7 @@ pub async fn supervisor(
                 Err(_) => break 'outer,
             },
             Some(done) = parked.join_next() => {
-                if let Ok(done) = done {
-                    settle_parked(done, &ctx, fd, &mut parked, &defer_sem).await;
-                }
+                settle_parked(done, &ctx, fd, &mut parked, &defer_sem).await;
                 continue;
             }
         };
