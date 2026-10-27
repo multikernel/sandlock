@@ -648,10 +648,12 @@ fn deny_open_verdict(
             .flatten();
         policy.chroot_writable.iter().chain(reads)
     };
-    let granted = grants().any(|grant| realpath.starts_with(grant))
-        || self_forms
-            .iter()
-            .any(|form| grants().any(|grant| crate::procfs::own_grant_covers(form, grant)));
+    let granted = grants().any(|grant| grant.covers(realpath))
+        || self_forms.iter().any(|form| {
+            grants()
+                .filter_map(|grant| grant.path())
+                .any(|grant| crate::procfs::own_grant_covers(form, &grant))
+        });
     if granted {
         None
     } else {
@@ -1287,9 +1289,9 @@ pub struct NotifPolicy {
     pub cow_enabled: bool,
     pub chroot_root: Option<std::path::PathBuf>,
     /// Virtual paths allowed for reading under chroot (original user-specified paths).
-    pub chroot_readable: Vec<std::path::PathBuf>,
+    pub chroot_readable: Vec<crate::grant::Grant>,
     /// Virtual paths allowed for writing under chroot (original user-specified paths).
-    pub chroot_writable: Vec<std::path::PathBuf>,
+    pub chroot_writable: Vec<crate::grant::Grant>,
     /// Virtual paths explicitly denied under chroot.
     pub chroot_denied: Vec<std::path::PathBuf>,
     /// Mount mappings: (virtual_path, host_path) pairs.
@@ -1335,14 +1337,15 @@ impl NotifPolicy {
         let granted = |path: &str| {
             self.chroot_readable
                 .iter()
-                .any(|g| std::path::Path::new(path).starts_with(g))
+                .any(|g| g.covers(std::path::Path::new(path)))
         };
         self.chroot_root.is_none()
             && (self
                 .chroot_readable
                 .iter()
                 .chain(&self.chroot_writable)
-                .any(|p| crate::procfs::is_supervised_proc_grant(p))
+                .filter_map(|grant| grant.path())
+                .any(|p| crate::procfs::is_supervised_proc_grant(&p))
                 || crate::procfs::SHADOWED_ETC_FILES
                     .iter()
                     .any(|f| crate::procfs::virtual_file(f, self).is_some() && granted(f)))

@@ -133,19 +133,21 @@ pub(crate) async fn check_ip_destination(
 /// True if `real` (an already-canonical path) is at or under any of `prefixes`,
 /// canonicalizing each prefix so a symlinked grant path still matches. Touches
 /// only the supervisor's own view of the grant paths, never child state.
-pub(crate) fn real_path_under_any(real: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
-    prefixes.iter().any(|p| {
-        let canon = std::fs::canonicalize(p);
-        real.starts_with(canon.as_deref().unwrap_or(p))
+pub(crate) fn real_path_under_any(real: &std::path::Path, grants: &[crate::grant::Grant]) -> bool {
+    grants.iter().filter_map(|grant| grant.path()).any(|p| {
+        let canon = std::fs::canonicalize(&p);
+        real.starts_with(canon.as_deref().unwrap_or(&p))
     })
 }
 
 /// True if `path`, lexically normalized (`.`/`..` resolved without touching the
 /// filesystem), is at or under any of the granted `prefixes`. Mirrors the
 /// prefix matching the chroot fs enforcement uses.
-pub(crate) fn path_under_any(path: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
+pub(crate) fn path_under_any(path: &std::path::Path, grants: &[crate::grant::Grant]) -> bool {
     let norm = crate::chroot::resolve::confine(&path.to_string_lossy());
-    prefixes.iter().any(|p| norm.starts_with(p))
+    grants
+        .iter()
+        .any(|grant| grant.covers(std::path::Path::new(&norm)))
 }
 
 /// The shape of a non-IP destination sockaddr, keyed on its ADDRESS FAMILY

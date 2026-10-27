@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -11,6 +11,7 @@ use landlock::{
 };
 
 use crate::error::{ConfinementError, SandlockError};
+use crate::grant::Grant;
 use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
 use crate::sandbox::Sandbox;
 use crate::sys::structs::{LANDLOCK_CREATE_RULESET_VERSION, SYS_LANDLOCK_CREATE_RULESET};
@@ -99,35 +100,72 @@ fn shadowed_files() -> impl Iterator<Item = &'static Path> {
     crate::procfs::SHADOWED_ETC_FILES.iter().map(Path::new)
 }
 
+/// How confinement treats a grant under /proc. Only `Landlock` installs the
+/// grant as given, which follows a magic link to its target; the others turn
+/// a grant on such a link into one that grants nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcGrants {
+    Landlock,
+    /// The supervisor serves procfs and the files it generates.
+    Served,
+    /// The grant names the jail's copy of the path.
+    Jailed,
+}
+
+impl ProcGrants {
+    pub(crate) fn of(supervised: bool, jailed: bool) -> Self {
+        match (supervised, jailed) {
+            (_, true) => ProcGrants::Jailed,
+            (true, false) => ProcGrants::Served,
+            (false, false) => ProcGrants::Landlock,
+        }
+    }
+}
+
 /// Install a read grant on `dir` as rules on its entries, leaving out the
 /// shadowed files beneath it. Landlock cannot deny a file inside a granted
 /// tree, so this is the only way to grant the rest. A file created directly
 /// in `dir` after this is not covered; the grants this applies to are
-/// read-only host trees such as /etc.
+/// read-only host trees such as /etc. Entries are opened beneath `dir`'s
+/// descriptor so a pinned grant stays on the tree it was pinned to.
 fn add_read_rules_around_shadowed(
     mut ruleset: RulesetCreated,
-    dir: &Path,
+    dir: File,
+    path: &Path,
 ) -> Result<RulesetCreated, ConfinementError> {
-    ruleset = add_path_beneath_rule(ruleset, dir, AccessFs::ReadDir)?;
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| ConfinementError::Landlock(format!("read dir {:?}: {}", dir, e)))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    use nix::fcntl::OFlag;
+    let fail = |e| ConfinementError::Landlock(format!("read dir {:?}: {}", path, e));
+    let mut entries = nix::dir::Dir::openat(
+        Some(dir.as_raw_fd()),
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(fail)?;
+    for entry in entries.iter().flatten() {
+        let name = Path::new(std::ffi::OsStr::from_bytes(entry.file_name().to_bytes()));
+        if name == Path::new(".") || name == Path::new("..") {
+            continue;
+        }
+        let child = path.join(name);
+        if shadowed_files().any(|f| f == child) || crate::procfs::is_supervised_proc_grant(&child) {
+            continue;
+        }
+        // An entry that vanished or cannot be referenced costs only itself.
+        let Ok(file) = open_at(dir.as_raw_fd(), name, libc::O_NOFOLLOW) else {
+            continue;
+        };
         // A link is never the object of an access; its target has its own rule.
-        if shadowed_files().any(|f| f == path) || entry.file_type().is_ok_and(|t| t.is_symlink()) {
+        if file.metadata().is_ok_and(|m| m.is_symlink()) {
             continue;
         }
-        if crate::procfs::is_supervised_proc_grant(&path) {
-            continue;
-        }
-        if shadowed_files().any(|f| f.starts_with(&path)) {
-            ruleset = add_read_rules_around_shadowed(ruleset, &path)?;
+        if shadowed_files().any(|f| f.starts_with(&child)) {
+            ruleset = add_read_rules_around_shadowed(ruleset, file, &child)?;
         } else {
-            // An entry that vanished or cannot be referenced costs only itself.
-            let _ = add_path_beneath_rule(&mut ruleset, path, READ_ACCESS);
+            let _ = add_file_beneath_rule(&mut ruleset, file, &child, READ_ACCESS);
         }
     }
-    Ok(ruleset)
+    add_file_beneath_rule(ruleset, dir, path, AccessFs::ReadDir)
 }
 
 // ============================================================
@@ -435,53 +473,39 @@ fn confine_inner(
     // The PT_INTERP patching in handle_chroot_exec ensures the kernel loads
     // the image's ELF interpreter via an injected fd, not a host path.
     let chroot_root = policy.chroot.as_deref();
+    let served = ProcGrants::of(supervised, chroot_root.is_some()) == ProcGrants::Served;
     // Writable-path grants use the resolved handled set so disabled or
     // degraded rights cannot be reintroduced. add_path_beneath_rule further
     // removes directory-only rights for non-directory paths.
-    for path in &policy.fs_writable {
-        if supervised && chroot_root.is_none() && crate::procfs::is_supervised_proc_grant(path) {
+    for grant in &policy.fs_writable {
+        let path = grant_path(grant)?;
+        if served && crate::procfs::is_supervised_proc_grant(&path) {
             continue;
         }
-        let host;
-        let rule_path = if let Some(root) = chroot_root {
-            host = root.join(path.strip_prefix("/").unwrap_or(path));
-            if !host.exists() {
-                continue;
-            }
-            host.as_path()
-        } else {
-            path.as_path()
-        };
-
-        ruleset = add_path_beneath_rule(ruleset, rule_path, handled_access_fs)?;
+        if let Some(file) = open_grant(grant, &path, chroot_root)? {
+            ruleset = add_file_beneath_rule(ruleset, file, &path, handled_access_fs)?;
+        }
     }
 
-    for path in &policy.fs_readable {
-        let host;
-        let rule_path = if let Some(root) = chroot_root {
-            host = root.join(path.strip_prefix("/").unwrap_or(path));
-            if !host.exists() {
-                continue;
-            }
-            host.as_path()
-        } else {
-            // The supervisor serves procfs reads: a rule would let any link
-            // reach what the handlers hide by name. Without a supervisor the
-            // rule is all there is, so it stays.
-            if supervised && crate::procfs::is_supervised_proc_grant(path) {
-                continue;
-            }
-            if supervised && shadowed_files().any(|f| f == path) {
-                continue;
-            }
-            if supervised && shadowed_files().any(|f| f.starts_with(path)) {
-                ruleset = add_read_rules_around_shadowed(ruleset, path)?;
-                continue;
-            }
-            path.as_path()
+    for grant in &policy.fs_readable {
+        let path = grant_path(grant)?;
+        // The supervisor serves procfs reads: a rule would let any link reach
+        // what the handlers hide by name. Without a supervisor the rule is all
+        // there is, so it stays.
+        if served
+            && (crate::procfs::is_supervised_proc_grant(&path)
+                || shadowed_files().any(|f| f == path))
+        {
+            continue;
+        }
+        let Some(file) = open_grant(grant, &path, chroot_root)? else {
+            continue;
         };
-
-        ruleset = add_path_beneath_rule(ruleset, rule_path, READ_ACCESS)?;
+        ruleset = if served && shadowed_files().any(|f| f.starts_with(&path)) {
+            add_read_rules_around_shadowed(ruleset, file, &path)?
+        } else {
+            add_file_beneath_rule(ruleset, file, &path, READ_ACCESS)?
+        };
     }
 
     // GPU device paths (when gpu_devices is set)
@@ -623,21 +647,71 @@ where
     P: AsRef<Path>,
     A: Into<BitFlags<AccessFs>>,
 {
-    let fail = |e| ConfinementError::Landlock(format!("open path {:?}: {}", path.as_ref(), e));
+    let path = path.as_ref();
+    let file = open_at(libc::AT_FDCWD, path, 0)
+        .map_err(|e| ConfinementError::Landlock(format!("open path {:?}: {}", path, e)))?;
+    add_file_beneath_rule(ruleset, file, path, access)
+}
 
-    let c_path = CString::new(path.as_ref().as_os_str().as_bytes())
-        .map_err(|e| fail(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+fn grant_path(grant: &Grant) -> Result<std::borrow::Cow<'_, Path>, ConfinementError> {
+    grant
+        .path()
+        .ok_or_else(|| ConfinementError::Landlock("fd grant has no path".into()))
+}
 
-    // Open directly: OpenOptions masks out O_PATH on musl.
-    // See: https://github.com/rust-lang/rust/issues/164464
-    // SAFETY: `c_path` is a valid, NUL-terminated string.
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(fail(io::Error::last_os_error()));
+/// The inode a grant names. A descriptor is used as is: reopening its path
+/// would follow whatever the path names by now. Under a chroot a path names
+/// the jail's copy, and one the jail lacks names nothing.
+fn open_grant(
+    grant: &Grant,
+    path: &Path,
+    chroot_root: Option<&Path>,
+) -> Result<Option<File>, ConfinementError> {
+    let fail = |e| ConfinementError::Landlock(format!("open path {:?}: {}", path, e));
+    if let Some(fd) = grant.as_fd() {
+        return fd.try_clone().map(|fd| Some(fd.into())).map_err(fail);
     }
+    let host = match chroot_root {
+        Some(root) => root.join(path.strip_prefix("/").unwrap_or(path)),
+        None => path.to_path_buf(),
+    };
+    if chroot_root.is_some() && !host.exists() {
+        return Ok(None);
+    }
+    open_at(libc::AT_FDCWD, &host, 0).map(Some).map_err(fail)
+}
 
-    // SAFETY: `open` returned a fresh descriptor. File takes sole ownership.
-    let file = unsafe { File::from_raw_fd(fd) };
+/// Open directly: OpenOptions masks out O_PATH on musl.
+/// See: https://github.com/rust-lang/rust/issues/164464
+fn open_at(dirfd: RawFd, path: &Path, flags: i32) -> io::Result<File> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_path` is a valid, NUL-terminated string.
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | flags,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh descriptor. File takes sole ownership.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn add_file_beneath_rule<R, A>(
+    ruleset: R,
+    file: File,
+    path: &Path,
+    access: A,
+) -> Result<R, ConfinementError>
+where
+    R: RulesetCreatedAttr,
+    A: Into<BitFlags<AccessFs>>,
+{
+    let fail = |e| ConfinementError::Landlock(format!("open path {:?}: {}", path, e));
     let metadata = file.metadata().map_err(fail)?;
 
     let mut access = access.into();
@@ -650,9 +724,7 @@ where
 
     ruleset
         .add_rule(PathBeneath::new(file, access))
-        .map_err(|e| {
-            ConfinementError::Landlock(format!("add path rule for {:?}: {}", path.as_ref(), e))
-        })
+        .map_err(|e| ConfinementError::Landlock(format!("add path rule for {:?}: {}", path, e)))
 }
 
 // ============================================================
