@@ -260,6 +260,14 @@ fn test_no_supervisor_blocklist_excludes_sysv_ipc_when_allowed() {
 }
 
 #[test]
+fn test_no_supervisor_blocklist_denies_namespaces() {
+    let policy = Sandbox::builder().build().unwrap();
+    let nrs = no_supervisor_blocklist_syscall_numbers(&policy);
+    assert!(nrs.contains(&(libc::SYS_unshare as u32)));
+    assert!(nrs.contains(&(libc::SYS_setns as u32)));
+}
+
+#[test]
 fn test_arg_filters_has_clone_ioctl_prctl_socket() {
     use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K};
     let policy = Sandbox::builder().build().unwrap();

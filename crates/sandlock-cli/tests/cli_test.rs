@@ -317,6 +317,44 @@ fn test_no_supervisor_blocks_denied_path() {
 }
 
 #[test]
+fn test_no_supervisor_blocks_unshare() {
+    let host_ok = Command::new("unshare")
+        .args(["-U", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !host_ok {
+        eprintln!("skipping: host cannot create user namespaces");
+        return;
+    }
+    let output = sandlock_bin()
+        .args(args_for_host(&[
+            "run",
+            "--no-supervisor",
+            "-r",
+            "/usr",
+            "-r",
+            "/lib",
+            "-r",
+            "/lib64",
+            "-r",
+            "/bin",
+            "--",
+            "unshare",
+            "-U",
+            "true",
+        ]))
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("Operation not permitted"),
+        "unshare(CLONE_NEWUSER) should be denied, stderr: {}",
+        stderr
+    );
+}
+
+#[test]
 fn test_no_supervisor_rejects_fs_deny() {
     let output = sandlock_bin()
         .args([

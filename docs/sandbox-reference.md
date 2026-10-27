@@ -259,7 +259,7 @@ fields on `Sandbox`.
 | `clean_env`     | `clean_env`     | `bool`              | `False` | When `True`, start with a minimal environment (`PATH`, `HOME`, `USER`, `TERM`, `LANG`) instead of inheriting the parent's.                            |
 | `no_coredump`   | `no_coredump`   | `bool`              | `False` | Apply `prctl(PR_SET_DUMPABLE, 0)`. Disables core dumps and restricts `/proc/<pid>` access from other processes. Breaks `gdb`, `strace`, and `perf`.   |
 | `no_huge_pages` | `no_huge_pages` | `bool`              | `False` | Disable transparent huge pages via `prctl(PR_SET_THP_DISABLE)`.                                                                                      |
-| `no_supervisor` | `no_supervisor` | `bool`              | `False` | Skip the seccomp user-notification supervisor. The sandbox runs with Landlock + a kernel-only deny filter, without IP allowlisting, resource limits, COW, chroot mediation, `/proc` virtualization, or custom handlers. Required when nesting inside another sandlock (the kernel only allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task). |
+| `no_supervisor` | `no_supervisor` | `bool`              | `False` | Skip the seccomp user-notification supervisor. The sandbox runs with Landlock + a kernel-only deny filter, without IP allowlisting, resource limits, COW, chroot mediation, `/proc` virtualization, or custom handlers. Required when nesting inside another sandlock (the kernel only allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task). Denies `unshare` and `setns`, so a sandbox nested inside cannot use `uid`/`gid` mapping. |
 
 ## Variable expansion
 

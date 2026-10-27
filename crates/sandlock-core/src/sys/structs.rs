@@ -275,10 +275,15 @@ pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
 ///
 /// More relaxed than DEFAULT_BLOCKLIST_SYSCALLS because a full sandbox supervisor
 /// may run inside the outer no-supervisor sandbox and needs syscalls like
-/// ptrace, process_vm_readv/writev, unshare, mount, and setns.
+/// ptrace and process_vm_readv/writev.
 ///
-/// Only blocks syscalls that could damage the host or escape all containment.
+/// Only blocks syscalls that could damage the host, escape all containment,
+/// or widen kernel attack surface.
 pub const NO_SUPERVISOR_BLOCKLIST_SYSCALLS: &[&str] = &[
+    // A user namespace hands a full capability set to anything that escapes
+    // the inner sandbox; the cost is no --user mapping in a nested sandbox
+    "unshare",
+    "setns",
     // Swap / reboot / shutdown — host-wide damage
     "swapon",
     "swapoff",
