@@ -11,6 +11,7 @@ async fn test_num_cpus_virtualization() {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
+        .fs_read("/sys")
         .num_cpus(2)
         .build()
         .unwrap();
@@ -37,6 +38,7 @@ async fn test_num_cpus_virtualization() {
         "getconf _NPROCESSORS_CONF",
         "cat /sys/devices/system/cpu/present",
         "grep -c '^cpu[0-9]' /proc/stat",
+        "ls /sys/devices/system/cpu | grep -c '^cpu[0-9]'",
     ] {
         let result = policy.clone().run(&["sh", "-c", cmd]).await.unwrap();
         assert!(result.success(), "{cmd} should succeed");
@@ -44,6 +46,104 @@ async fn test_num_cpus_virtualization() {
         let want = if cmd.starts_with("cat") { "0-1" } else { "2" };
         assert_eq!(stdout.trim(), want, "{cmd} should report 2 CPUs");
     }
+}
+
+async fn check_cpu_directory_stream(syscall: i64) {
+    let mut policy = proc_grant().fs_read("/sys").num_cpus(2).build().unwrap();
+    let script = r#"
+import ctypes, errno, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+nr, name_offset = map(int, sys.argv[1:])
+buf = ctypes.create_string_buffer(4096)
+def read(fd, count=4096, addr=None):
+    n = libc.syscall(nr, fd, ctypes.byref(buf) if addr is None else addr, count)
+    if n < 0:
+        return n, ctypes.get_errno()
+    records = []
+    offset = 0
+    while offset < n:
+        length = int.from_bytes(buf.raw[offset+16:offset+18], sys.byteorder)
+        assert length >= 24 and offset + length <= n, (offset, length, n)
+        name = buf.raw[offset+name_offset:offset+length].split(b'\0')[0].decode()
+        cookie = int.from_bytes(buf.raw[offset+8:offset+16], sys.byteorder, signed=True)
+        kind = buf.raw[offset+18] if name_offset == 19 else buf.raw[offset+length-1]
+        records.append((name, cookie, kind))
+        offset += length
+    return n, records
+def open_dir():
+    return os.open('/sys/devices/system/cpu', os.O_RDONLY | os.O_DIRECTORY)
+fd = open_dir()
+records = []
+for _ in range(1000):
+    n, batch = read(fd, 64)
+    assert n >= 0, (n, batch)
+    if n == 0:
+        break
+    records.extend(batch)
+else:
+    raise AssertionError('directory never reached EOF')
+cpus = {name: kind for name, _, kind in records if name.startswith('cpu') and name[3:].isdigit()}
+assert cpus == {'cpu0': 4, 'cpu1': 4}, cpus
+assert read(fd) == (0, []), 'EOF must persist'
+assert read(fd) == (0, []), 'EOF must persist across repeated reads'
+os.lseek(fd, 0, os.SEEK_SET)
+first = read(fd, 64)
+assert first[0] > 0, first
+other = os.dup(fd)
+os.lseek(other, 0, os.SEEK_SET)
+assert read(fd, 64) == first, 'rewind through dup must reset the shared cursor'
+second = read(other, 64)
+assert second[0] > 0, second
+assert second[1][0][0] not in {r[0] for r in first[1]}, 'dup must share the cursor'
+os.lseek(fd, first[1][-1][1], os.SEEK_SET)
+assert read(other, 64) == second, 'd_off must be a usable seek cookie'
+os.lseek(fd, 0, os.SEEK_SET)
+assert read(fd, 1) == (-1, errno.EINVAL)
+assert read(fd, 4096, ctypes.c_void_p(1)) == (-1, errno.EFAULT)
+assert read(fd, 64) == first, 'failed reads must preserve the cursor'
+os.lseek(fd, 0, os.SEEK_SET)
+pid = os.fork()
+if pid == 0:
+    try:
+        assert read(fd, 64) == first
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+assert os.waitpid(pid, 0)[1] == 0
+assert read(other, 64) == second, 'fork must share the cursor'
+os.close(other)
+old_fd = fd
+os.close(fd)
+fd = open_dir()
+assert fd == old_fd, (fd, old_fd)
+assert read(fd, 64) == first, 'reused fd must start a new stream'
+os.close(fd)
+"#;
+    let name_offset = if syscall == libc::SYS_getdents64 {
+        "19"
+    } else {
+        "18"
+    };
+    let result = policy
+        .run(&["python3", "-c", script, &syscall.to_string(), name_offset])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
+}
+
+#[tokio::test]
+async fn test_cpu_directory_stream() {
+    check_cpu_directory_stream(libc::SYS_getdents64).await;
+}
+
+#[tokio::test]
+#[cfg(target_arch = "x86_64")]
+async fn test_cpu_directory_stream_legacy() {
+    check_cpu_directory_stream(libc::SYS_getdents).await;
 }
 
 /// Test that max_memory virtualizes /proc/meminfo.

@@ -30,16 +30,16 @@ pub(crate) use metadata::handle_pinned_metadata;
 pub(crate) use net_dispatch::{handle_net_directory, handle_net_open};
 pub(crate) use net_metadata::handle_net_metadata;
 
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{
-    content_memfd, inject_open_result, openat2_at, write_child_mem, NotifAction, NotifPolicy,
-    OpenArgs, OpenRequest,
+    content_memfd, dup_fd_from_pid, inject_open_result, openat2_at, write_child_mem, NotifAction,
+    NotifPolicy, OpenArgs, OpenRequest,
 };
 use crate::seccomp::state::ProcessIndex;
 use crate::sys::structs::{SeccompNotif, EACCES};
@@ -1308,133 +1308,149 @@ pub(crate) fn build_dirent64(d_ino: u64, d_off: i64, d_type: u8, name: &str) -> 
     Some(buf)
 }
 
-/// Build a filtered list of dirent64 entries for /proc, hiding PIDs not in the sandbox.
-fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
-    let mut entries = Vec::new();
-    let mut d_off: i64 = 0;
-
-    let dir = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return entries,
+fn read_filtered_dirents(
+    fd: RawFd,
+    syscall: i64,
+    count: usize,
+    keep: impl Fn(&str) -> bool,
+) -> std::io::Result<Vec<u8>> {
+    let name_offset = if syscall == libc::SYS_getdents64 {
+        19
+    } else {
+        18
     };
-
-    for entry in dir {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Filter out foreign PID directories.
-        if let Ok(pid) = name_str.parse::<i32>() {
-            if !sandbox_pids.contains(&pid) {
-                continue;
-            }
+    let mut data = vec![0; count];
+    loop {
+        let n = unsafe { libc::syscall(syscall, fd, data.as_mut_ptr(), count) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-
-        d_off += 1;
-
-        let d_type = match entry.file_type() {
-            Ok(ft) if ft.is_dir() => DT_DIR,
-            Ok(ft) if ft.is_symlink() => DT_LNK,
-            _ => DT_REG,
-        };
-
-        let d_ino = {
-            use std::os::linux::fs::MetadataExt;
-            entry.metadata().map(|m| m.st_ino()).unwrap_or(0)
-        };
-
-        if let Some(rec) = build_dirent64(d_ino, d_off, d_type, &name_str) {
-            entries.push(rec);
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut offset = 0;
+        let mut written = 0;
+        let mut last_kept = 0;
+        let mut next = [0; 8];
+        while offset < n as usize {
+            if offset + name_offset >= n as usize {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            let len =
+                u16::from_ne_bytes(data[offset + 16..offset + 18].try_into().unwrap()) as usize;
+            if len <= name_offset || offset + len > n as usize {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            next.copy_from_slice(&data[offset + 8..offset + 16]);
+            let name = data[offset + name_offset..offset + len]
+                .split(|&b| b == 0)
+                .next()
+                .unwrap();
+            if keep(&String::from_utf8_lossy(name)) {
+                data.copy_within(offset..offset + len, written);
+                last_kept = written;
+                written += len;
+            }
+            offset += len;
+        }
+        if written > 0 {
+            // The last seek cookie must advance past trailing hidden entries too.
+            data[last_kept + 8..last_kept + 16].copy_from_slice(&next);
+            data.truncate(written);
+            return Ok(data);
         }
     }
-    entries
 }
 
 // ============================================================
-// handle_getdents — PID filtering
+// handle_getdents — PID and CPU filtering
 // ============================================================
 
-/// Handle getdents64 for PID filtering when `isolate_pids` is true.
-///
-/// Intercepts getdents64 calls on /proc directory fds and returns a filtered
-/// set of entries that hides PIDs not belonging to the sandbox.
+enum ListingFilter {
+    Pids,
+    Cpus(u32),
+}
+
+fn sysfs_cpu_id(name: &str) -> Option<u32> {
+    name.strip_prefix("cpu")?.parse().ok()
+}
+
+/// Filter PID and CPU directory entries while preserving the kernel's stream.
 pub(crate) async fn handle_getdents(
     notif: &SeccompNotif,
-    processes: &Arc<ProcessIndex>,
-    _policy: &NotifPolicy,
+    ctx: &SupervisorCtx,
     notif_fd: RawFd,
 ) -> NotifAction {
-    let pid = notif.pid; // u32
-    let child_fd = (notif.data.args[0] & 0xFFFF_FFFF) as u32;
-    let buf_addr = notif.data.args[1];
-    let buf_size = (notif.data.args[2] & 0xFFFF_FFFF) as usize;
-
-    // Check if the child's fd points to /proc.
-    let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
-    let target = match std::fs::read_link(&link_path) {
+    let fd = match dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
+        Ok(fd) => fd,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let target = match std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
         Ok(t) => t,
-        Err(_) => return NotifAction::Continue,
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO)),
     };
-    if target.to_str() != Some("/proc") {
-        return NotifAction::Continue;
+    let filter = match (target.to_str(), ctx.policy.num_cpus) {
+        (Some("/proc"), _) => ListingFilter::Pids,
+        (Some("/sys/devices/system/cpu"), Some(n)) => ListingFilter::Cpus(n),
+        _ => return NotifAction::Continue,
+    };
+
+    let _guard = ctx.procfs.lock().await;
+    if notif.data.nr as i64 == libc::SYS_lseek {
+        let offset = unsafe {
+            libc::lseek(
+                fd.as_raw_fd(),
+                notif.data.args[1] as i64,
+                notif.data.args[2] as i32,
+            )
+        };
+        return if offset < 0 {
+            NotifAction::Errno(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
+        } else {
+            NotifAction::ReturnValue(offset)
+        };
     }
 
-    let entry = match processes.entry_for(pid as i32) {
-        Some(e) => e,
-        None => return NotifAction::Continue,
-    };
-    let cache_key = (child_fd, target.to_string_lossy().into_owned());
-    let mut perproc = entry.1.lock().await;
-
-    // Build and cache entries on first call for this (fd, target) pair.
-    if !perproc.procfs_dir_cache.contains_key(&cache_key) {
-        // Snapshot sandbox PIDs without holding the per-process lock
-        // any longer than needed — pids_snapshot only takes the
-        // ProcessIndex read lock briefly.
-        let snapshot = processes.pids_snapshot();
-        let entries = build_filtered_dirents(&snapshot);
-        perproc.procfs_dir_cache.insert(cache_key.clone(), entries);
+    let initial_offset = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) };
+    if initial_offset < 0 {
+        return NotifAction::Errno(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        );
     }
-
-    let entries = match perproc.procfs_dir_cache.get_mut(&cache_key) {
-        Some(e) => e,
-        None => return NotifAction::Continue,
-    };
-
-    // Pack as many entries as fit into the child's buffer.
-    let mut result = Vec::new();
-    let mut consumed = 0;
-    for entry in entries.iter() {
-        if result.len() + entry.len() > buf_size {
-            break;
+    let pids = ctx.processes.pids_snapshot();
+    let count = (notif.data.args[2] as u32 as usize).min(1024 * 1024);
+    let result =
+        read_filtered_dirents(
+            fd.as_raw_fd(),
+            notif.data.nr as i64,
+            count,
+            |name| match filter {
+                ListingFilter::Pids => name.parse::<i32>().map_or(true, |pid| pids.contains(&pid)),
+                ListingFilter::Cpus(n) => sysfs_cpu_id(name).map_or(true, |id| id < n),
+            },
+        )
+        .and_then(|data| {
+            if !data.is_empty()
+                && write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], &data)
+                    .is_err()
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EFAULT));
+            }
+            Ok(data.len())
+        });
+    match result {
+        Ok(len) => NotifAction::ReturnValue(len as i64),
+        Err(e) => {
+            unsafe { libc::lseek(fd.as_raw_fd(), initial_offset, libc::SEEK_SET) };
+            NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO))
         }
-        result.extend_from_slice(entry);
-        consumed += 1;
     }
-
-    // Empty cache = already fully drained on a prior call → return 0 (EOF).
-    if entries.is_empty() {
-        perproc.procfs_dir_cache.remove(&cache_key);
-        return NotifAction::ReturnValue(0);
-    }
-
-    if consumed > 0 {
-        entries.drain(..consumed);
-    }
-
-    drop(perproc);
-
-    // Write the result into the child's buffer and return the byte count.
-    if !result.is_empty() {
-        if write_child_mem(notif_fd, notif.id, pid, buf_addr, &result).is_err() {
-            return NotifAction::Continue;
-        }
-    }
-
-    NotifAction::ReturnValue(result.len() as i64)
 }
 
 // ============================================================
@@ -1999,11 +2015,28 @@ mod tests {
     }
 
     #[test]
-    fn test_build_filtered_dirents() {
-        use std::collections::HashSet;
-        let mut sandbox_pids = HashSet::new();
-        sandbox_pids.insert(1_i32);
-        let entries = build_filtered_dirents(&sandbox_pids);
-        assert!(!entries.is_empty());
+    fn test_read_filtered_dirents_skips_hidden_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible"), b"").unwrap();
+        for nr in [Some(libc::SYS_getdents64), crate::arch::sys_getdents()]
+            .into_iter()
+            .flatten()
+        {
+            let fd = std::fs::File::open(dir.path()).unwrap();
+            let data =
+                read_filtered_dirents(fd.as_raw_fd(), nr, 32, |name| name == "visible").unwrap();
+            let start = if nr == libc::SYS_getdents64 { 19 } else { 18 };
+            assert_eq!(&data[start..start + 8], b"visible\0");
+            assert!(read_filtered_dirents(fd.as_raw_fd(), nr, 32, |_| true)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn test_sysfs_cpu_id() {
+        assert_eq!(sysfs_cpu_id("cpu12"), Some(12));
+        assert_eq!(sysfs_cpu_id("cpufreq"), None);
+        assert_eq!(sysfs_cpu_id("online"), None);
     }
 }

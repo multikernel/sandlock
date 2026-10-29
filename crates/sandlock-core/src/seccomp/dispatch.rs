@@ -586,22 +586,17 @@ pub(crate) fn build_dispatch_table(
     // empty rather than leaking the host's /proc entry names (which are not all
     // synthesized and would dangle on access).
     // ------------------------------------------------------------------
-    let mut getdents_nrs = vec![libc::SYS_getdents64];
+    let mut getdents_nrs = vec![libc::SYS_getdents64, libc::SYS_lseek];
     if let Some(getdents) = arch::sys_getdents() {
         getdents_nrs.push(getdents);
     }
     for nr in getdents_nrs {
-        let policy_for_getdents = Arc::clone(policy);
-        let __sup = Arc::clone(ctx);
+        let sup = Arc::clone(ctx);
         table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
+            let sup = Arc::clone(&sup);
             let notif_fd = cx.notif_fd;
-            let policy = Arc::clone(&policy_for_getdents);
-            async move {
-                let processes = Arc::clone(&sup.processes);
-                crate::procfs::handle_getdents(&notif, &processes, &policy, notif_fd).await
-            }
+            async move { crate::procfs::handle_getdents(&notif, &sup, notif_fd).await }
         });
     }
 
