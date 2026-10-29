@@ -36,6 +36,7 @@ async fn test_num_cpus_virtualization() {
         "getconf _NPROCESSORS_ONLN",
         "getconf _NPROCESSORS_CONF",
         "cat /sys/devices/system/cpu/present",
+        "grep -c '^cpu[0-9]' /proc/stat",
     ] {
         let result = policy.clone().run(&["sh", "-c", cmd]).await.unwrap();
         assert!(result.success(), "{cmd} should succeed");

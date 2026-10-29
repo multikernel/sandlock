@@ -136,6 +136,7 @@ pub(crate) const SHADOWED_ETC_FILES: &[&str] = &["/etc/hostname", "/etc/hosts"];
 pub(crate) enum VirtualFile {
     CpuInfo,
     CpuList,
+    Stat,
     MemInfo,
     Uptime,
     LoadAvg,
@@ -153,6 +154,7 @@ pub(crate) enum VirtualFile {
 pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFile> {
     Some(match canon_proc_namespace(path).as_ref() {
         "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
+        "/proc/stat" if policy.num_cpus.is_some() => VirtualFile::Stat,
         // glibc's sysconf(_SC_NPROCESSORS_ONLN/CONF) counts these, not the
         // affinity mask, so `make -j$(getconf _NPROCESSORS_ONLN)` sees them.
         "/sys/devices/system/cpu/online"
@@ -193,6 +195,10 @@ pub(crate) async fn render_virtual_file(
     match file {
         VirtualFile::CpuInfo => generate_cpuinfo(policy.num_cpus.unwrap_or(1)),
         VirtualFile::CpuList => generate_cpu_list(policy.num_cpus.unwrap_or(1)),
+        VirtualFile::Stat => {
+            let real = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+            filter_proc_stat(&real, policy.num_cpus.unwrap_or(1))
+        }
         VirtualFile::MemInfo => {
             let rs = resource.lock().await;
             generate_meminfo(policy.max_memory_bytes, rs.mem_used)
@@ -236,6 +242,45 @@ pub(crate) fn generate_cpu_list(num_cpus: u32) -> Vec<u8> {
         0 | 1 => b"0\n".to_vec(),
         n => format!("0-{}\n", n - 1).into_bytes(),
     }
+}
+
+/// /proc/stat with only the first `num_cpus` per-CPU lines. The aggregate
+/// `cpu` line is summed from those, so usage ratios computed from it agree
+/// with the per-CPU lines.
+pub(crate) fn filter_proc_stat(real: &str, num_cpus: u32) -> Vec<u8> {
+    let kept: Vec<&str> = real
+        .lines()
+        .filter(|line| {
+            line.strip_prefix("cpu")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|id| id.parse::<u32>().ok())
+                .is_some_and(|id| id < num_cpus)
+        })
+        .collect();
+    let mut total: Vec<u64> = Vec::new();
+    for line in &kept {
+        for (i, value) in line.split_whitespace().skip(1).enumerate() {
+            if total.len() <= i {
+                total.push(0);
+            }
+            total[i] += value.parse::<u64>().unwrap_or(0);
+        }
+    }
+    let mut out = String::new();
+    for line in real.lines() {
+        if line.starts_with("cpu ") {
+            out.push_str("cpu ");
+            for value in &total {
+                out.push_str(&format!(" {value}"));
+            }
+            out.push('\n');
+            out.extend(kept.iter().map(|cpu| format!("{cpu}\n")));
+        } else if !line.starts_with("cpu") {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
 }
 
 // ============================================================
@@ -1652,6 +1697,15 @@ mod tests {
         assert_eq!(
             canon_proc_namespace("/proc/self/mountsx"),
             "/proc/self/mountsx"
+        );
+    }
+
+    #[test]
+    fn test_filter_proc_stat() {
+        let real = "cpu  6 0 9\ncpu0 1 0 2\ncpu1 2 0 3\ncpu2 3 0 4\nintr 7\nctxt 8\n";
+        assert_eq!(
+            String::from_utf8(filter_proc_stat(real, 2)).unwrap(),
+            "cpu  3 0 5\ncpu0 1 0 2\ncpu1 2 0 3\nintr 7\nctxt 8\n"
         );
     }
 
