@@ -745,6 +745,25 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_env_var(
     Box::into_raw(Box::new(builder.env_var(key, value)))
 }
 
+/// An unknown `field` or an oversized `value` fails the build.
+///
+/// # Safety
+/// `b`, `field`, and `value` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_uname(
+    b: *mut SandboxBuilder,
+    field: *const c_char,
+    value: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || field.is_null() || value.is_null() {
+        return b;
+    }
+    let field = CStr::from_ptr(field).to_str().unwrap_or("");
+    let value = CStr::from_ptr(value).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.uname(field, value)))
+}
+
 /// `timestamp` is RFC 3339 with an offset, e.g. "2000-01-01T00:00:00Z". A value
 /// that does not parse fails the build with the reason; null returns null.
 ///

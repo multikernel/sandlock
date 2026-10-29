@@ -706,6 +706,16 @@ sandlock_builder_t *sandlock_sandbox_builder_env_var(sandlock_builder_t *b,
                                                      const char *value);
 
 /**
+ * An unknown `field` or an oversized `value` fails the build.
+ *
+ * # Safety
+ * `b`, `field`, and `value` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_uname(sandlock_builder_t *b,
+                                                   const char *field,
+                                                   const char *value);
+
+/**
  * `timestamp` is RFC 3339 with an offset, e.g. "2000-01-01T00:00:00Z". A value
  * that does not parse fails the build with the reason; null returns null.
  *
