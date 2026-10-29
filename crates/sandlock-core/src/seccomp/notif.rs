@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
-use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -1515,16 +1515,23 @@ fn respond_value(fd: RawFd, id: u64, val: i64) -> io::Result<()> {
 
 /// Fail-closed response used when fd injection fails.
 ///
-/// Denies the syscall with `EACCES` rather than letting it continue: a
+/// Denies the syscall rather than letting it continue: a
 /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` here would let the child's original
 /// syscall run unmediated against the host path, silently bypassing
 /// chroot/file confinement. (Regression guard: this must never be a CONTINUE
-/// response.)
-fn inject_failure_resp(id: u64) -> SeccompNotifResp {
+/// response.) Kernels whose ADDFD takes the source with `fget()` refuse an
+/// `O_PATH` file with `EBADF`; the child hears `EOPNOTSUPP`, not a denial.
+fn inject_failure_resp(id: u64, srcfd: BorrowedFd<'_>, err: io::Error) -> SeccompNotifResp {
+    let o_path = unsafe { libc::fcntl(srcfd.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH != 0;
+    let errno = if o_path && err.raw_os_error() == Some(libc::EBADF) {
+        libc::EOPNOTSUPP
+    } else {
+        libc::EACCES
+    };
     SeccompNotifResp {
         id,
         val: 0,
-        error: -libc::EACCES,
+        error: -errno,
         flags: 0,
     }
 }
@@ -2086,7 +2093,7 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             // srcfd (OwnedFd) is dropped at end of this arm, closing the fd.
             match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
                 Ok(_new_fd) => Ok(()),
-                Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
+                Err(e) => send_resp_raw(fd, &inject_failure_resp(id, srcfd.as_fd(), e)),
             }
         }
         NotifAction::InjectFdSendTracked {
@@ -2098,7 +2105,7 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
                 (on_success.0)(new_fd);
                 Ok(())
             }
-            Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
+            Err(e) => send_resp_raw(fd, &inject_failure_resp(id, srcfd.as_fd(), e)),
         },
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
@@ -3662,7 +3669,9 @@ mod tests {
         // When fd injection fails, the supervisor must fail closed: deny the
         // syscall instead of letting it continue unmediated against the host
         // path (which would silently bypass chroot/file confinement).
-        let resp = inject_failure_resp(123);
+        let file = std::fs::File::open("/").unwrap();
+        let resp =
+            inject_failure_resp(123, file.as_fd(), io::Error::from_raw_os_error(libc::EBADF));
         assert_eq!(resp.id, 123);
         assert_eq!(
             resp.flags & SECCOMP_USER_NOTIF_FLAG_CONTINUE,
@@ -3671,6 +3680,23 @@ mod tests {
         );
         assert_ne!(resp.error, 0, "fd-injection failure must be a denial");
         assert_eq!(resp.error, -libc::EACCES);
+    }
+
+    #[test]
+    fn inject_failure_of_an_o_path_source_is_eopnotsupp() {
+        let raw = unsafe { libc::open(c"/".as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let ebadf = || io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(
+            inject_failure_resp(1, fd.as_fd(), ebadf()).error,
+            -libc::EOPNOTSUPP
+        );
+        let enomem = io::Error::from_raw_os_error(libc::ENOMEM);
+        assert_eq!(
+            inject_failure_resp(1, fd.as_fd(), enomem).error,
+            -libc::EACCES
+        );
     }
 
     #[test]
