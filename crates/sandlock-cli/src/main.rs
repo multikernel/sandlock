@@ -111,6 +111,11 @@ struct RunArgs {
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env_vars: Vec<String>,
 
+    /// Report VALUE as a uname field: release, version, sysname, machine or
+    /// domainname (e.g. --uname release=8.0.0). Repeatable.
+    #[arg(long = "uname", value_name = "FIELD=VALUE")]
+    uname: Vec<String>,
+
     /// CPU cores to pin the sandbox to (e.g. --cpu-cores 0,2,3)
     #[arg(long = "cpu-cores", value_delimiter = ',')]
     cpu_cores: Vec<u32>,
@@ -816,6 +821,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if !args.cpu_cores.is_empty() {
         builder = builder.cpu_cores(args.cpu_cores.clone());
     }
+    for spec in &args.uname {
+        builder = builder.uname_spec(spec);
+    }
     match &args.gpu {
         // `all` maps to an empty device list, which the core expands to every
         // present GPU; explicit indices pass through unchanged.
@@ -1084,6 +1092,9 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     }
     if !args.cpu_cores.is_empty() {
         bad.push("--cpu-cores");
+    }
+    if !args.uname.is_empty() {
+        bad.push("--uname");
     }
     if args.gpu.is_some() {
         bad.push("--gpu");
