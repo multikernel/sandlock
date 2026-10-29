@@ -209,6 +209,10 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "port-remap"))]
     pub port_remap: bool,
 
+    // The CLI takes repeated FIELD=VALUE specs on RunArgs.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub uname: super::Uname,
+
     /// Skip the seccomp user-notification supervisor. The CLI exposes
     /// its own `--no-supervisor` flag on `RunArgs` (which short-circuits
     /// to a direct exec); this field is the API-level counterpart used
@@ -318,6 +322,7 @@ impl Default for SandboxBuilder {
             cpu_cores: None,
             num_cpus: None,
             port_remap: false,
+            uname: Default::default(),
             no_supervisor: false,
             user: None,
             protection_policy: ProtectionPolicy::default(),
@@ -384,6 +389,7 @@ impl Clone for SandboxBuilder {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            uname: self.uname.clone(),
             no_supervisor: self.no_supervisor,
             user: self.user,
             protection_policy: self.protection_policy.clone(),
@@ -830,6 +836,23 @@ impl SandboxBuilder {
     pub fn num_cpus(mut self, n: u32) -> Self {
         self.num_cpus = Some(n);
         self
+    }
+
+    /// Report `value` as the `uname()` field named `field` (`release`,
+    /// `version`, `sysname`, `machine` or `domainname`).
+    pub fn uname(mut self, field: &str, value: &str) -> Self {
+        match self.uname.set(field, value) {
+            Ok(()) => self,
+            Err(msg) => self.reject(msg),
+        }
+    }
+
+    /// [`uname`](Self::uname) from `FIELD=VALUE`.
+    pub fn uname_spec(mut self, spec: &str) -> Self {
+        match self.uname.set_spec(spec) {
+            Ok(()) => self,
+            Err(msg) => self.reject(msg),
+        }
     }
 
     pub fn port_remap(mut self, v: bool) -> Self {
@@ -1280,6 +1303,7 @@ impl SandboxBuilder {
             cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            uname: self.uname.clone(),
             no_supervisor: self.no_supervisor,
             user: self.user,
             policy_fn,

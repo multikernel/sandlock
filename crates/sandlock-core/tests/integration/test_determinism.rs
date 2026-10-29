@@ -257,6 +257,45 @@ async fn test_hostname_virtualization() {
     }
 }
 
+/// A uname override must agree across uname() and every procfs file that
+/// repeats the same field.
+#[tokio::test]
+async fn test_uname_override() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .uname("release", "8.0.0-sandlock")
+        .uname("version", "#1 SMP fake")
+        .uname("machine", "riscv64")
+        .build()
+        .unwrap();
+    let script = "uname -r; uname -v; uname -m; \
+                  cat /proc/sys/kernel/osrelease /proc/sys/kernel/version \
+                  /proc/sys/kernel/arch /proc/version";
+    let result = policy
+        .with_name(&format!("uname-{}", std::process::id()))
+        .run(&["sh", "-c", script])
+        .await
+        .unwrap();
+    assert!(result.success(), "uname probe failed: {result:?}");
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[..6],
+        [
+            "8.0.0-sandlock",
+            "#1 SMP fake",
+            "riscv64",
+            "8.0.0-sandlock",
+            "#1 SMP fake",
+            "riscv64"
+        ]
+    );
+    assert_eq!(lines[6], "Linux version 8.0.0-sandlock #1 SMP fake");
+}
+
 /// The /etc/hostname shim used to do a literal `path == "/etc/hostname"`
 /// match, so dirfd-relative and non-canonical spellings leaked the host's
 /// real hostname. Exercise each bypass shape and assert the virtual

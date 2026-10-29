@@ -692,3 +692,25 @@ fn timestamp_formats_in_utc_and_round_trips() {
     let t = parse_timestamp("t", "2026-01-01T08:00:00+08:00").unwrap();
     assert_eq!(format_timestamp(t).as_deref(), Some("2026-01-01T00:00:00Z"));
 }
+
+#[test]
+fn builder_uname_sets_fields() {
+    let sb = Sandbox::builder()
+        .uname("release", "8.0.0")
+        .uname_spec("machine=riscv64")
+        .build()
+        .unwrap();
+    assert_eq!(sb.uname.release.as_deref(), Some("8.0.0"));
+    assert_eq!(sb.uname.machine.as_deref(), Some("riscv64"));
+    assert_eq!(sb.uname.sysname, None);
+}
+
+#[test]
+fn builder_uname_rejects_bad_specs() {
+    for spec in ["nodename=x", "kernel=8.0", "release", "release=a\0b"] {
+        let err = Sandbox::builder().uname_spec(spec).build();
+        assert!(err.is_err(), "{spec:?} must be rejected");
+    }
+    let long = "x".repeat(65);
+    assert!(Sandbox::builder().uname("release", &long).build().is_err());
+}

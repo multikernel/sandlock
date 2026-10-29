@@ -1349,6 +1349,7 @@ pub struct NotifPolicy {
     pub chroot_mount_ro: Vec<std::path::PathBuf>,
     pub deterministic_dirs: bool,
     pub virtual_hostname: Option<String>,
+    pub uname: crate::sandbox::Uname,
     pub has_http_acl: bool,
     /// Synthetic `/etc/hosts` served to the sandbox. Always populated:
     /// `openat("/etc/hosts")` returns a memfd with this content so the

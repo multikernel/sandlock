@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::sandbox::Uname;
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{
     content_memfd, dup_fd_from_pid, inject_open_result, openat2_at, write_child_mem, NotifAction,
@@ -146,12 +147,19 @@ pub(crate) enum VirtualFile {
     Cgroup,
     Hostname,
     EtcHosts,
+    OsType,
+    OsRelease,
+    KernelVersion,
+    Arch,
+    DomainName,
+    ProcVersion,
 }
 
 /// The virtual file `path` names under `policy`, with every per-task
 /// spelling of a namespace entry collapsed first. The real file behind it
 /// must never be handed out in its place.
 pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFile> {
+    let uname = &policy.uname;
     Some(match canon_proc_namespace(path).as_ref() {
         "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
         "/proc/stat" if policy.num_cpus.is_some() => VirtualFile::Stat,
@@ -175,6 +183,16 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
             VirtualFile::Hostname
         }
         "/etc/hosts" if !policy.virtual_etc_hosts.is_empty() => VirtualFile::EtcHosts,
+        "/proc/sys/kernel/ostype" if uname.sysname.is_some() => VirtualFile::OsType,
+        "/proc/sys/kernel/osrelease" if uname.release.is_some() => VirtualFile::OsRelease,
+        "/proc/sys/kernel/version" if uname.version.is_some() => VirtualFile::KernelVersion,
+        "/proc/sys/kernel/arch" if uname.machine.is_some() => VirtualFile::Arch,
+        "/proc/sys/kernel/domainname" if uname.domainname.is_some() => VirtualFile::DomainName,
+        "/proc/version"
+            if uname.sysname.is_some() || uname.release.is_some() || uname.version.is_some() =>
+        {
+            VirtualFile::ProcVersion
+        }
         _ => return None,
     })
 }
@@ -235,6 +253,12 @@ pub(crate) async fn render_virtual_file(
         )
         .into_bytes(),
         VirtualFile::EtcHosts => policy.virtual_etc_hosts.clone().into_bytes(),
+        VirtualFile::OsType => uts_line(&policy.uname.sysname),
+        VirtualFile::OsRelease => uts_line(&policy.uname.release),
+        VirtualFile::KernelVersion => uts_line(&policy.uname.version),
+        VirtualFile::Arch => uts_line(&policy.uname.machine),
+        VirtualFile::DomainName => uts_line(&policy.uname.domainname),
+        VirtualFile::ProcVersion => proc_version(&host_utsname(), &policy.uname).into_bytes(),
     }
 }
 
@@ -283,6 +307,48 @@ pub(crate) fn filter_proc_stat(real: &str, num_cpus: u32) -> Vec<u8> {
         }
     }
     out.into_bytes()
+}
+
+fn uts_line(value: &Option<String>) -> Vec<u8> {
+    format!("{}\n", value.as_deref().unwrap_or_default()).into_bytes()
+}
+
+/// /proc/version built from the uname fields alone. The host's compiler
+/// banner is left out: it names the build host and differs across
+/// machines, so pinned fields would still not give a reproducible file.
+fn proc_version(host: &libc::utsname, uname: &Uname) -> String {
+    let field = |value: &Option<String>, host: &[libc::c_char]| {
+        value.clone().unwrap_or_else(|| uts_field(host))
+    };
+    format!(
+        "{} version {} {}\n",
+        field(&uname.sysname, &host.sysname),
+        field(&uname.release, &host.release),
+        field(&uname.version, &host.version),
+    )
+}
+
+fn host_utsname() -> libc::utsname {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    unsafe { libc::uname(&mut uts) };
+    uts
+}
+
+fn uts_field(field: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = field
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn set_uts_field(field: &mut [libc::c_char], value: &str) {
+    let len = value.len().min(field.len() - 1);
+    field.fill(0);
+    for (dst, &b) in field.iter_mut().zip(&value.as_bytes()[..len]) {
+        *dst = b as libc::c_char;
+    }
 }
 
 // ============================================================
@@ -962,12 +1028,14 @@ pub(crate) fn handle_sched_getaffinity(
 // uname virtualization
 // ============================================================
 
-/// Handle uname() — override the nodename (hostname) field.
-///
-/// uname(buf) writes a `struct utsname` to buf. We call the real uname()
-/// in the supervisor, patch the nodename field, and write the result to
-/// the child's buffer.
-pub(crate) fn handle_uname(notif: &SeccompNotif, hostname: &str, notif_fd: RawFd) -> NotifAction {
+/// Handle uname(): report the sandbox name as nodename and the overridden
+/// `uname` fields over the host's.
+pub(crate) fn handle_uname(
+    notif: &SeccompNotif,
+    hostname: &str,
+    uname: &Uname,
+    notif_fd: RawFd,
+) -> NotifAction {
     let buf_addr = notif.data.args[0];
     if buf_addr == 0 {
         return NotifAction::Continue;
@@ -979,13 +1047,18 @@ pub(crate) fn handle_uname(notif: &SeccompNotif, hostname: &str, notif_fd: RawFd
         return NotifAction::Continue;
     }
 
-    // Overwrite nodename with the virtual hostname.
-    let name_bytes = hostname.as_bytes();
-    let len = name_bytes.len().min(uts.nodename.len() - 1);
-    for (i, &b) in name_bytes[..len].iter().enumerate() {
-        uts.nodename[i] = b as libc::c_char;
+    set_uts_field(&mut uts.nodename, hostname);
+    for (field, value) in [
+        (&mut uts.sysname[..], &uname.sysname),
+        (&mut uts.release[..], &uname.release),
+        (&mut uts.version[..], &uname.version),
+        (&mut uts.machine[..], &uname.machine),
+        (&mut uts.domainname[..], &uname.domainname),
+    ] {
+        if let Some(value) = value {
+            set_uts_field(field, value);
+        }
     }
-    uts.nodename[len] = 0;
 
     // Write the patched utsname to child memory.
     let bytes = unsafe {
@@ -1731,6 +1804,31 @@ mod tests {
     fn test_generate_cpu_list() {
         assert_eq!(generate_cpu_list(1), b"0\n");
         assert_eq!(generate_cpu_list(4), b"0-3\n");
+    }
+
+    #[test]
+    fn proc_version_takes_unset_fields_from_the_host() {
+        let mut host: libc::utsname = unsafe { std::mem::zeroed() };
+        set_uts_field(&mut host.sysname, "Linux");
+        set_uts_field(&mut host.release, "6.8.0");
+        set_uts_field(&mut host.version, "#1 SMP");
+        let uname = Uname {
+            release: Some("8.0.0".into()),
+            ..Default::default()
+        };
+        assert_eq!(proc_version(&host, &uname), "Linux version 8.0.0 #1 SMP\n");
+    }
+
+    #[test]
+    fn set_uts_field_truncates_and_terminates() {
+        let mut field = [b'x' as libc::c_char; 8];
+        set_uts_field(&mut field, "0123456789");
+        assert_eq!(uts_field(&field), "0123456");
+        set_uts_field(&mut field, "ab");
+        assert_eq!(uts_field(&field), "ab");
+        assert!(field[2..].iter().all(|&c| c == 0));
+        set_uts_field(&mut field, "");
+        assert!(field.iter().all(|&c| c == 0));
     }
 
     #[test]

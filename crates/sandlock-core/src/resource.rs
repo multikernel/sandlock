@@ -1011,6 +1011,7 @@ mod tests {
             chroot_mount_ro: Vec::new(),
             deterministic_dirs: false,
             virtual_hostname: None,
+            uname: Default::default(),
             has_http_acl: false,
             virtual_etc_hosts: String::new(),
             ca_inject_paths: Vec::new(),

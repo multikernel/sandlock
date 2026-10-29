@@ -619,11 +619,13 @@ pub(crate) fn build_dispatch_table(
     if let Some(ref hostname) = policy.virtual_hostname {
         let hostname_for_uname = hostname.clone();
         let hostname_for_open = hostname.clone();
+        let uname = policy.uname.clone();
         table.register(libc::SYS_uname, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
             let hostname = hostname_for_uname.clone();
-            async move { crate::procfs::handle_uname(&notif, &hostname, notif_fd) }
+            let uname = uname.clone();
+            async move { crate::procfs::handle_uname(&notif, &hostname, &uname, notif_fd) }
         });
         for nr in open_family_syscalls() {
             let hostname = hostname_for_open.clone();
@@ -1285,6 +1287,7 @@ mod handler_tests {
                 chroot_mount_ro: Vec::new(),
                 deterministic_dirs: false,
                 virtual_hostname: None,
+                uname: Default::default(),
                 has_http_acl: false,
                 virtual_etc_hosts: String::new(),
                 ca_inject_paths: Vec::new(),
