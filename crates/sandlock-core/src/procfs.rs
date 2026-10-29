@@ -135,6 +135,7 @@ pub(crate) const SHADOWED_ETC_FILES: &[&str] = &["/etc/hostname", "/etc/hosts"];
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum VirtualFile {
     CpuInfo,
+    CpuList,
     MemInfo,
     Uptime,
     LoadAvg,
@@ -152,6 +153,15 @@ pub(crate) enum VirtualFile {
 pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFile> {
     Some(match canon_proc_namespace(path).as_ref() {
         "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
+        // glibc's sysconf(_SC_NPROCESSORS_ONLN/CONF) counts these, not the
+        // affinity mask, so `make -j$(getconf _NPROCESSORS_ONLN)` sees them.
+        "/sys/devices/system/cpu/online"
+        | "/sys/devices/system/cpu/possible"
+        | "/sys/devices/system/cpu/present"
+            if policy.num_cpus.is_some() =>
+        {
+            VirtualFile::CpuList
+        }
         "/proc/meminfo" if policy.max_memory_bytes > 0 => VirtualFile::MemInfo,
         "/proc/uptime" if policy.has_time_start => VirtualFile::Uptime,
         "/proc/loadavg" => VirtualFile::LoadAvg,
@@ -182,6 +192,7 @@ pub(crate) async fn render_virtual_file(
     };
     match file {
         VirtualFile::CpuInfo => generate_cpuinfo(policy.num_cpus.unwrap_or(1)),
+        VirtualFile::CpuList => generate_cpu_list(policy.num_cpus.unwrap_or(1)),
         VirtualFile::MemInfo => {
             let rs = resource.lock().await;
             generate_meminfo(policy.max_memory_bytes, rs.mem_used)
@@ -216,6 +227,14 @@ pub(crate) async fn render_virtual_file(
         )
         .into_bytes(),
         VirtualFile::EtcHosts => policy.virtual_etc_hosts.clone().into_bytes(),
+    }
+}
+
+/// A sysfs CPU list (`0` or `0-N`) naming the first `num_cpus` CPUs.
+pub(crate) fn generate_cpu_list(num_cpus: u32) -> Vec<u8> {
+    match num_cpus {
+        0 | 1 => b"0\n".to_vec(),
+        n => format!("0-{}\n", n - 1).into_bytes(),
     }
 }
 
@@ -534,7 +553,7 @@ pub(crate) async fn handle_proc_open(
 
     // The /etc shims are handlers of their own, ordered around the chroot
     // handler so that its grant check comes first.
-    if path.starts_with("/proc/") {
+    if path.starts_with("/proc/") || path.starts_with("/sys/") {
         if let Some(file) = virtual_file(path, policy) {
             let content = render_virtual_file(file, processes, resource, policy).await;
             return inject_memfd(&content);
@@ -1634,6 +1653,12 @@ mod tests {
             canon_proc_namespace("/proc/self/mountsx"),
             "/proc/self/mountsx"
         );
+    }
+
+    #[test]
+    fn test_generate_cpu_list() {
+        assert_eq!(generate_cpu_list(1), b"0\n");
+        assert_eq!(generate_cpu_list(4), b"0-3\n");
     }
 
     #[test]
