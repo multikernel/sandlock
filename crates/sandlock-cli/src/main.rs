@@ -617,6 +617,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         if let Some(n) = base.num_cpus {
             b = b.num_cpus(n);
         }
+        b.uname = base.uname.clone();
         if let Some(n) = base.max_open_files {
             b = b.max_open_files(n);
         }
@@ -1200,6 +1201,9 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     }
     if profile.num_cpus.is_some() {
         bad.push("[limits].num_cpus");
+    }
+    if !profile.uname.is_empty() {
+        bad.push("[uname]");
     }
     if profile.random_seed.is_some() {
         bad.push("[determinism].random_seed");

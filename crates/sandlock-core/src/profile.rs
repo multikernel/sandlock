@@ -1,5 +1,5 @@
 use crate::error::SandlockError;
-use crate::sandbox::{ByteSize, Sandbox};
+use crate::sandbox::{ByteSize, Sandbox, Uname};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +32,8 @@ pub struct ProfileInput {
     pub syscalls: SyscallsSection,
     #[serde(skip_serializing_if = "is_default")]
     pub limits: LimitsSection,
+    #[serde(skip_serializing_if = "is_default")]
+    pub uname: Uname,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -348,6 +350,23 @@ pub struct ResolvedProfile {
     pub cpu_cores: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_cpus: Option<u32>,
+
+    #[serde(
+        skip_serializing_if = "Uname::is_empty",
+        serialize_with = "uname_as_map"
+    )]
+    pub uname: Uname,
+}
+
+// The SDKs read this as a plain map, where a null value would be a field
+// set to nothing rather than one left to the host.
+fn uname_as_map<S: serde::Serializer>(uname: &Uname, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(
+        uname
+            .fields()
+            .into_iter()
+            .filter_map(|(field, value)| value.as_ref().map(|v| (field, v))),
+    )
 }
 
 fn pairs_as_map<S: serde::Serializer>(
@@ -446,6 +465,8 @@ pub fn resolve(input: ProfileInput) -> Result<ResolvedProfile, SandlockError> {
         gpu_devices: l.gpu_devices,
         cpu_cores: l.cpu_cores,
         num_cpus: l.num_cpus,
+
+        uname: input.uname,
     })
 }
 
@@ -600,6 +621,7 @@ impl ResolvedProfile {
         if let Some(n) = self.num_cpus {
             b = b.num_cpus(n);
         }
+        b.uname = self.uname;
 
         let policy = b.build()?;
         Ok((
@@ -871,6 +893,7 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
             cpu_cores: s.cpu_cores.clone(),
             num_cpus: s.num_cpus,
         },
+        uname: s.uname.clone(),
     }
 }
 
@@ -1366,6 +1389,22 @@ mod tests {
             let rendered = sandbox_to_profile(&policy, &[]);
             assert_eq!(rendered.determinism.time_start.as_deref(), Some(stamp));
         }
+    }
+
+    #[test]
+    fn profile_uname_round_trips() {
+        let toml = "[uname]\nrelease = \"8.0.0\"\nmachine = \"riscv64\"\n";
+        let (policy, _spec) = parse_profile(toml).unwrap();
+        assert_eq!(policy.uname.release.as_deref(), Some("8.0.0"));
+        assert_eq!(policy.uname.machine.as_deref(), Some("riscv64"));
+        assert_eq!(sandbox_to_profile(&policy, &[]).uname, policy.uname);
+    }
+
+    #[test]
+    fn profile_uname_rejects_unknown_and_oversized_fields() {
+        assert!(parse_profile("[uname]\nnodename = \"x\"\n").is_err());
+        let long = format!("[uname]\nrelease = \"{}\"\n", "x".repeat(65));
+        assert!(parse_profile(&long).is_err());
     }
 
     #[test]

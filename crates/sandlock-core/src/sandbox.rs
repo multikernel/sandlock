@@ -243,6 +243,7 @@ impl std::str::FromStr for RunAs {
 /// repeat it. A field left `None` shows the host's value; `nodename` is
 /// always the sandbox name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct Uname {
     pub sysname: Option<String>,
     pub release: Option<String>,
@@ -292,7 +293,7 @@ impl Uname {
         Ok(())
     }
 
-    fn fields(&self) -> [(&'static str, &Option<String>); 5] {
+    pub(crate) fn fields(&self) -> [(&'static str, &Option<String>); 5] {
         [
             ("sysname", &self.sysname),
             ("release", &self.release),

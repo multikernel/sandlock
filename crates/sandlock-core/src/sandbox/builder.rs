@@ -938,6 +938,7 @@ impl SandboxBuilder {
         if let Some(msg) = self.rejected {
             return Err(SandboxError::Invalid(msg));
         }
+        self.uname.validate().map_err(SandboxError::Invalid)?;
         validate_syscall_names(&self.extra_deny_syscalls)?;
         validate_allow_groups(&self.extra_allow_syscalls)?;
         validate_allow_deny_disjoint(&self.extra_allow_syscalls, &self.extra_deny_syscalls)?;
