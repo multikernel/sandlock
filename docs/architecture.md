@@ -112,6 +112,19 @@ clients and supervisors must share the IPC namespace used for discovery and the
 network namespace containing their abstract sockets. This protocol does not
 discover sandboxes started by older versions using name-based socket addresses.
 
+A host program can disable registration for an individual sandbox with
+`SandboxBuilder::registration(false)`
+(FFI `sandlock_sandbox_builder_registration`, Python
+`Sandbox(registration=False)`, Go `Sandbox{DisableRegistration: true}`).
+Registration defaults to enabled and is an instance setting, excluded from
+serialized policy. An unregistered sandbox claims no name, binds no socket,
+and runs no control loop: it is invisible to `sandlock ps`, unreachable by
+`sandlock kill`, and does not reserve a UID-wide unique name. Its name still
+sets the virtual hostname, and direct `Controller` and SDK lifecycle methods
+continue to work. Registered and unregistered sandboxes can coexist in one
+process. Set the option before creating the sandbox; changing it does not
+alter an already running instance.
+
 Sandlock does not create an IPC namespace. The default seccomp policy denies
 semaphore and shared-memory syscalls, including in unsupervised mode.
 Knowing the registry ID does not let a confined workload read, modify, or remove

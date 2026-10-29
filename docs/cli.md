@@ -254,6 +254,9 @@ Killed sandbox 'web.local'
 Ports show as `virtual→real` when `--port-remap` is active; see
 [`network.md`](network.md#port-virtualization).
 
+Sandboxes created with SDK registration disabled do not appear here and
+cannot be killed by name. Registration is enabled by default.
+
 ## Generating a profile
 
 `sandlock learn` runs a workload under observation and emits a profile

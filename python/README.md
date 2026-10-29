@@ -73,13 +73,20 @@ network, resource limits, etc.) and runtime state. Construct once, then call
 `run()` (blocking) or `spawn()` + lifecycle methods, or use as a context manager.
 
 All config fields are optional. Unset fields mean "no restriction" unless
-noted otherwise. Runtime kwargs (`name`, `policy_fn`, `init_fn`, `work_fn`)
+noted otherwise. Runtime kwargs (`name`, `registration`, `policy_fn`, `init_fn`, `work_fn`)
 are set at construction time alongside config fields.
 
 A single `Sandbox` instance holds at most one running process at a time.
 For concurrent execution, create multiple instances.
 
 **Runtime kwargs:**
+
+- `registration`: defaults to `True`. Set `Sandbox(registration=False)` to
+  skip this instance's name claim and control socket. It will not appear in
+  `sandlock ps` or accept `sandlock kill` by name, and its name will not be
+  reserved. The virtual hostname and direct lifecycle methods still work.
+  Set before creation; other sandboxes and existing running instances are
+  unaffected. This setting is excluded from serialized policy.
 
 - `name` -- sandbox name (also its virtual hostname inside the sandbox).
   Auto-generated as `sandbox-{pid}` when omitted.
