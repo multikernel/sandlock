@@ -34,6 +34,9 @@ allow_bind = [8080, "9000-9001"]
 [limits]
 memory = "64M"
 cpu = 50
+
+[uname]
+release = "8.0.0"
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +54,7 @@ cpu = 50
 		NetAllowBind: []string{"8080", "9000-9001"},
 		MaxMemory:    "64M",
 		MaxCPU:       50,
+		Uname:        map[string]string{"release": "8.0.0"},
 	}
 	if !reflect.DeepEqual(sb, want) {
 		t.Fatalf("got  %+v\nwant %+v", sb, want)

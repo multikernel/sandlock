@@ -191,16 +191,11 @@ func (s *Sandbox) validateStrings() error {
 			}
 		}
 	}
-	for _, m := range []map[string]string{s.FSMount, s.FSMountRO} {
+	for _, m := range []map[string]string{s.FSMount, s.FSMountRO, s.Env, s.Uname} {
 		for k, v := range m {
 			if hasNUL(k) || hasNUL(v) {
 				return ErrInvalidString
 			}
-		}
-	}
-	for k, v := range s.Env {
-		if hasNUL(k) || hasNUL(v) {
-			return ErrInvalidString
 		}
 	}
 	if img := s.Image; img != nil {
@@ -430,6 +425,12 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		ck, cv := C.CString(k), C.CString(v)
 		b = C.sandlock_sandbox_builder_env_var(b, ck, cv)
 		C.free(unsafe.Pointer(ck))
+		C.free(unsafe.Pointer(cv))
+	}
+	for field, value := range s.Uname {
+		cf, cv := C.CString(field), C.CString(value)
+		b = C.sandlock_sandbox_builder_uname(b, cf, cv)
+		C.free(unsafe.Pointer(cf))
 		C.free(unsafe.Pointer(cv))
 	}
 

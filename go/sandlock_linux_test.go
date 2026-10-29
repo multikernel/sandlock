@@ -144,6 +144,23 @@ func TestRunEmptyCommand(t *testing.T) {
 	}
 }
 
+func TestUnameOverride(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs, Uname: map[string]string{"release": "8.0.0"}}
+	res, err := sb.Run(context.Background(), "sh", "-c", "uname -r; cat /proc/sys/kernel/osrelease")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := string(res.Stdout); got != "8.0.0\n8.0.0\n" {
+		t.Fatalf("stdout = %q, stderr = %q", got, res.Stderr)
+	}
+
+	bad := &sandlock.Sandbox{FSReadable: rootfs, Uname: map[string]string{"kernel": "8"}}
+	if _, err := bad.Run(context.Background(), "true"); err == nil || !strings.Contains(err.Error(), "unknown uname field") {
+		t.Fatalf("err = %v, want unknown uname field", err)
+	}
+}
+
 func TestRunNULRejected(t *testing.T) {
 	sb := &sandlock.Sandbox{}
 	if _, err := sb.Run(context.Background(), "echo", "a\x00b"); err != sandlock.ErrInvalidString {
