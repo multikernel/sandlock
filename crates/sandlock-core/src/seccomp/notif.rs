@@ -736,11 +736,12 @@ pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<
     let a = &notif.data.args;
     let nr = notif.data.nr as i64;
     if nr == libc::SYS_openat {
+        let (flags, mode) = openat_how(a[2], a[3]);
         Some(OpenArgs {
             dirfd: a[0] as i64,
             path_ptr: a[1],
-            flags: a[2],
-            mode: a[3],
+            flags,
+            mode,
             resolve: 0,
         })
     } else if nr == arch::SYS_OPENAT2 {
@@ -771,14 +772,59 @@ pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<
         })
     } else {
         // legacy open(path, flags, mode) — AT_FDCWD implied.
+        let (flags, mode) = openat_how(a[1], a[2]);
         Some(OpenArgs {
             dirfd: libc::AT_FDCWD as i64,
             path_ptr: a[0],
-            flags: a[1],
-            mode: a[2],
+            flags,
+            mode,
             resolve: 0,
         })
     }
+}
+
+/// The `open_how` the kernel builds for an `open`/`openat` caller. Handlers
+/// serve opens with `openat2`, which rejects what `openat` silently drops:
+/// unknown flag bits, stray flags beside `O_PATH` (glibc adds `O_LARGEFILE`),
+/// and a mode without `O_CREAT`/`O_TMPFILE`.
+fn openat_how(flags: u64, mode: u64) -> (u64, u64) {
+    // libc exposes O_LARGEFILE as zero on some 64-bit targets, unlike the syscall ABI.
+    const O_LARGEFILE: u64 = if cfg!(target_arch = "aarch64") {
+        0o400000
+    } else {
+        0o100000
+    };
+    const VALID_OPEN_FLAGS: u64 = (libc::O_ACCMODE
+        | libc::O_CREAT
+        | libc::O_EXCL
+        | libc::O_NOCTTY
+        | libc::O_TRUNC
+        | libc::O_APPEND
+        | libc::O_NDELAY
+        | libc::O_NONBLOCK
+        | libc::O_SYNC
+        | libc::O_DSYNC
+        | libc::O_ASYNC
+        | libc::O_DIRECT
+        | libc::O_DIRECTORY
+        | libc::O_NOFOLLOW
+        | libc::O_NOATIME
+        | libc::O_CLOEXEC
+        | libc::O_PATH
+        | libc::O_TMPFILE) as u64
+        | O_LARGEFILE;
+    const O_PATH_FLAGS: u64 =
+        (libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_PATH | libc::O_CLOEXEC) as u64;
+    let flags = flags & VALID_OPEN_FLAGS;
+    let flags = if flags & libc::O_PATH as u64 != 0 {
+        flags & O_PATH_FLAGS
+    } else {
+        flags
+    };
+    let creates = flags & libc::O_CREAT as u64 != 0
+        || flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64;
+    let mode = if creates { mode & 0o7777 } else { 0 };
+    (flags, mode)
 }
 
 /// An open-family request, decoded once per notification and shared by every
@@ -3389,6 +3435,21 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openat_how_matches_what_openat2_accepts() {
+        let o_path = (libc::O_PATH | libc::O_DIRECTORY) as u64;
+        assert_eq!(openat_how(o_path | libc::O_NONBLOCK as u64, 0), (o_path, 0));
+        assert_eq!(openat_how(o_path | libc::O_RDWR as u64, 0), (o_path, 0));
+        assert_eq!(openat_how(libc::O_RDONLY as u64, 0o755), (0, 0));
+        let creat = (libc::O_WRONLY | libc::O_CREAT) as u64;
+        assert_eq!(openat_how(creat, 0o100644), (creat, 0o644));
+        let tmpfile = (libc::O_RDWR | libc::O_TMPFILE) as u64;
+        assert_eq!(openat_how(tmpfile, 0o600), (tmpfile, 0o600));
+        assert_eq!(openat_how(libc::O_DIRECTORY as u64, 0o600).1, 0);
+        assert_eq!(openat_how(creat | 0x4000_0000, 0o644), (creat, 0o644));
+        assert_eq!(openat_how(creat | (1 << 63), 0o644), (creat, 0o644));
+    }
 
     #[test]
     fn fifo_writer_probe_sees_a_writer_and_consumes_nothing() {
