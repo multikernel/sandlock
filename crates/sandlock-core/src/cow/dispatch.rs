@@ -33,7 +33,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::arch;
 use crate::cow::result::link_result;
-use crate::cow::seccomp::SeccompCowBranch;
+use crate::cow::seccomp::{branch_errno, SeccompCowBranch};
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{
     decode_open_args, read_child_mem, write_child_mem, write_child_mem_force, NotifAction,
@@ -248,11 +248,8 @@ pub(crate) async fn handle_cow_open(
 
         let plan = match cow.prepare_open(&path, flags) {
             Ok(plan) => plan,
-            Err(crate::error::BranchError::QuotaExceeded) => {
-                return NotifAction::Errno(libc::ENOSPC)
-            }
-            Err(crate::error::BranchError::Exists) => return NotifAction::Errno(libc::EEXIST),
-            Err(_) => return NotifAction::Continue,
+            Err(crate::error::BranchError::NotOwned) => return NotifAction::Continue,
+            Err(e) => return NotifAction::Errno(branch_errno(e)),
         };
         (plan, upper_root, workdir_root)
     };
@@ -292,12 +289,17 @@ pub(crate) async fn handle_cow_open(
                     upper
                 }
                 Ok(Err(_)) | Err(_) => {
-                    // Copy failed — roll back quota and let kernel handle it
+                    // Continuing would let the kernel open the lower file
+                    // itself, so a write would land outside the branch.
                     let mut st = cow_state.lock().await;
                     if let Some(cow) = st.branch.as_mut() {
                         cow.rollback_copy(file_size);
                     }
-                    return NotifAction::Continue;
+                    let errno = match copy_result {
+                        Ok(Err(e)) => e.raw_os_error().unwrap_or(libc::EIO),
+                        _ => libc::EIO,
+                    };
+                    return NotifAction::Errno(errno);
                 }
             }
         }
@@ -320,7 +322,8 @@ pub(crate) async fn handle_cow_open(
         create_mode,
     ) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Continue,
+        // The kernel cannot see the upper layer, so its answer would be wrong.
+        Err(errno) => return NotifAction::Errno(errno),
     };
 
     // Preserve O_CLOEXEC from the original openat flags.

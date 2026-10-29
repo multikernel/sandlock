@@ -32,7 +32,7 @@ fn parent_rel(rel: &str) -> Option<&str> {
 
 /// Errno for a branch failure, for handlers that answer the child directly
 /// (the `handle_unlink` convention) rather than returning a `BranchError`.
-fn branch_errno(e: BranchError) -> i32 {
+pub(super) fn branch_errno(e: BranchError) -> i32 {
     match e {
         BranchError::QuotaExceeded => libc::ENOSPC,
         BranchError::Denied => libc::EPERM,
@@ -41,6 +41,7 @@ fn branch_errno(e: BranchError) -> i32 {
         // A kernel object cannot be staged in the upper; EXDEV makes mv and
         // ln fall back to mknod plus unlink, which the branch virtualizes.
         BranchError::NotOwned => libc::EXDEV,
+        BranchError::Io { source, .. } => source.raw_os_error().unwrap_or(libc::EIO),
         BranchError::Operation(_) | BranchError::Conflict(_) => libc::EIO,
     }
 }
@@ -1185,18 +1186,31 @@ impl SeccompCowBranch {
                 self.check_quota(0)?;
                 return Ok(CowCopyPlan::Ready(upper_file));
             }
-            Err(e) => return Err(BranchError::Operation(format!("stat lower: {}", e))),
+            Err(e) => {
+                return Err(BranchError::Io {
+                    operation: "stat lower",
+                    source: std::io::Error::from_raw_os_error(e),
+                })
+            }
         };
         let kind = st.st_mode & libc::S_IFMT;
 
         // Symlink — copy verbatim (tiny, not worth deferring)
         if kind == libc::S_IFLNK {
             self.check_quota(256)?;
-            let target = crate::sys::fs::readlink_in_root(&self.workdir, rel_path)
-                .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
+            let target =
+                crate::sys::fs::readlink_in_root(&self.workdir, rel_path).map_err(|e| {
+                    BranchError::Io {
+                        operation: "readlink",
+                        source: std::io::Error::from_raw_os_error(e),
+                    }
+                })?;
             let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(target));
             crate::sys::fs::symlinkat_in_root(&self.upper, rel_path, &target.to_string_lossy())
-                .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
+                .map_err(|e| BranchError::Io {
+                    operation: "symlink",
+                    source: std::io::Error::from_raw_os_error(e),
+                })?;
             self.disk_used += 256;
             return Ok(CowCopyPlan::Ready(upper_file));
         }
@@ -1204,8 +1218,12 @@ impl SeccompCowBranch {
         // Directory — create immediately (no data copy)
         if kind == libc::S_IFDIR {
             self.check_quota(4096)?;
-            crate::sys::fs::mkdirp_in_root(&self.upper, rel_path, st.st_mode & 0o7777)
-                .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
+            crate::sys::fs::mkdirp_in_root(&self.upper, rel_path, st.st_mode & 0o7777).map_err(
+                |e| BranchError::Io {
+                    operation: "create dir",
+                    source: std::io::Error::from_raw_os_error(e),
+                },
+            )?;
             let _ = crate::sys::fs::chmod_in_root(&self.upper, rel_path, st.st_mode & 0o7777);
             self.disk_used += 4096;
             return Ok(CowCopyPlan::Ready(upper_file));
@@ -4501,6 +4519,22 @@ mod tests {
         // O_RDONLY
         let err = branch.handle_open(&path, 0).unwrap_err();
         assert!(matches!(err, BranchError::Deleted));
+    }
+
+    #[test]
+    fn test_prepare_open_preserves_path_errors() {
+        let (workdir, storage) = setup_workdir();
+        fs::write(workdir.path().join("file"), "original").unwrap();
+        std::os::unix::fs::symlink("loop", workdir.path().join("loop")).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        for (path, errno) in [("file/child", libc::ENOTDIR), ("loop/child", libc::ELOOP)] {
+            let path = workdir.path().join(path);
+            let err = branch
+                .prepare_open(path.to_str().unwrap(), libc::O_WRONLY as u64)
+                .unwrap_err();
+            assert_eq!(branch_errno(err), errno);
+        }
     }
 
     #[test]

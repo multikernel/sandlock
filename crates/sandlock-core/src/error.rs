@@ -115,6 +115,13 @@ pub enum BranchError {
     #[error("branch operation failed: {0}")]
     Operation(String),
 
+    #[error("branch operation failed: {operation}: {source}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("branch conflict: {0}")]
     Conflict(String),
 

@@ -316,6 +316,57 @@ async fn test_seccomp_cow_openat_ignores_mode_without_creat() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// An O_PATH open of an upper-only directory either gets a descriptor or, on
+/// kernels whose SECCOMP_IOCTL_NOTIF_ADDFD refuses O_PATH sources, an honest
+/// EOPNOTSUPP. It must never be the EACCES of a denial (issue #325).
+#[tokio::test]
+async fn test_seccomp_cow_o_path_open_of_created_dir() {
+    let workdir = temp_dir("seccomp-o-path");
+    let out_file = workdir.join("result.txt");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let script = format!(
+        concat!(
+            "import errno, os\n",
+            "os.mkdir('subdir')\n",
+            "try:\n",
+            "    os.close(os.open('subdir', os.O_PATH | os.O_DIRECTORY))\n",
+            "    res = 'ok'\n",
+            "except OSError as e:\n",
+            "    res = 'ok' if e.errno == errno.EOPNOTSUPP else f'errno={{e.errno}}'\n",
+            "open('{out}', 'w').write(res)\n",
+        ),
+        out = out_file.display()
+    );
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "stderr: {}",
+        result.stderr_str().unwrap_or("")
+    );
+    assert_eq!(fs::read_to_string(&out_file).unwrap(), "ok");
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 /// Test that chdir works for directories created inside COW.
 ///
 /// When a directory is created via COW (only exists in the upper layer),
