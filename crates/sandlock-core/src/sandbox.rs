@@ -631,6 +631,10 @@ impl BindPorts {
     }
 }
 
+fn default_registration() -> bool {
+    true
+}
+
 /// Sandbox configuration.
 #[derive(Serialize, Deserialize)]
 pub struct Sandbox {
@@ -816,6 +820,11 @@ pub struct Sandbox {
     #[serde(skip)]
     pub name: Option<String>,
 
+    /// Register this instance for discovery and control by name (default: true).
+    /// Disabled instances reserve no name. Applies at creation, not to live instances.
+    #[serde(skip, default = "default_registration")]
+    pub registration: bool,
+
     /// Operating-mode marker (e.g. "learn") served by the control socket
     /// and shown as STATUS by `sandlock ps`, so an operator sees
     /// why a sandbox exists (learn's read-everything observation run would
@@ -925,6 +934,7 @@ impl Clone for Sandbox {
             user: self.user,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
+            registration: self.registration,
             mode: self.mode.clone(),
             // init_fn (FnOnce) cannot be cloned — the clone gets None.
             // If the clone also needs an init function, set it explicitly.
@@ -2473,16 +2483,22 @@ impl Sandbox {
 
         // Claim before fork so a name collision leaves no child to reap.
         let sandbox_name = self.rt().name.clone();
-        let mut control_socket = match crate::control::bind_control_socket(&sandbox_name) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+        let bound = if self.registration {
+            Some(crate::control::bind_control_socket(&sandbox_name))
+        } else {
+            None
+        };
+        let mut control_socket = match bound {
+            None => None,
+            Some(Ok(s)) => Some(s),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(SandboxRuntimeError::Child(format!(
                     "sandbox '{}' is already running",
                     sandbox_name
                 ))
                 .into());
             }
-            Err(e)
+            Some(Err(e))
                 if matches!(
                     e.raw_os_error(),
                     Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
@@ -2498,7 +2514,7 @@ impl Sandbox {
                 );
                 None
             }
-            Err(e) => return Err(SandboxRuntimeError::Io(e).into()),
+            Some(Err(e)) => return Err(SandboxRuntimeError::Io(e).into()),
         };
         let child_publisher = control_socket
             .as_ref()
