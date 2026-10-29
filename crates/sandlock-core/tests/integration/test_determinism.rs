@@ -207,7 +207,7 @@ async fn test_deterministic_dirs() {
     );
 }
 
-/// Test that hostname virtualizes both uname() and /etc/hostname.
+/// Test that hostname virtualizes uname() and every file naming the host.
 #[tokio::test]
 async fn test_hostname_virtualization() {
     let policy = Sandbox::builder()
@@ -239,21 +239,22 @@ async fn test_hostname_virtualization() {
         stdout.trim()
     );
 
-    // Verify /etc/hostname also returns the virtual hostname.
-    let result = policy
-        .clone()
-        .with_name(&name)
-        .run(&["cat", "/etc/hostname"])
-        .await
-        .unwrap();
-    assert!(result.success(), "cat /etc/hostname failed");
-    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(
-        stdout.trim(),
-        name,
-        "Expected /etc/hostname {name:?}, got: {:?}",
-        stdout.trim()
-    );
+    for file in ["/etc/hostname", "/proc/sys/kernel/hostname"] {
+        let result = policy
+            .clone()
+            .with_name(&name)
+            .run(&["cat", file])
+            .await
+            .unwrap();
+        assert!(result.success(), "cat {file} failed");
+        let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+        assert_eq!(
+            stdout.trim(),
+            name,
+            "Expected {file} {name:?}, got: {:?}",
+            stdout.trim()
+        );
+    }
 }
 
 /// The /etc/hostname shim used to do a literal `path == "/etc/hostname"`

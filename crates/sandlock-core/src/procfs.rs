@@ -171,7 +171,9 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
         "/proc/self/mountinfo" => VirtualFile::MountInfo,
         "/proc/self/mountstats" => VirtualFile::MountStats,
         "/proc/self/cgroup" => VirtualFile::Cgroup,
-        "/etc/hostname" if policy.virtual_hostname.is_some() => VirtualFile::Hostname,
+        "/etc/hostname" | "/proc/sys/kernel/hostname" if policy.virtual_hostname.is_some() => {
+            VirtualFile::Hostname
+        }
         "/etc/hosts" if !policy.virtual_etc_hosts.is_empty() => VirtualFile::EtcHosts,
         _ => return None,
     })
