@@ -30,16 +30,19 @@ async fn test_num_cpus_virtualization() {
         stdout.trim()
     );
 
-    // Verify nproc (sched_getaffinity) also reports 2.
-    let result = policy.clone().run(&["nproc"]).await.unwrap();
-    assert!(result.success(), "nproc should succeed");
-    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(
-        stdout.trim(),
-        "2",
-        "nproc should report 2 CPUs, got: {:?}",
-        stdout.trim()
-    );
+    // nproc reads the affinity mask, getconf the sysfs CPU lists.
+    for cmd in [
+        "nproc",
+        "getconf _NPROCESSORS_ONLN",
+        "getconf _NPROCESSORS_CONF",
+        "cat /sys/devices/system/cpu/present",
+    ] {
+        let result = policy.clone().run(&["sh", "-c", cmd]).await.unwrap();
+        assert!(result.success(), "{cmd} should succeed");
+        let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+        let want = if cmd.starts_with("cat") { "0-1" } else { "2" };
+        assert_eq!(stdout.trim(), want, "{cmd} should report 2 CPUs");
+    }
 }
 
 /// Test that max_memory virtualizes /proc/meminfo.
