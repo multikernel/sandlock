@@ -266,6 +266,56 @@ async fn test_seccomp_cow_open_directory() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// An openat whose mode register is set without O_CREAT must still reach a
+/// directory that exists only in the upper layer (issue #325). openat ignores
+/// that mode; the openat2 serving the request rejected it.
+#[tokio::test]
+async fn test_seccomp_cow_openat_ignores_mode_without_creat() {
+    let workdir = temp_dir("seccomp-openat-mode");
+    let out_file = workdir.join("result.txt");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let script = format!(
+        concat!(
+            "import ctypes, os, platform\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "nr = 257 if platform.machine() == 'x86_64' else 56\n",
+            "os.mkdir('subdir')\n",
+            "fd = libc.syscall(nr, -100, b'subdir', os.O_RDONLY | os.O_DIRECTORY, 0o755)\n",
+            "err = ctypes.get_errno()\n",
+            "open('{out}', 'w').write('ok' if fd >= 0 else f'errno={{err}}')\n",
+        ),
+        out = out_file.display()
+    );
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "stderr: {}",
+        result.stderr_str().unwrap_or("")
+    );
+    assert_eq!(fs::read_to_string(&out_file).unwrap(), "ok");
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 /// Test that chdir works for directories created inside COW.
 ///
 /// When a directory is created via COW (only exists in the upper layer),
