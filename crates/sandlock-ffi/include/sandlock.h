@@ -749,6 +749,16 @@ sandlock_builder_t *sandlock_sandbox_builder_extra_allow_syscalls(sandlock_build
 int64_t sandlock_syscall_nr(const char *name);
 
 /**
+ * Set this instance's registration for discovery and control by name.
+ * Defaults to true; false skips the name claim and control socket.
+ * This setting is not serialized as policy.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer or NULL.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_registration(sandlock_builder_t *b, bool enabled);
+
+/**
  * # Safety
  * `b` must be a valid builder pointer.
  */

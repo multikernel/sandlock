@@ -836,6 +836,24 @@ pub unsafe extern "C" fn sandlock_syscall_nr(name: *const c_char) -> i64 {
     }
 }
 
+/// Set this instance's registration for discovery and control by name.
+/// Defaults to true; false skips the name claim and control socket.
+/// This setting is not serialized as policy.
+///
+/// # Safety
+/// `b` must be a valid builder pointer or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_registration(
+    b: *mut SandboxBuilder,
+    enabled: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.registration(enabled)))
+}
+
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]

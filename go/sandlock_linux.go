@@ -239,6 +239,7 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	}
 
 	b := C.sandlock_sandbox_builder_new()
+	b = C.sandlock_sandbox_builder_registration(b, cbool(!s.DisableRegistration))
 
 	// str calls a one-string builder setter, freeing the C string afterward.
 	str := func(fn func(*C.sandlock_builder_t, *C.char) *C.sandlock_builder_t, val string) {

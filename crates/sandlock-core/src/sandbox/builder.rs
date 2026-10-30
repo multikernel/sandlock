@@ -235,6 +235,9 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub name: Option<String>,
 
+    #[cfg_attr(feature = "cli", clap(skip = true))]
+    pub registration: bool,
+
     // Operating-mode marker (e.g. "learn") shown as STATUS by `sandlock ps`:
     // gives operators context for otherwise alarming sandboxes like learn's
     // read-everything observation run.
@@ -320,6 +323,7 @@ impl Default for SandboxBuilder {
             protection_policy: ProtectionPolicy::default(),
             policy_fn: None,
             name: None,
+            registration: true,
             mode: None,
             init_fn: None,
             work_fn: None,
@@ -385,6 +389,7 @@ impl Clone for SandboxBuilder {
             protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
+            registration: self.registration,
             mode: self.mode.clone(),
             // init_fn (FnOnce) cannot be cloned; drop to None.
             init_fn: None,
@@ -869,6 +874,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Enable registration for discovery and control by name (default: true).
+    /// Disabled instances do not reserve their names. Not serialized as policy.
+    pub fn registration(mut self, enabled: bool) -> Self {
+        self.registration = enabled;
+        self
+    }
+
     /// Set the operating-mode marker shown as STATUS in `sandlock ps`
     /// output (e.g. `"learn"`).
     pub fn mode(mut self, mode: impl Into<String>) -> Self {
@@ -1272,6 +1284,7 @@ impl SandboxBuilder {
             user: self.user,
             policy_fn,
             name: self.name,
+            registration: self.registration,
             mode: self.mode,
             cow_upper: None,
             init_fn: self.init_fn,

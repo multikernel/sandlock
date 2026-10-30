@@ -321,6 +321,10 @@ type Sandbox struct {
 	// Empty auto-generates "sandbox-{pid}".
 	Name string
 
+	// DisableRegistration skips this instance's name claim and control socket.
+	// Set before spawning; existing processes and other sandboxes are unaffected.
+	DisableRegistration bool `json:"-"`
+
 	// PolicyFn receives dynamic syscall events and may return an allow/deny
 	// decision or modify live policy through the supplied context.
 	PolicyFn *PolicyFn

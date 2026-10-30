@@ -141,6 +141,7 @@ _b_max_open_files = _builder_fn("sandlock_sandbox_builder_max_open_files", ctype
 _b_no_randomize_memory = _builder_fn("sandlock_sandbox_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_sandbox_builder_no_huge_pages", ctypes.c_bool)
 _b_no_coredump = _builder_fn("sandlock_sandbox_builder_no_coredump", ctypes.c_bool)
+_b_registration = _builder_fn("sandlock_sandbox_builder_registration", ctypes.c_bool)
 _b_deterministic_dirs = _builder_fn("sandlock_sandbox_builder_deterministic_dirs", ctypes.c_bool)
 _b_cpu_cores = _builder_fn("sandlock_sandbox_builder_cpu_cores", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 
@@ -1310,7 +1311,7 @@ class _NativePolicy:
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
-        "port_remap",
+        "port_remap", "registration",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
@@ -1328,6 +1329,7 @@ class _NativePolicy:
     def _build_from_policy(policy: PolicyDataclass):
         """Build a native builder from a Python Sandbox dataclass. Returns builder pointer."""
         b = _lib.sandlock_sandbox_builder_new()
+        b = _b_registration(b, policy.registration)
 
         for p in (policy.fs_readable or []):
             if str(p) == "/lib64" and not os.path.exists("/lib64"):

@@ -307,6 +307,16 @@ configuration that needs a supervisor or a fresh child (seccomp, network,
 resource limits, environment, ...) is rejected rather than silently ignored.
 This is something the `sandlock` CLI cannot do.
 
+### Sandbox registration
+
+Registration is enabled by default. Set `DisableRegistration: true` on a
+`Sandbox` to skip its name claim and control socket. That sandbox will not
+appear in `sandlock ps` or accept `sandlock kill` by name, and its name will
+not be reserved. Its virtual hostname and direct process lifecycle methods
+still work. Other sandboxes in the same process are unaffected. Set the
+option before starting a new process; it does not change a running process
+and is not part of serialized policy.
+
 ### Platform
 
 ```go

@@ -294,7 +294,7 @@ class Sandbox:
     Most config fields are optional — unset fields mean "no restriction".
     Sandlock's default syscall blocklist is always applied.
 
-    Runtime kwargs (``name``, ``image``, ``policy_fn``, ``init_fn``,
+    Runtime kwargs (``name``, ``registration``, ``image``, ``policy_fn``, ``init_fn``,
     ``work_fn``) have ``metadata={"runtime": True}`` so serializers can skip
     them.
     """
@@ -569,6 +569,11 @@ class Sandbox:
     name: str | None = field(default=None, repr=False, metadata={"runtime": True})
     """Sandbox name (also exposed as the virtual hostname inside the sandbox).
     Auto-generated as ``sandbox-{pid}-{counter}`` when omitted."""
+
+    registration: bool = field(default=True, metadata={"runtime": True})
+    """Register this instance for discovery and control by name. False skips
+    its name claim and control socket. Set before creation; running instances
+    and other sandboxes are unaffected."""
 
     policy_fn: PolicyFn | None = field(default=None, repr=False, metadata={"runtime": True})
     """Optional callback for dynamic per-event policy decisions."""
