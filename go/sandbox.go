@@ -307,6 +307,11 @@ type Sandbox struct {
 	CleanEnv bool              // start from a minimal environment
 	Env      map[string]string // variables to set/override in the child
 
+	// Kernel identity reported by uname() and the /proc files that repeat
+	// it, keyed by utsname field: release, version, sysname, machine,
+	// domainname. Unset fields show the host's values.
+	Uname map[string]string
+
 	// Misc.
 	UID        *int // map to this UID inside a user namespace; nil = unset
 	GID        *int // map to this GID inside the user namespace; must be set together with UID

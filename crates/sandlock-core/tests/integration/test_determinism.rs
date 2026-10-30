@@ -207,7 +207,7 @@ async fn test_deterministic_dirs() {
     );
 }
 
-/// Test that hostname virtualizes both uname() and /etc/hostname.
+/// Test that hostname virtualizes uname() and every file naming the host.
 #[tokio::test]
 async fn test_hostname_virtualization() {
     let policy = Sandbox::builder()
@@ -239,21 +239,61 @@ async fn test_hostname_virtualization() {
         stdout.trim()
     );
 
-    // Verify /etc/hostname also returns the virtual hostname.
+    for file in ["/etc/hostname", "/proc/sys/kernel/hostname"] {
+        let result = policy
+            .clone()
+            .with_name(&name)
+            .run(&["cat", file])
+            .await
+            .unwrap();
+        assert!(result.success(), "cat {file} failed");
+        let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+        assert_eq!(
+            stdout.trim(),
+            name,
+            "Expected {file} {name:?}, got: {:?}",
+            stdout.trim()
+        );
+    }
+}
+
+/// A uname override must agree across uname() and every procfs file that
+/// repeats the same field.
+#[tokio::test]
+async fn test_uname_override() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .uname("release", "8.0.0-sandlock")
+        .uname("version", "#1 SMP fake")
+        .uname("machine", "riscv64")
+        .build()
+        .unwrap();
+    let script = "uname -r; uname -v; uname -m; \
+                  cat /proc/sys/kernel/osrelease /proc/sys/kernel/version \
+                  /proc/sys/kernel/arch /proc/version";
     let result = policy
-        .clone()
-        .with_name(&name)
-        .run(&["cat", "/etc/hostname"])
+        .with_name(&format!("uname-{}", std::process::id()))
+        .run(&["sh", "-c", script])
         .await
         .unwrap();
-    assert!(result.success(), "cat /etc/hostname failed");
+    assert!(result.success(), "uname probe failed: {result:?}");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
-        stdout.trim(),
-        name,
-        "Expected /etc/hostname {name:?}, got: {:?}",
-        stdout.trim()
+        lines[..6],
+        [
+            "8.0.0-sandlock",
+            "#1 SMP fake",
+            "riscv64",
+            "8.0.0-sandlock",
+            "#1 SMP fake",
+            "riscv64"
+        ]
     );
+    assert_eq!(lines[6], "Linux version 8.0.0-sandlock #1 SMP fake");
 }
 
 /// The /etc/hostname shim used to do a literal `path == "/etc/hostname"`

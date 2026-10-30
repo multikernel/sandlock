@@ -134,6 +134,7 @@ _b_user = _builder_fn("sandlock_sandbox_builder_user", ctypes.c_uint32, ctypes.c
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_sandbox_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
+_b_uname = _builder_fn("sandlock_sandbox_builder_uname", ctypes.c_char_p, ctypes.c_char_p)
 _b_time_start = _builder_fn("sandlock_sandbox_builder_time_start", ctypes.c_char_p)
 _b_extra_deny_syscalls = _builder_fn("sandlock_sandbox_builder_extra_deny_syscalls", ctypes.c_char_p)
 _b_extra_allow_syscalls = _builder_fn("sandlock_sandbox_builder_extra_allow_syscalls", ctypes.c_char_p)
@@ -1314,7 +1315,7 @@ class _NativePolicy:
         "port_remap", "registration",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "uid",
-        "random_seed", "time_start", "clean_env", "env",
+        "random_seed", "time_start", "clean_env", "env", "uname",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
         # Landlock protection opt-out (see Protection IntEnum):
@@ -1436,6 +1437,8 @@ class _NativePolicy:
             b = _b_clean_env(b, True)
         for k, v in (policy.env or {}).items():
             b = _b_env_var(b, _encode(k), _encode(v))
+        for field, value in policy.uname.items():
+            b = _b_uname(b, _encode(field), _encode(value))
 
         if policy.extra_deny_syscalls:
             b = _b_extra_deny_syscalls(b, _encode(",".join(policy.extra_deny_syscalls or [])))

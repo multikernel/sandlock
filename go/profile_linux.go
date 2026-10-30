@@ -62,6 +62,7 @@ type resolvedProfile struct {
 	GPUDevices         []uint32          `json:"gpu_devices"`
 	CPUCores           []uint32          `json:"cpu_cores"`
 	NumCPUs            uint32            `json:"num_cpus"`
+	Uname              map[string]string `json:"uname"`
 }
 
 // ParseProfile builds a Sandbox from profile TOML using sandlock's own
@@ -116,7 +117,7 @@ func ParseProfile(toml string) (*Sandbox, error) {
 		RandomSeed: r.RandomSeed, TimeStart: r.TimeStart,
 		NoRandomizeMemory: r.NoRandomizeMemory, NoHugePages: r.NoHugePages,
 		DeterministicDirs: r.DeterministicDirs,
-		CleanEnv:          r.CleanEnv, Env: r.Env,
+		CleanEnv:          r.CleanEnv, Env: r.Env, Uname: r.Uname,
 		UID: r.UID, GID: r.GID, NoCoredump: r.NoCoredump,
 		FSStorage: r.FSStorage, OnExit: onExit, OnError: onError,
 	}, nil

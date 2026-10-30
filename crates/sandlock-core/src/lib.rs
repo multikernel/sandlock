@@ -65,7 +65,7 @@ pub use policy_fn::PolicyFn;
 pub use protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 pub use result::{renames, Change, ChangeKind, Entry, EntryKind, ExitStatus, RunResult};
 pub use sandbox::{
-    BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
+    BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode, Uname,
 };
 pub use sys::structs::{SeccompData, SeccompNotif};
 #[cfg(feature = "cow")]

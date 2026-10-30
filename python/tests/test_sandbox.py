@@ -1308,3 +1308,16 @@ class TestDiskQuota:
             ["sh", "-c", f"echo x >> {workdir}/big.bin"]
         )
         assert not result.success
+
+
+class TestUname:
+    def test_override_agrees_across_channels(self):
+        result = _policy(uname={"release": "8.0.0", "machine": "riscv64"}).run(
+            ["sh", "-c", "uname -r; uname -m; cat /proc/sys/kernel/osrelease"]
+        )
+        assert result.success, result.error
+        assert result.stdout.decode().split() == ["8.0.0", "riscv64", "8.0.0"]
+
+    def test_unknown_field_is_rejected(self):
+        with pytest.raises(RuntimeError, match="unknown uname field"):
+            _policy(uname={"kernel": "8.0.0"}).run(["true"])

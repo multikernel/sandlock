@@ -438,6 +438,12 @@ class Sandbox:
     (renumbered 0..N-1).  Also virtualizes /proc/meminfo when
     max_memory is set.  Requires seccomp user notification (automatic)."""
 
+    uname: Mapping[str, str] = field(default_factory=dict)
+    """Kernel identity reported in place of the host's, keyed by
+    ``struct utsname`` field: ``release``, ``version``, ``sysname``,
+    ``machine``, ``domainname``.  Also answers the /proc/sys/kernel files
+    and /proc/version that repeat them, e.g. ``{"release": "8.0.0"}``."""
+
     port_remap: bool = False
     """Enable transparent TCP port virtualization.  Each sandbox gets a
     full virtual port space — bind(3000) is silently remapped to a unique

@@ -111,6 +111,11 @@ struct RunArgs {
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env_vars: Vec<String>,
 
+    /// Report VALUE as a uname field: release, version, sysname, machine or
+    /// domainname (e.g. --uname release=8.0.0). Repeatable.
+    #[arg(long = "uname", value_name = "FIELD=VALUE")]
+    uname: Vec<String>,
+
     /// CPU cores to pin the sandbox to (e.g. --cpu-cores 0,2,3)
     #[arg(long = "cpu-cores", value_delimiter = ',')]
     cpu_cores: Vec<u32>,
@@ -612,6 +617,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         if let Some(n) = base.num_cpus {
             b = b.num_cpus(n);
         }
+        b.uname = base.uname.clone();
         if let Some(n) = base.max_open_files {
             b = b.max_open_files(n);
         }
@@ -815,6 +821,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     }
     if !args.cpu_cores.is_empty() {
         builder = builder.cpu_cores(args.cpu_cores.clone());
+    }
+    for spec in &args.uname {
+        builder = builder.uname_spec(spec);
     }
     match &args.gpu {
         // `all` maps to an empty device list, which the core expands to every
@@ -1085,6 +1094,9 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if !args.cpu_cores.is_empty() {
         bad.push("--cpu-cores");
     }
+    if !args.uname.is_empty() {
+        bad.push("--uname");
+    }
     if args.gpu.is_some() {
         bad.push("--gpu");
     }
@@ -1189,6 +1201,9 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     }
     if profile.num_cpus.is_some() {
         bad.push("[limits].num_cpus");
+    }
+    if !profile.uname.is_empty() {
+        bad.push("[uname]");
     }
     if profile.random_seed.is_some() {
         bad.push("[determinism].random_seed");

@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 // rules inside `net_allow`, which v3 would misread as explicit rules
 // (e.g. deny-only+HTTP loading as combined), so v2 is rejected outright
 // with no compatibility fallback (pre-1.0 policy).
-const IMAGE_VERSION: u32 = 3;
+// v4 adds Sandbox.uname to the positional bincode policy. Reject v3
+// rather than decoding its remaining fields as uname values.
+const IMAGE_VERSION: u32 = 4;
 
 fn io_err(e: impl std::fmt::Display) -> SandlockError {
     SandlockError::Runtime(SandboxRuntimeError::Child(e.to_string()))
@@ -373,6 +375,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_rejects_pre_uname_policy_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meta.json"),
+            br#"{"name":"x","cow_snapshot":null,"version":3}"#,
+        )
+        .unwrap();
+        let msg = Checkpoint::load(dir.path()).unwrap_err().to_string();
+        assert!(
+            msg.contains("unsupported checkpoint image version 3"),
+            "expected rejection before reading policy.dat, got: {msg}"
+        );
+    }
+
     fn round_trip_policy(policy: Sandbox) -> Sandbox {
         let dir = std::env::temp_dir().join(format!(
             "sandlock-mode-{}-{}",
@@ -397,6 +414,19 @@ mod tests {
         let loaded = Checkpoint::load(&dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         loaded.policy
+    }
+
+    #[test]
+    fn image_round_trip_preserves_uname() {
+        let policy = Sandbox::builder()
+            .uname("release", "8.0.0")
+            .uname("machine", "riscv64")
+            .build()
+            .unwrap();
+        let loaded = round_trip_policy(policy);
+        assert_eq!(loaded.uname.release.as_deref(), Some("8.0.0"));
+        assert_eq!(loaded.uname.machine.as_deref(), Some("riscv64"));
+        assert_eq!(loaded.uname.sysname, None);
     }
 
     #[test]

@@ -239,6 +239,71 @@ impl std::str::FromStr for RunAs {
     }
 }
 
+/// Kernel identity the sandbox sees in `uname()` and the procfs files that
+/// repeat it. A field left `None` shows the host's value; `nodename` is
+/// always the sandbox name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Uname {
+    pub sysname: Option<String>,
+    pub release: Option<String>,
+    pub version: Option<String>,
+    pub machine: Option<String>,
+    pub domainname: Option<String>,
+}
+
+impl Uname {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Set the field named as in `struct utsname`.
+    pub fn set(&mut self, field: &str, value: &str) -> Result<(), String> {
+        let slot = match field {
+            "sysname" => &mut self.sysname,
+            "release" => &mut self.release,
+            "version" => &mut self.version,
+            "machine" => &mut self.machine,
+            "domainname" => &mut self.domainname,
+            "nodename" => return Err("uname nodename is the sandbox name; set the name".into()),
+            _ => return Err(format!("unknown uname field {field:?}")),
+        };
+        *slot = Some(value.to_string());
+        self.validate()
+    }
+
+    /// Set a field from `FIELD=VALUE`.
+    pub fn set_spec(&mut self, spec: &str) -> Result<(), String> {
+        let (field, value) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("expected FIELD=VALUE, got {spec:?}"))?;
+        self.set(field, value)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in self.fields() {
+            let Some(value) = value else { continue };
+            // Each utsname field is a NUL-terminated char[65].
+            if value.len() > 64 || value.contains('\0') {
+                return Err(format!(
+                    "uname {field} must be at most 64 bytes without NUL, got {value:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fields(&self) -> [(&'static str, &Option<String>); 5] {
+        [
+            ("sysname", &self.sysname),
+            ("release", &self.release),
+            ("version", &self.version),
+            ("machine", &self.machine),
+            ("domainname", &self.domainname),
+        ]
+    }
+}
+
 /// Confinement for confining the current process in place.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confinement {
@@ -395,6 +460,9 @@ impl TryFrom<&Sandbox> for Confinement {
         }
         if sandbox.num_cpus.is_some() {
             unsupported.push("num_cpus");
+        }
+        if !sandbox.uname.is_empty() {
+            unsupported.push("uname");
         }
         if sandbox.port_remap {
             unsupported.push("port_remap");
@@ -800,6 +868,9 @@ pub struct Sandbox {
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
 
+    #[serde(default)]
+    pub uname: Uname,
+
     /// Skip the seccomp user-notification supervisor. The sandbox runs
     /// with Landlock + a kernel-only deny filter, with none of the
     /// supervisor-mediated features (IP allowlist, resource limits,
@@ -930,6 +1001,7 @@ impl Clone for Sandbox {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            uname: self.uname.clone(),
             no_supervisor: self.no_supervisor,
             user: self.user,
             policy_fn: self.policy_fn.clone(),
@@ -2724,6 +2796,7 @@ impl Sandbox {
                 chroot_mount_ro: self.fs_mount_ro.clone(),
                 deterministic_dirs: self.deterministic_dirs,
                 virtual_hostname: Some(rt_name),
+                uname: self.uname.clone(),
                 has_http_acl: resolved.features.http_acl,
                 virtual_etc_hosts,
                 ca_inject_paths: self.http_inject_ca.clone(),
