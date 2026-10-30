@@ -1140,6 +1140,88 @@ async fn test_empty_net_allow_denies_tcp_despite_fs_grants() {
     );
 }
 
+/// Regression for #314: relative connect targets resolve against the child's
+/// current cwd, not the supervisor's.
+#[tokio::test]
+async fn test_relative_unix_connect_delivers_after_chdir() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(dir.path().join("svc.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let script = format!(
+        concat!(
+            "import os, socket\n",
+            "os.chdir({cwd:?})\n",
+            "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:\n",
+            "    s.connect('./svc.sock')\n",
+            "    s.sendall(b'relative-stream')\n",
+        ),
+        cwd = dir.path().to_str().unwrap(),
+    );
+    let mut policy = Sandbox::builder()
+        // Allow the host Python runtime, including installations outside /usr.
+        .fs_read("/")
+        .fs_write(dir.path().to_str().unwrap())
+        .build()
+        .unwrap();
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    // The small payload is already queued; no background accept thread needed.
+    let (mut conn, _) = listener
+        .accept()
+        .expect("relative connect must reach listener");
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut payload = [0; 15];
+    conn.read_exact(&mut payload).unwrap();
+    assert_eq!(&payload, b"relative-stream");
+}
+
+/// Regression for #314: relative sendto targets also use the child's cwd and
+/// must deliver through the named AF_UNIX on-behalf path.
+#[tokio::test]
+async fn test_relative_unix_sendto_delivers_after_chdir() {
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let listener = UnixDatagram::bind(dir.path().join("svc.dgram")).unwrap();
+    listener
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let script = format!(
+        concat!(
+            "import os, socket\n",
+            "os.chdir({cwd:?})\n",
+            "with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:\n",
+            "    s.sendto(b'relative-datagram', './svc.dgram')\n",
+        ),
+        cwd = dir.path().to_str().unwrap(),
+    );
+    let mut policy = Sandbox::builder()
+        .fs_read("/")
+        .fs_write(dir.path().to_str().unwrap())
+        .build()
+        .unwrap();
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let mut payload = [0; 64];
+    let len = listener.recv(&mut payload).unwrap();
+    assert_eq!(&payload[..len], b"relative-datagram");
+}
+
 /// Regression: a `sendmsg()` on a *connected* `AF_UNIX` stream socket must pass
 /// through when a `net_allow` destination policy is active. The IP destination
 /// policy governs IP sockets only; a bug routed every connected send through

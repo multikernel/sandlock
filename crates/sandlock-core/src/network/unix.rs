@@ -20,25 +20,17 @@ use super::materialize::{
 use super::send_engine::{prepare_batch, prepare_send, wants_blocking};
 use super::verdict::{path_under_any, real_path_under_any};
 
-/// Render the supervisor-side path that addresses `sun_path` **in the child's
-/// root view**, i.e. `/proc/<pid>/root` + the child's absolute `sun_path`.
+/// Address `sun_path` in child's context. Absolute paths use `/proc/<tid>/root`,
+/// relative paths use `/proc/<tid>/cwd`.
 /// Pure: builds a string, touches nothing. Single source of truth for the
 /// resolution context, so a change to it is visible in one unit test rather
 /// than only in a live sandbox.
-///
-/// Returns `None` for a relative `sun_path`, which is refused instead of
-/// resolved: the supervisor cannot reproduce the child's cwd, so resolving one
-/// here would silently address a different socket — whichever one sits at that
-/// name under the *supervisor's* cwd. Concatenating a relative input onto the
-/// prefix would also produce a path that merely happens to be bogus today
-/// (`/proc/42/rootsvc.dgram`); the explicit check makes the fail-closed
-/// property intentional rather than incidental, and keeps it under a refactor
-/// to `Path::join`, which would silently drop the prefix.
-fn child_root_path(child_pid: u32, sun_path: &std::path::Path) -> Option<String> {
-    if !sun_path.is_absolute() {
-        return None;
+fn child_lookup_path(child_pid: u32, sun_path: &std::path::Path) -> String {
+    if sun_path.is_absolute() {
+        format!("/proc/{}/root{}", child_pid, sun_path.display())
+    } else {
+        format!("/proc/{}/cwd/{}", child_pid, sun_path.display())
     }
-    Some(format!("/proc/{}/root{}", child_pid, sun_path.display()))
 }
 
 /// Pin the inode a named unix socket `sun_path` resolves to **in the child's
@@ -46,18 +38,11 @@ fn child_root_path(child_pid: u32, sun_path: &std::path::Path) -> Option<String>
 /// than the supervisor's. Returns an `O_PATH` fd to that exact inode; callers
 /// address it through `/proc/self/fd` so the resolved inode is the one acted on,
 /// immune to a path swap after the check (TOCTOU- and symlink-safe).
-///
-/// A `sun_path` [`child_root_path`] refuses gets `ECONNREFUSED`, which matches
-/// the errno an unreachable target already returns, so no caller observes a new
-/// failure mode.
 fn pin_child_unix_target(
     child_pid: u32,
     sun_path: &std::path::Path,
 ) -> Result<OwnedFd, NotifAction> {
-    let proc_path = match child_root_path(child_pid, sun_path) {
-        Some(p) => p,
-        None => return Err(NotifAction::Errno(ECONNREFUSED)),
-    };
+    let proc_path = child_lookup_path(child_pid, sun_path);
     // `O_PATH` follows symlinks to the real socket inode and pins it without
     // performing any I/O on the socket.
     let c_proc = std::ffi::CString::new(proc_path).map_err(|_| NotifAction::Errno(libc::EACCES))?;
@@ -453,25 +438,18 @@ mod tests {
     #[test]
     fn child_root_path_resolves_in_the_childs_root_view() {
         assert_eq!(
-            child_root_path(4242, std::path::Path::new("/run/svc.dgram")).as_deref(),
-            Some("/proc/4242/root/run/svc.dgram")
+            child_lookup_path(4242, std::path::Path::new("/run/svc.dgram")),
+            "/proc/4242/root/run/svc.dgram"
         );
     }
 
-    /// A relative `sun_path` must be refused outright, never resolved: the
-    /// supervisor's cwd is not the child's, so resolving it would address
-    /// whatever socket happens to sit at that name next to the supervisor.
-    /// Asserted on the builder rather than on `pin_child_unix_target`, whose
-    /// `ECONNREFUSED` is indistinguishable from "target missing" — dropping the
-    /// guard there still yields `ECONNREFUSED` because the concatenation
-    /// (`/proc/<pid>/rootsvc.dgram`) fails to open anyway, so such a test would
-    /// pass with the guard deleted.
+    /// Relative paths are resolved into childs working directory through
+    /// `/proc/<pid>/cwd`.
     #[test]
-    fn child_root_path_refuses_relative_sun_path() {
+    fn child_root_path_resolves_in_the_childs_working_dir_when_relative() {
         assert_eq!(
-            child_root_path(4242, std::path::Path::new("svc.dgram")),
-            None,
-            "a relative sun_path must be refused, not concatenated"
+            child_lookup_path(4242, std::path::Path::new("svc.dgram")),
+            "/proc/4242/cwd/svc.dgram",
         );
     }
 
