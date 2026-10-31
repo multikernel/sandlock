@@ -2127,9 +2127,13 @@ mod tests {
                 read_filtered_dirents(fd.as_raw_fd(), nr, 32, |name| name == "visible").unwrap();
             let start = if nr == libc::SYS_getdents64 { 19 } else { 18 };
             assert_eq!(&data[start..start + 8], b"visible\0");
-            assert!(read_filtered_dirents(fd.as_raw_fd(), nr, 32, |_| true)
-                .unwrap()
-                .is_empty());
+            // The dots may come before or after "visible", so only the kept
+            // entry's absence is order independent.
+            assert!(
+                read_filtered_dirents(fd.as_raw_fd(), nr, 32, |name| name == "visible")
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
