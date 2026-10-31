@@ -2646,3 +2646,110 @@ async fn test_chroot_shebang_loop_is_eloop() {
     );
     cleanup_rootfs(&rootfs);
 }
+
+/// Run `rootfs-helper unix-send` inside a chroot granting write on virtual
+/// `/tmp`, returning the child's result.
+async fn chroot_unix_send(
+    rootfs: &PathBuf,
+    kind: &str,
+    dir: &str,
+    path: &str,
+    payload: &str,
+) -> sandlock_core::RunResult {
+    minimal_exec_policy(rootfs)
+        .fs_write("/tmp")
+        .build()
+        .unwrap()
+        .run(&["rootfs-helper", "unix-send", kind, dir, path, payload])
+        .await
+        .unwrap()
+}
+
+/// Named unix sockets are virtual paths in chroot mode: an absolute target
+/// reaches the socket inside the rootfs, and a relative one resolves against
+/// the child's virtual cwd.
+#[tokio::test]
+async fn test_chroot_unix_connect_resolves_in_root_and_cwd() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    let rootfs = build_test_rootfs("unix-connect");
+    let listener = UnixListener::bind(rootfs.join("tmp/svc.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    for (dir, path) in [
+        ("/", "/tmp/svc.sock"),
+        ("/tmp", "svc.sock"),
+        ("/tmp", "./svc.sock"),
+    ] {
+        let r = chroot_unix_send(&rootfs, "stream", dir, path, "hello").await;
+        assert!(
+            r.success(),
+            "connect {path} from {dir}: {}",
+            r.stderr_str().unwrap_or("")
+        );
+        let (mut conn, _) = listener
+            .accept()
+            .expect("connect must reach the rootfs socket");
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A relative datagram target resolves against the virtual cwd too.
+#[tokio::test]
+async fn test_chroot_unix_sendto_relative_after_chdir() {
+    use std::os::unix::net::UnixDatagram;
+
+    let rootfs = build_test_rootfs("unix-sendto");
+    let listener = UnixDatagram::bind(rootfs.join("tmp/svc.dgram")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let r = chroot_unix_send(&rootfs, "dgram", "/tmp", "svc.dgram", "datagram").await;
+    assert!(r.success(), "sendto: {}", r.stderr_str().unwrap_or(""));
+    let mut buf = [0u8; 16];
+    let n = listener
+        .recv(&mut buf)
+        .expect("datagram must reach the rootfs socket");
+    assert_eq!(&buf[..n], b"datagram");
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The grant is checked on the virtual path the relative target resolves to:
+/// `tmp/svc.sock` from cwd `/etc` is `/etc/tmp/svc.sock`, outside the `/tmp`
+/// write grant, and must not be mistaken for `/tmp/svc.sock`.
+#[tokio::test]
+async fn test_chroot_unix_connect_relative_outside_grant_denied() {
+    use std::os::unix::net::UnixListener;
+
+    let rootfs = build_test_rootfs("unix-deny");
+    fs::create_dir_all(rootfs.join("etc/tmp")).unwrap();
+    let outside = UnixListener::bind(rootfs.join("etc/tmp/svc.sock")).unwrap();
+    outside.set_nonblocking(true).unwrap();
+    let _granted = UnixListener::bind(rootfs.join("tmp/svc.sock")).unwrap();
+
+    let r = chroot_unix_send(&rootfs, "stream", "/etc", "tmp/svc.sock", "hello").await;
+    assert!(!r.success(), "connect outside the write grant must fail");
+    assert!(
+        outside.accept().is_err(),
+        "the ungranted socket must not be reached"
+    );
+
+    // A symlink inside the grant is judged by the socket it reaches.
+    std::os::unix::fs::symlink("/etc/tmp/svc.sock", rootfs.join("tmp/link.sock")).unwrap();
+    let r = chroot_unix_send(&rootfs, "stream", "/tmp", "link.sock", "hello").await;
+    assert!(
+        !r.success(),
+        "a symlink out of the write grant must be denied"
+    );
+    assert!(
+        outside.accept().is_err(),
+        "the ungranted socket must not be reached"
+    );
+
+    cleanup_rootfs(&rootfs);
+}
