@@ -18,7 +18,7 @@ use super::materialize::{
     MaterializedMsg,
 };
 use super::send_engine::{prepare_batch, prepare_send, wants_blocking};
-use super::verdict::{path_under_any, real_path_under_any};
+use super::verdict::real_path_under_any;
 
 /// Address `sun_path` in child's context. Absolute paths use `/proc/<tid>/root`,
 /// relative paths use `/proc/<tid>/cwd`.
@@ -34,7 +34,7 @@ fn child_lookup_path(child_pid: u32, sun_path: &std::path::Path) -> String {
 }
 
 /// Pin the inode a named unix socket `sun_path` resolves to **in the child's
-/// root view** (see [`child_root_path`]), following the child's symlinks rather
+/// root view** (see [`child_lookup_path`]), following the child's symlinks rather
 /// than the supervisor's. Returns an `O_PATH` fd to that exact inode; callers
 /// address it through `/proc/self/fd` so the resolved inode is the one acted on,
 /// immune to a path swap after the check (TOCTOU- and symlink-safe).
@@ -55,20 +55,25 @@ fn pin_child_unix_target(
 }
 
 /// Resolve a named unix socket `sun_path` to its real, symlink-followed inode
-/// in the child's root view (see [`pin_child_unix_target`]) and verify that
-/// inode is under an fs-write grant. On success returns the pinned `O_PATH` fd;
-/// on failure returns the deny/refuse `NotifAction`.
+/// in the child's view and verify that inode is under an fs-write grant. On
+/// success returns the pinned `O_PATH` fd; on failure returns the deny/refuse
+/// `NotifAction`.
 fn resolve_named_unix_target(
-    child_pid: u32,
+    notif: &SeccompNotif,
+    ctx: &SupervisorCtx,
     sun_path: &std::path::Path,
-    writable: &[crate::grant::Grant],
 ) -> Result<OwnedFd, NotifAction> {
-    let pinned = pin_child_unix_target(child_pid, sun_path)?;
+    if ctx.policy.chroot_root.is_some() {
+        let chroot = crate::chroot::dispatch::ChrootCtx::new(&ctx.policy, &ctx.processes);
+        return crate::chroot::dispatch::pin_writable_unix_target(notif, &chroot, sun_path)
+            .map_err(NotifAction::Errno);
+    }
+    let pinned = pin_child_unix_target(notif.pid, sun_path)?;
 
     // Canonical path of the pinned inode in our mount namespace.
     let real = std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
         .map_err(|_| NotifAction::Errno(libc::EACCES))?;
-    if real_path_under_any(&real, writable) {
+    if real_path_under_any(&real, &ctx.policy.chroot_writable) {
         Ok(pinned)
     } else {
         Err(NotifAction::Errno(libc::EACCES))
@@ -104,16 +109,17 @@ fn sockaddr_un_bytes(sun: &libc::sockaddr_un, len: libc::socklen_t) -> Vec<u8> {
     .to_vec()
 }
 
-/// On-behalf `connect()` for a NAMED `AF_UNIX` socket in non-chroot mode:
-/// resolve+verify the target, then connect the child's socket to the pinned
-/// inode through `/proc/self/fd`.
+/// On-behalf `connect()` for a NAMED `AF_UNIX` socket: resolve+verify the
+/// target, then connect the child's socket to the pinned inode through
+/// `/proc/self/fd`.
 pub(super) fn connect_named_unix_on_behalf(
-    child_pid: u32,
+    notif: &SeccompNotif,
+    ctx: &SupervisorCtx,
     sockfd: i32,
     sun_path: &std::path::Path,
-    writable: &[crate::grant::Grant],
 ) -> NotifAction {
-    let pinned = match resolve_named_unix_target(child_pid, sun_path, writable) {
+    let child_pid = notif.pid;
+    let pinned = match resolve_named_unix_target(notif, ctx, sun_path) {
         Ok(fd) => fd,
         Err(action) => return action,
     };
@@ -143,20 +149,20 @@ pub(super) fn connect_named_unix_on_behalf(
     })
 }
 
-/// On-behalf `sendto()` for a NAMED `AF_UNIX` datagram in non-chroot mode:
-/// resolve+verify the target, copy the child's data, then send to the pinned
-/// inode through `/proc/self/fd`.
+/// On-behalf `sendto()` for a NAMED `AF_UNIX` datagram: resolve+verify the
+/// target, copy the child's data, then send to the pinned inode through
+/// `/proc/self/fd`.
 pub(super) fn sendto_named_unix_on_behalf(
     notif: &SeccompNotif,
+    ctx: &SupervisorCtx,
     notif_fd: RawFd,
     sockfd: i32,
     buf_ptr: u64,
     buf_len: usize,
     flags: i32,
     sun_path: &std::path::Path,
-    writable: &[crate::grant::Grant],
 ) -> NotifAction {
-    let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
+    let pinned = match resolve_named_unix_target(notif, ctx, sun_path) {
         Ok(fd) => fd,
         Err(action) => return action,
     };
@@ -274,38 +280,24 @@ pub(super) fn unix_sendmsg_gate(
     .ok()?;
     // None unless this is a NAMED AF_UNIX target; IP/abstract fall through.
     let path = named_unix_socket_path(&addr_bytes)?;
-
-    if ctx.policy.chroot_root.is_some() {
-        return Some(if path_under_any(&path, &ctx.policy.chroot_writable) {
-            NotifAction::Continue
-        } else {
-            NotifAction::Errno(libc::EACCES)
-        });
-    }
     Some(sendmsg_named_unix_on_behalf(
-        notif,
-        notif_fd,
-        sockfd,
-        msghdr_ptr,
-        flags,
-        &path,
-        &ctx.policy.chroot_writable,
+        notif, ctx, notif_fd, sockfd, msghdr_ptr, flags, &path,
     ))
 }
 
-/// On-behalf `sendmsg()` for a NAMED `AF_UNIX` datagram in non-chroot mode:
-/// resolve+verify the target, copy the message's iovecs and control data, then
-/// send to the pinned inode through `/proc/self/fd`.
+/// On-behalf `sendmsg()` for a NAMED `AF_UNIX` datagram: resolve+verify the
+/// target, copy the message's iovecs and control data, then send to the pinned
+/// inode through `/proc/self/fd`.
 fn sendmsg_named_unix_on_behalf(
     notif: &SeccompNotif,
+    ctx: &SupervisorCtx,
     notif_fd: RawFd,
     sockfd: i32,
     msghdr_ptr: u64,
     flags: i32,
     sun_path: &std::path::Path,
-    writable: &[crate::grant::Grant],
 ) -> NotifAction {
-    match send_named_unix_msghdr(notif, notif_fd, sockfd, msghdr_ptr, sun_path, writable) {
+    match send_named_unix_msghdr(notif, ctx, notif_fd, sockfd, msghdr_ptr, sun_path) {
         Ok((dup_fd, m)) => {
             let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
             prepare_send(dup_fd, m, flags, blocking)
@@ -322,13 +314,13 @@ fn sendmsg_named_unix_on_behalf(
 /// the per-entry `sendmmsg` path.
 fn send_named_unix_msghdr(
     notif: &SeccompNotif,
+    ctx: &SupervisorCtx,
     notif_fd: RawFd,
     sockfd: i32,
     msghdr_ptr: u64,
     sun_path: &std::path::Path,
-    writable: &[crate::grant::Grant],
 ) -> Result<(OwnedFd, MaterializedMsg), i32> {
-    let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
+    let pinned = match resolve_named_unix_target(notif, ctx, sun_path) {
         Ok(fd) => fd,
         Err(NotifAction::Errno(e)) => return Err(e),
         Err(_) => return Err(libc::EACCES),
@@ -374,20 +366,19 @@ pub(super) fn mmsg_entry_named_unix_path(
     named_unix_socket_path(&addr_bytes)
 }
 
-/// On-behalf `sendmmsg` for a batch containing NAMED `AF_UNIX` entries
-/// (non-chroot). Each named-unix entry is resolved, verified, and sent to its
+/// On-behalf `sendmmsg` for a batch containing NAMED `AF_UNIX` entries. Each named-unix entry is resolved, verified, and sent to its
 /// pinned inode; the loop stops at the first entry it cannot gate on-behalf
 /// (connected/abstract) or that is denied, returning the count sent so far
 /// (standard short-`sendmmsg` semantics). Never returns `Continue`, so a unix
 /// entry cannot ride out via the binary whole-call passthrough.
 pub(super) fn sendmmsg_named_unix_on_behalf(
     notif: &SeccompNotif,
+    ctx: &SupervisorCtx,
     notif_fd: RawFd,
     sockfd: i32,
     msgvec_ptr: u64,
     vlen: usize,
     flags: i32,
-    writable: &[crate::grant::Grant],
 ) -> NotifAction {
     let mut entries = Vec::new();
     let mut batch_bytes = 0usize;
@@ -401,7 +392,7 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
             None => break,
         };
         let (dup_fd, m) =
-            match send_named_unix_msghdr(notif, notif_fd, sockfd, entry_ptr, &path, writable) {
+            match send_named_unix_msghdr(notif, ctx, notif_fd, sockfd, entry_ptr, &path) {
                 Ok(pair) => pair,
                 Err(errno) => {
                     first_errno = Some(errno);
