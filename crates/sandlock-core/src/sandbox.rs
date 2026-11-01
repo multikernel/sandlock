@@ -809,6 +809,9 @@ pub struct Sandbox {
     /// spawned even without ACL rules; every request is logged via this closure.
     #[serde(skip)]
     pub(crate) http_log_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    /// Optional callback given the body of every proxied request.
+    #[serde(skip)]
+    pub(crate) http_body_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
 
     // Resource limits
     pub max_memory: Option<ByteSize>,
@@ -972,6 +975,7 @@ impl Clone for Sandbox {
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
             http_log_fn: self.http_log_fn.clone(),
+            http_body_fn: self.http_body_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -2432,7 +2436,11 @@ impl Sandbox {
         );
 
         let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
-        if !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some() {
+        if !self.http_allow.is_empty()
+            || !self.http_deny.is_empty()
+            || self.http_log_fn.is_some()
+            || self.http_body_fn.is_some()
+        {
             // Generate an ephemeral CA when injection is requested without BYO.
             let generate = !self.http_inject_ca.is_empty();
             let ca_material = crate::transparent_proxy::resolve_ca(
@@ -2466,6 +2474,7 @@ impl Sandbox {
                 cert_pem,
                 key_pem,
                 self.http_log_fn.clone(),
+                self.http_body_fn.clone(),
             )
             .await
             .map_err(SandboxRuntimeError::Io)?;

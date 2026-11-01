@@ -44,6 +44,7 @@ pub(crate) async fn spawn_transparent_proxy(
     _: Option<&str>,
     _: Option<&str>,
     _: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    _: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
 ) -> io::Result<HttpAclProxyHandle> {
     Err(disabled())
 }

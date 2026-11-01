@@ -801,6 +801,219 @@ async fn test_env_sourced_credential_stripped_from_child() {
     );
 }
 
+// ============================================================
+// Observation callbacks: http_log_fn / http_body_fn
+// ============================================================
+
+fn post_bytes_script(url: &str, body: &str, out: &std::path::Path) -> String {
+    let body_literal = format!("b'{}'", body);
+    format!(
+        concat!(
+            "import urllib.request, urllib.error\n",
+            "try:\n",
+            "    req = urllib.request.Request('{url}', method='POST', data={body_literal})\n",
+            "    resp = urllib.request.urlopen(req)\n",
+            "    open('{out}', 'w').write('OK:' + str(resp.status))\n",
+            "except urllib.error.HTTPError as e:\n",
+            "    open('{out}', 'w').write('HTTP:' + str(e.code))\n",
+            "except Exception as e:\n",
+            "    open('{out}', 'w').write('ERR:' + str(e))\n",
+        ),
+        url = url,
+        body_literal = body_literal,
+        out = out.display(),
+    )
+}
+
+/// `http_log_fn` observes method/host/path for every request that reaches
+/// the proxy, in addition to whatever ACL/forwarding decision it makes.
+#[tokio::test]
+async fn test_http_log_fn_records_requests() {
+    let out = temp_file("log-fn-records");
+    let (port, srv) = spawn_http_server(1);
+
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cb = seen.clone();
+
+    let policy = base_policy()
+        .http_allow("GET 127.0.0.1/*")
+        .http_port(port)
+        .http_log_fn(std::sync::Arc::new(move |method, host, path| {
+            seen_cb
+                .lock()
+                .unwrap()
+                .push(format!("{method} {host}{path}"));
+        }))
+        .build()
+        .unwrap();
+
+    let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(content.starts_with("OK:200"), "got: {}", content);
+
+    srv.join().unwrap();
+    let _ = std::fs::remove_file(&out);
+
+    assert_eq!(seen.lock().unwrap().as_slice(), ["GET 127.0.0.1/get"]);
+}
+
+/// Spawn a server that records the body of the one request it receives, for
+/// `http_body_fn` tests that need to tell the callback's view and the
+/// upstream's view of a request apart.
+fn spawn_body_capturing_http_server() -> (
+    u16,
+    thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cap = captured.clone();
+    let handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.to_lowercase().starts_with("content-length:") {
+                    content_length = line
+                        .split(':')
+                        .nth(1)
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                let _ = reader.read_exact(&mut body);
+            }
+            *cap.lock().unwrap() = Some(body);
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, handle, captured)
+}
+
+/// `http_body_fn` sees exactly the bytes the child sent, and the upstream
+/// still receives the same, unmodified bytes.
+#[tokio::test]
+async fn test_http_body_fn_receives_request_body() {
+    let out = temp_file("body-fn-receives");
+    let (port, srv, upstream_got) = spawn_body_capturing_http_server();
+
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cb = seen.clone();
+
+    let policy = base_policy()
+        .http_allow("POST 127.0.0.1/*")
+        .http_port(port)
+        .http_body_fn(std::sync::Arc::new(move |method, host, path, body| {
+            seen_cb.lock().unwrap().push((
+                method.to_string(),
+                host.to_string(),
+                path.to_string(),
+                body.to_vec(),
+            ));
+        }))
+        .build()
+        .unwrap();
+
+    let script = post_bytes_script(
+        &format!("http://127.0.0.1:{}/upload", port),
+        "hello-body-fn",
+        &out,
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(content.starts_with("OK:200"), "got: {}", content);
+
+    srv.join().unwrap();
+    let _ = std::fs::remove_file(&out);
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured.len(), 1, "callback should fire exactly once");
+    let (method, host, path, body) = &captured[0];
+    assert_eq!(method, "POST");
+    assert_eq!(host, "127.0.0.1");
+    assert_eq!(path, "/upload");
+    assert_eq!(body, b"hello-body-fn");
+
+    assert_eq!(
+        upstream_got.lock().unwrap().as_deref(),
+        Some(b"hello-body-fn".as_slice()),
+        "upstream must still receive the unmodified body"
+    );
+}
+
+/// A request the ACL blocks still reaches `http_body_fn`, so the body of an
+/// attempt is observable even though it is never forwarded.
+#[tokio::test]
+async fn test_http_body_fn_observes_denied_request() {
+    let out = temp_file("body-fn-denied");
+    let (port, _srv, _got) = spawn_body_capturing_http_server();
+
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cb = seen.clone();
+
+    let policy = base_policy()
+        .http_allow("POST 127.0.0.1/allowed")
+        .http_port(port)
+        .http_body_fn(std::sync::Arc::new(move |_m, _h, _p, body| {
+            seen_cb.lock().unwrap().push(body.to_vec());
+        }))
+        .build()
+        .unwrap();
+
+    let script = post_bytes_script(
+        &format!("http://127.0.0.1:{}/blocked", port),
+        "blocked-prompt",
+        &out,
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(
+        content.starts_with("HTTP:403"),
+        "expected 403, got: {}",
+        content
+    );
+    let _ = std::fs::remove_file(&out);
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "body_fn should fire for a denied request"
+    );
+    assert_eq!(captured[0], b"blocked-prompt");
+}
+
 // NOTE (RFC #66 follow-up): injection over the HTTPS/MITM path is not covered
 // here — this suite has no TLS upstream or ephemeral-CA harness. The rendering
 // code is scheme-agnostic (service.rs runs the same `apply` after the ACL on the

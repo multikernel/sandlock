@@ -44,6 +44,16 @@ pub(crate) struct AclService {
     /// Optional observation callback for learn mode. Called with (method, host, path)
     /// for every request after the host is validated, before the ACL check.
     pub(crate) log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    /// Optional callback given the full request body, in addition to
+    /// (method, host, path).
+    pub(crate) body_fn: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
+}
+
+/// Truncate to the cap handed to `body_fn`, since the untrusted workload could
+/// otherwise force an arbitrarily large allocation into the callback's own storage.
+fn capped_for_body_fn(body: &[u8]) -> &[u8] {
+    const MAX_BODY_FN_BYTES: usize = 10 * 1024 * 1024;
+    &body[..body.len().min(MAX_BODY_FN_BYTES)]
 }
 
 /// Whether this cleartext injection should emit the one-per-run warning: true the
@@ -104,6 +114,7 @@ impl AclService {
         orig_dest: OrigDestMap,
         forwarder: Forwarder,
         log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+        body_fn: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
     ) -> Self {
         Self {
             allow: Arc::new(allow),
@@ -114,6 +125,7 @@ impl AclService {
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
             cleartext_warned: Arc::new(AtomicBool::new(false)),
             log_fn,
+            body_fn,
         }
     }
 
@@ -204,6 +216,29 @@ impl AclService {
             f(&method, &host, &path);
         }
 
+        let (mut parts, body) = req.into_parts();
+
+        // Buffer the body once as `Bytes` (cheap to share) before forwarding.
+        // A read failure rejects the request: the headers still carry the
+        // original Content-Length, so forwarding a short body would stall the
+        // upstream waiting for bytes that never arrive.
+        let body = match self.body_fn {
+            Some(ref f) => {
+                let body_bytes = match body.collect().await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(_) => {
+                        return text_response(
+                            StatusCode::BAD_GATEWAY,
+                            "sandlock could not read the request body",
+                        )
+                    }
+                };
+                f(&method, &host, &path, capped_for_body_fn(&body_bytes));
+                Full::new(body_bytes).map_err(|e| match e {}).boxed()
+            }
+            None => box_incoming(body),
+        };
+
         if !http_acl_check(&self.allow, &self.deny, &method, &host, &path) {
             return text_response(StatusCode::FORBIDDEN, "Blocked by sandlock HTTP ACL policy");
         }
@@ -211,19 +246,16 @@ impl AclService {
         // Rebuild an absolute-URI request for the upstream client from the SAME
         // validated authority — never the raw Host header — so the forward host
         // equals the host the ACL/credential match ran against.
-        let pq = req
-            .uri()
+        let pq = parts
+            .uri
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/")
             .to_string();
-        let uri: hyper::Uri = match format!("{scheme}://{authority}{pq}").parse() {
+        parts.uri = match format!("{scheme}://{authority}{pq}").parse() {
             Ok(u) => u,
             Err(_) => return text_response(StatusCode::BAD_GATEWAY, "bad upstream URI"),
         };
-
-        let (mut parts, body) = req.into_parts();
-        parts.uri = uri;
 
         // ACL passed: attach a credential if a rule matches. First match wins.
         // The secret is rendered into the outbound request only here — never on
@@ -286,7 +318,7 @@ impl AclService {
             }
         }
 
-        let out_req = Request::from_parts(parts, box_incoming(body));
+        let out_req = Request::from_parts(parts, body);
 
         match self.forwarder.forward(out_req).await {
             Ok(resp) => resp,
