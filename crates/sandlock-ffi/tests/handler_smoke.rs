@@ -280,6 +280,14 @@ use sandlock_core::seccomp::notif::NotifAction;
 use sandlock_core::{SeccompData, SeccompNotif};
 use sandlock_ffi::handler::FfiHandler;
 
+async fn resolve_handler(handler: &FfiHandler, cx: &HandlerCtx) -> NotifAction {
+    let mut action = handler.handle(cx).await;
+    while let NotifAction::Suspend(work) = action {
+        action = work.run().await;
+    }
+    action
+}
+
 fn fake_ctx() -> HandlerCtx {
     HandlerCtx::new(
         SeccompNotif {
@@ -293,7 +301,7 @@ fn fake_ctx() -> HandlerCtx {
                 args: [0; 6],
             },
         },
-        -1,
+        std::fs::File::open("/dev/null").unwrap().into(),
     )
 }
 
@@ -358,7 +366,7 @@ fn fake_ctx_with_isolated_child() -> (HandlerCtx, std::process::Child) {
                 args: [0; 6],
             },
         },
-        -1,
+        std::fs::File::open("/dev/null").unwrap().into(),
     );
     (ctx, child)
 }
@@ -394,7 +402,7 @@ async fn ffi_handler_translates_return_value() {
     };
     let h = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx();
-    let action = h.handle(&cx).await;
+    let action = resolve_handler(&h, &cx).await;
     assert!(matches!(action, NotifAction::ReturnValue(42)));
 }
 
@@ -414,7 +422,7 @@ async fn deferred_ffi_handler_returns_defer_that_resolves_to_callback() {
     unsafe { sandlock_ffi::handler::sandlock_handler_set_deferred(raw, true) };
     let h = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx();
-    let action = h.handle(&cx).await;
+    let action = resolve_handler(&h, &cx).await;
     let deferred = match action {
         NotifAction::Defer(d) => d,
         other => panic!("deferred handler must return Defer, got {other:?}"),
@@ -423,8 +431,7 @@ async fn deferred_ffi_handler_returns_defer_that_resolves_to_callback() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn non_deferred_ffi_handler_stays_inline() {
-    // Without the flag, handle() resolves the action inline (no Defer).
+async fn non_deferred_ffi_handler_suspends_dispatch() {
     let raw = unsafe {
         sandlock_ffi::handler::sandlock_handler_new(
             Some(return_value_42),
@@ -435,7 +442,68 @@ async fn non_deferred_ffi_handler_stays_inline() {
     };
     let h = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx();
-    assert!(matches!(h.handle(&cx).await, NotifAction::ReturnValue(42)));
+    let NotifAction::Suspend(work) = h.handle(&cx).await else {
+        panic!("callback must suspend dispatch");
+    };
+    assert!(matches!(work.run().await, NotifAction::ReturnValue(42)));
+}
+
+#[tokio::test]
+async fn abandoned_callback_keeps_user_data_until_worker_exits() {
+    struct State {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    extern "C-unwind" fn callback(
+        ud: *mut std::ffi::c_void,
+        _: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+        _: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+        out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+    ) -> i32 {
+        let state = unsafe { &mut *ud.cast::<State>() };
+        let _ = state.started.take().unwrap().send(());
+        let _ = state.release.recv();
+        unsafe { sandlock_ffi::handler::sandlock_action_set_return_value(out, 42) };
+        0
+    }
+    extern "C-unwind" fn destroy(ud: *mut std::ffi::c_void) {
+        let mut state = unsafe { Box::from_raw(ud.cast::<State>()) };
+        let _ = state.dropped.take().unwrap().send(());
+    }
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
+    let state = Box::new(State {
+        started: Some(started_tx),
+        release: release_rx,
+        dropped: Some(dropped_tx),
+    });
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(callback),
+            Box::into_raw(state).cast(),
+            Some(destroy),
+            sandlock_exception_policy_t::DenyEio as u32,
+        )
+    };
+    let handler = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx();
+    let NotifAction::Suspend(work) = handler.handle(&cx).await else {
+        panic!("expected suspension");
+    };
+    let waiter = tokio::spawn(work.run());
+    started_rx.await.unwrap();
+    drop(handler);
+    drop(cx);
+    waiter.abort();
+    let _ = waiter.await;
+    assert!(matches!(
+        dropped_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    release_tx.send(()).unwrap();
+    dropped_rx.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -450,7 +518,7 @@ async fn ffi_handler_applies_exception_policy_on_failure() {
     };
     let h = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx();
-    let action = h.handle(&cx).await;
+    let action = resolve_handler(&h, &cx).await;
     assert!(matches!(action, NotifAction::Errno(e) if e == libc::EPERM));
 }
 
@@ -709,7 +777,7 @@ async fn ffi_handler_translates_continue() {
     // Safety: `raw` was just produced by `sandlock_handler_new` and is
     // non-null; ownership transfers into the adapter.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     assert!(matches!(action, NotifAction::Continue));
 }
 
@@ -725,7 +793,7 @@ async fn ffi_handler_translates_errno() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     assert!(matches!(action, NotifAction::Errno(e) if e == 13));
 }
 
@@ -741,7 +809,7 @@ async fn ffi_handler_translates_hold() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     assert!(matches!(action, NotifAction::Hold));
 }
 
@@ -757,7 +825,7 @@ async fn ffi_handler_translates_kill_with_explicit_pgid() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     assert!(matches!(
         action,
         NotifAction::KillGroup { sig, pgid } if sig == libc::SIGTERM && pgid == 1234
@@ -837,9 +905,9 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
                 args: [0; 6],
             },
         },
-        -1,
+        std::fs::File::open("/dev/null").unwrap().into(),
     );
-    let action = h.handle(&cx).await;
+    let action = resolve_handler(&h, &cx).await;
 
     // Reap the child regardless of assertion outcome.
     let _ = child.kill();
@@ -874,7 +942,7 @@ fn fake_ctx_with_pid(pid: u32) -> HandlerCtx {
                 args: [0; 6],
             },
         },
-        -1,
+        std::fs::File::open("/dev/null").unwrap().into(),
     )
 }
 
@@ -911,7 +979,7 @@ async fn k1_pgid_resolution_rejects_pid_zero() {
     };
     let handler = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx_with_pid(0);
-    let action = handler.handle(&cx).await;
+    let action = resolve_handler(&handler, &cx).await;
     assert!(
         matches!(action, NotifAction::Continue),
         "expected exception-policy fallback (Continue) when no safe pgid available, got {action:?}",
@@ -965,7 +1033,7 @@ async fn k1_no_supervisor_signal_on_pid_zero_kill() {
     };
     let handler = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx_with_pid(0); // pid=0 -> UNSAFE_PGID
-    let action = handler.handle(&cx).await;
+    let action = resolve_handler(&handler, &cx).await;
 
     // The action must be Continue (exception-policy fallback), NOT a
     // Kill that send_response would forward to killpg(0).
@@ -1019,7 +1087,7 @@ async fn k2_pgid_resolution_rejects_supervisor_pgid_match() {
     };
     let handler = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx_with_pid(child_pid as u32);
-    let action = handler.handle(&cx).await;
+    let action = resolve_handler(&handler, &cx).await;
 
     // Reap the child regardless of assertion outcome.
     let _ = child.kill();
@@ -1054,7 +1122,7 @@ async fn k3_pgid_resolution_falls_back_on_esrch() {
     };
     let handler = unsafe { FfiHandler::from_raw(raw) };
     let cx = fake_ctx_with_pid(dead_pid);
-    let action = handler.handle(&cx).await;
+    let action = resolve_handler(&handler, &cx).await;
     assert!(
         matches!(action, NotifAction::Continue),
         "expected exception-policy fallback (Continue) on ESRCH, got {action:?}",
@@ -1081,7 +1149,7 @@ async fn ffi_handler_kill_policy_on_callback_rc_nonzero() {
     // suicide, and the assertion below would not exercise the
     // Kill-path the test exists to cover.
     let (cx, mut child) = fake_ctx_with_isolated_child();
-    let action = h.handle(&cx).await;
+    let action = resolve_handler(&h, &cx).await;
     let _ = child.kill();
     let _ = child.wait();
     assert!(matches!(action, NotifAction::KillGroup { sig, .. } if sig == libc::SIGKILL));
@@ -1099,7 +1167,7 @@ async fn ffi_handler_continue_policy_on_callback_rc_nonzero() {
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     assert!(matches!(action, NotifAction::Continue));
 }
 
@@ -1136,7 +1204,7 @@ async fn ffi_handler_recovers_from_callback_panic() {
     // Use an isolated child so the Kill exception policy is observable
     // (rationale identical to `ffi_handler_kill_policy_on_callback_rc_nonzero`).
     let (cx, mut child) = fake_ctx_with_isolated_child();
-    let action = h.handle(&cx).await;
+    let action = resolve_handler(&h, &cx).await;
     let _ = child.kill();
     let _ = child.wait();
     // The `catch_unwind` inside `spawn_blocking` swallows the panic and
@@ -1167,7 +1235,7 @@ async fn ffi_handler_callback_returns_zero_but_never_sets_action_triggers_fallba
     };
     // Safety: see `ffi_handler_translates_continue`.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     // `translate_action` returns `None` for `Unset`, which routes the
     // dispatcher onto the exception policy fallback.
     assert!(matches!(action, NotifAction::Errno(e) if e == libc::EPERM));
@@ -2028,7 +2096,7 @@ async fn a1_ffi_handler_drains_inject_fd_on_panic() {
     };
     // SAFETY: `raw` was just produced and is non-null.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     assert!(
         matches!(action, NotifAction::Errno(e) if e == libc::EPERM),
         "panic must route to the exception-policy fallback (Kill degraded to EPERM under UNSAFE_PGID), got {action:?}",
@@ -2103,7 +2171,7 @@ async fn a2_ffi_handler_drains_inject_fd_tracked_discriminant() {
     };
     // SAFETY: `raw` was just produced and is non-null.
     let h = unsafe { FfiHandler::from_raw(raw) };
-    let action = h.handle(&fake_ctx()).await;
+    let action = resolve_handler(&h, &fake_ctx()).await;
     assert!(
         matches!(action, NotifAction::Errno(e) if e == libc::EPERM),
         "unsupported tracked discriminant must route to the exception-policy fallback (Kill degraded to EPERM under UNSAFE_PGID), got {action:?}",
@@ -2318,7 +2386,7 @@ async fn ffi_handler_deny_eio_policy_on_callback_rc_nonzero() {
     };
     let h = unsafe { sandlock_ffi::handler::FfiHandler::from_raw(raw) };
     let cx = fake_ctx();
-    let action = h.handle(&cx).await;
+    let action = resolve_handler(&h, &cx).await;
     assert!(
         matches!(action, NotifAction::Errno(e) if e == libc::EIO),
         "expected Errno(EIO), got {:?}",

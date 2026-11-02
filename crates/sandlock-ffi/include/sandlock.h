@@ -1853,9 +1853,9 @@ sandlock_handler_t *sandlock_handler_new(int32_t (*handler_fn)(void *ud,
                                          uint32_t on_exception);
 
 /**
- * Mark a handler as deferred: the supervisor will run its callback off the
- * notification loop so a slow callback does not block other trapped
- * syscalls. Must be called before the handler is registered with a run.
+ * Select terminal deferral. All callbacks run off the notification loop;
+ * the default resumes the handler chain after the callback returns Continue.
+ * Must be called before the handler is registered with a run.
  *
  * A deferred handler makes a *terminal* decision: deferral short-circuits
  * the handler chain, so if a deferred handler would `Continue` and other
