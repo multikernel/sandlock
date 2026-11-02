@@ -1074,6 +1074,91 @@ pub(crate) fn handle_uname(
     }
 }
 
+// ============================================================
+// sysinfo virtualization
+// ============================================================
+
+/// The fields sysinfo(2) reports from the sandbox's view instead of the host's.
+#[derive(Debug, Clone, Default)]
+struct SysinfoView {
+    loads: [f64; 3],
+    procs: usize,
+    /// `(total, used)` bytes when a memory limit is set.
+    memory: Option<(u64, u64)>,
+    uptime_secs: Option<f64>,
+}
+
+const SI_LOAD_SHIFT: u32 = 16;
+
+// musl's struct sysinfo pads 256 reserved bytes the kernel's lacks; writing
+// all of it would overrun the caller's kernel-sized buffer.
+const KERNEL_SYSINFO_LEN: usize = (std::mem::offset_of!(libc::sysinfo, mem_unit)
+    + std::mem::size_of::<libc::c_uint>())
+.next_multiple_of(std::mem::align_of::<libc::c_ulong>());
+
+fn patch_sysinfo(info: &mut libc::sysinfo, view: &SysinfoView) {
+    for (slot, avg) in info.loads.iter_mut().zip(view.loads) {
+        *slot = (avg.max(0.0) * f64::from(1u32 << SI_LOAD_SHIFT)) as libc::c_ulong;
+    }
+    info.procs = view.procs.min(usize::from(u16::MAX)) as libc::c_ushort;
+    if let Some((total, used)) = view.memory {
+        info.mem_unit = 1;
+        info.totalram = total as libc::c_ulong;
+        info.freeram = total.saturating_sub(used) as libc::c_ulong;
+        info.sharedram = 0;
+        info.bufferram = 0;
+        info.totalswap = 0;
+        info.freeswap = 0;
+        info.totalhigh = 0;
+        info.freehigh = 0;
+    }
+    if let Some(secs) = view.uptime_secs {
+        info.uptime = secs.max(0.0).ceil() as _;
+    }
+}
+
+/// Handle sysinfo(): agree with the virtual /proc/loadavg, /proc/meminfo and
+/// /proc/uptime so callers can't read the host's values around them.
+pub(crate) async fn handle_sysinfo(
+    notif: &SeccompNotif,
+    processes: &ProcessIndex,
+    resource: &Mutex<crate::seccomp::state::ResourceState>,
+    policy: &NotifPolicy,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let buf_addr = notif.data.args[0];
+    if buf_addr == 0 {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } != 0 {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    let procs = processes.len().max(1);
+    let view = {
+        let rs = resource.lock().await;
+        SysinfoView {
+            loads: [rs.load_avg.avg_1, rs.load_avg.avg_5, rs.load_avg.avg_15],
+            procs,
+            memory: (policy.max_memory_bytes > 0).then(|| (policy.max_memory_bytes, rs.mem_used)),
+            uptime_secs: policy
+                .has_time_start
+                .then(|| rs.start_instant.elapsed().as_secs_f64()),
+        }
+    };
+    patch_sysinfo(&mut info, &view);
+
+    let bytes =
+        unsafe { std::slice::from_raw_parts(&info as *const _ as *const u8, KERNEL_SYSINFO_LEN) };
+    // Continue on a failed write would let the kernel hand over the host's values.
+    match write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, bytes) {
+        Ok(()) => NotifAction::ReturnValue(0),
+        Err(_) => NotifAction::Errno(libc::EFAULT),
+    }
+}
+
 /// Answer an open of /etc/hostname with the virtual hostname.
 pub(crate) fn handle_hostname_open(open: &OpenRequest, hostname: &str) -> Option<NotifAction> {
     if open.target.as_deref() != Some(std::path::Path::new("/etc/hostname")) {
@@ -1910,6 +1995,77 @@ mod tests {
         let info = generate_uptime(-5.0);
         let text = String::from_utf8(info).unwrap();
         assert!(text.starts_with("0.00"));
+    }
+
+    #[test]
+    fn test_kernel_sysinfo_len_matches_kernel_struct() {
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(KERNEL_SYSINFO_LEN, 112);
+        assert!(KERNEL_SYSINFO_LEN <= std::mem::size_of::<libc::sysinfo>());
+    }
+
+    #[test]
+    fn test_patch_sysinfo_replaces_host_values() {
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        info.uptime = 999_999;
+        info.loads = [7 << SI_LOAD_SHIFT; 3];
+        info.procs = 4000;
+        info.totalram = 64;
+        info.freeram = 32;
+        info.totalswap = 8;
+        info.freeswap = 8;
+        info.mem_unit = 4096;
+
+        patch_sysinfo(
+            &mut info,
+            &SysinfoView {
+                loads: [1.5, 0.25, 0.0],
+                procs: 3,
+                memory: Some((256 << 20, 56 << 20)),
+                uptime_secs: Some(41.2),
+            },
+        );
+
+        assert_eq!(info.loads[0], 3 << (SI_LOAD_SHIFT - 1));
+        assert_eq!(info.loads[1], 1 << (SI_LOAD_SHIFT - 2));
+        assert_eq!(info.loads[2], 0);
+        assert_eq!(info.procs, 3);
+        assert_eq!(info.mem_unit, 1);
+        assert_eq!(info.totalram, 256 << 20);
+        assert_eq!(info.freeram, 200 << 20);
+        assert_eq!((info.totalswap, info.freeswap), (0, 0));
+        assert_eq!(info.uptime, 42);
+    }
+
+    #[test]
+    fn test_patch_sysinfo_keeps_unvirtualized_fields() {
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        info.uptime = 1234;
+        info.totalram = 64;
+        info.mem_unit = 4096;
+        patch_sysinfo(
+            &mut info,
+            &SysinfoView {
+                procs: 100_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(info.uptime, 1234);
+        assert_eq!((info.totalram, info.mem_unit), (64, 4096));
+        assert_eq!(info.procs, u16::MAX);
+    }
+
+    #[test]
+    fn test_patch_sysinfo_clamps_used_above_limit() {
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        patch_sysinfo(
+            &mut info,
+            &SysinfoView {
+                memory: Some((100, 150)),
+                ..Default::default()
+            },
+        );
+        assert_eq!((info.totalram, info.freeram), (100, 0));
     }
 
     #[test]

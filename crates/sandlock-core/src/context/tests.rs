@@ -120,6 +120,21 @@ fn test_notif_syscalls_sandbox_name_enables_hostname_virtualization() {
     assert!(nrs.contains(&(libc::SYS_openat as u32)));
 }
 
+#[test]
+fn test_notif_syscalls_virtualize_sysinfo() {
+    let policy = Sandbox::builder().build().unwrap();
+    assert!(notif_syscalls(&policy, None).contains(&(libc::SYS_sysinfo as u32)));
+}
+
+#[test]
+fn test_notif_syscalls_skip_denied_sysinfo() {
+    let policy = Sandbox::builder()
+        .extra_deny_syscalls(vec!["sysinfo".into()])
+        .build()
+        .unwrap();
+    assert!(!notif_syscalls(&policy, None).contains(&(libc::SYS_sysinfo as u32)));
+}
+
 /// SYS_faccessat2 (439) must be in the notification filter for both
 /// chroot and COW modes; glibc 2.33+ uses it instead of faccessat.
 #[test]

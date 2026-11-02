@@ -415,6 +415,9 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
 
     nrs.extend(&procfs_hosts_notif_syscalls());
     nrs.extend(NETLINK_NOTIF_SYSCALLS);
+    if features.virtual_sysinfo {
+        nrs.push(libc::SYS_sysinfo);
+    }
 
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
     if features.virtual_cpu_count {

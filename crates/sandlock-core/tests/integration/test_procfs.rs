@@ -172,6 +172,63 @@ async fn test_meminfo_virtualization() {
     );
 }
 
+/// sysinfo(2) and sysconf(_SC_PHYS_PAGES) must agree with the virtual
+/// /proc files instead of reporting the host's RAM, swap, uptime and tasks.
+#[tokio::test]
+async fn test_sysinfo_virtualization() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .max_memory(ByteSize::mib(256))
+        .time_start(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(961027200))
+        .build()
+        .unwrap();
+
+    let script = concat!(
+        "import ctypes, os\n",
+        "UL = ctypes.c_ulong\n",
+        "class Sysinfo(ctypes.Structure):\n",
+        "  _fields_ = [('uptime', ctypes.c_long), ('loads', UL * 3),\n",
+        "    ('totalram', UL), ('freeram', UL), ('sharedram', UL), ('bufferram', UL),\n",
+        "    ('totalswap', UL), ('freeswap', UL), ('procs', ctypes.c_ushort),\n",
+        "    ('pad', ctypes.c_ushort), ('totalhigh', UL), ('freehigh', UL),\n",
+        "    ('mem_unit', ctypes.c_uint)]\n",
+        "si = Sysinfo()\n",
+        "assert ctypes.CDLL(None, use_errno=True).sysinfo(ctypes.byref(si)) == 0\n",
+        "print('total', si.totalram * si.mem_unit)\n",
+        "print('swap', si.totalswap)\n",
+        "print('uptime', si.uptime)\n",
+        "print('procs', si.procs)\n",
+        "print('phys', os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))\n",
+    );
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert!(result.success(), "sysinfo script failed: {stdout}");
+    let field = |name: &str| -> u64 {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or_else(|| panic!("missing {name} in {stdout:?}"))
+    };
+    assert_eq!(field("total"), 256 << 20);
+    assert_eq!(field("phys"), 256 << 20);
+    assert_eq!(field("swap"), 0);
+    assert!(field("uptime") < 120, "host uptime leaked: {stdout}");
+    let procs = field("procs");
+    assert!(
+        (1..100).contains(&procs),
+        "host task count leaked: {stdout}"
+    );
+}
+
 /// Test that sensitive /proc paths are blocked.
 #[tokio::test]
 async fn test_sensitive_proc_blocked() {
