@@ -170,6 +170,8 @@ pub enum NotifAction {
     /// so it short-circuits the handler chain — a deferring handler makes a
     /// terminal decision.  See [`Deferred`].
     Defer(Deferred),
+    /// Suspend dispatch, then resume the handler chain and policy processing.
+    Suspend(Deferred),
     /// Execute only after the policy callback permits the operation.
     Prepared(PreparedOperation),
 }
@@ -218,6 +220,10 @@ impl NotifAction {
     /// shorthand for `NotifAction::Defer(Deferred::new(fut))`.
     pub fn defer<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
         NotifAction::Defer(Deferred::new(fut))
+    }
+
+    pub fn suspend<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
+        NotifAction::Suspend(Deferred::new(fut))
     }
 
     /// Defer owned synchronous work with admission held until the work returns.
@@ -316,7 +322,9 @@ pub(crate) fn named_content_memfd(content: &[u8], seal: bool, name: &str) -> io:
 /// definite response instead of wedging forever waiting for one.
 fn finalize_deferred(action: NotifAction) -> NotifAction {
     match action {
-        NotifAction::Defer(_) | NotifAction::Prepared(_) => NotifAction::Errno(libc::EIO),
+        NotifAction::Defer(_) | NotifAction::Suspend(_) | NotifAction::Prepared(_) => {
+            NotifAction::Errno(libc::EIO)
+        }
         other => other,
     }
 }
@@ -2130,7 +2138,7 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
         },
         NotifAction::ReturnValue(val) => respond_value(fd, id, val),
         NotifAction::Hold => Ok(()), // Don't send a response.
-        NotifAction::Defer(_) | NotifAction::Prepared(_) => {
+        NotifAction::Defer(_) | NotifAction::Suspend(_) | NotifAction::Prepared(_) => {
             // Unexecuted work must never become a successful syscall response.
             debug_assert!(false, "unexecuted operation reached send_response");
             respond_errno(fd, id, libc::EIO)
@@ -2877,7 +2885,7 @@ async fn emit_policy_event(
 /// Maximum number of deferred handler futures running concurrently. Caps
 /// the worker fan-out (and any resources those workers hold, e.g. memfds or
 /// sockets) so a burst of deferrals cannot exhaust the supervisor process.
-const DEFER_MAX_INFLIGHT: usize = 64;
+pub(crate) const DEFER_MAX_INFLIGHT: usize = 64;
 
 /// Maximum time a deferred handler future may run before the supervisor gives
 /// up and fails the trapped syscall closed. Bounds the worst case so a hung
@@ -2909,6 +2917,12 @@ async fn run_deferred_within(deferred: Deferred, limit: std::time::Duration) -> 
 enum Parked {
     Approval(Box<Prepared>, crate::policy_fn::Verdict),
     Deferred(u64, NotifAction),
+    Dispatch {
+        notif: SeccompNotif,
+        action: NotifAction,
+        open: Option<Arc<OpenRequest>>,
+        has_denied: bool,
+    },
 }
 
 /// Parked notifications and the tids waiting on them, which the exec freeze
@@ -2916,6 +2930,7 @@ enum Parked {
 struct ParkedSet {
     tasks: tokio::task::JoinSet<Parked>,
     callers: HashMap<tokio::task::Id, (i32, u64)>,
+    active_work: Arc<tokio::sync::Semaphore>,
 }
 
 impl ParkedSet {
@@ -2923,6 +2938,7 @@ impl ParkedSet {
         Self {
             tasks: tokio::task::JoinSet::new(),
             callers: HashMap::new(),
+            active_work: Arc::new(tokio::sync::Semaphore::new(DEFER_MAX_INFLIGHT)),
         }
     }
 
@@ -2940,7 +2956,25 @@ impl ParkedSet {
                     return Some(parked);
                 }
                 Err(e) => {
-                    self.callers.remove(&e.id());
+                    if let Some((_, id)) = self.callers.remove(&e.id()) {
+                        return Some(Parked::Deferred(id, NotifAction::Errno(libc::EIO)));
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_join_next(&mut self) -> Option<Parked> {
+        loop {
+            match self.tasks.try_join_next_with_id()? {
+                Ok((id, parked)) => {
+                    self.callers.remove(&id);
+                    return Some(parked);
+                }
+                Err(e) => {
+                    if let Some((_, id)) = self.callers.remove(&e.id()) {
+                        return Some(Parked::Deferred(id, NotifAction::Errno(libc::EIO)));
+                    }
                 }
             }
         }
@@ -2986,10 +3020,11 @@ async fn handle_notification(
     notif: SeccompNotif,
     ctx: &Arc<super::ctx::SupervisorCtx>,
     dispatch_table: &super::dispatch::DispatchTable,
-    fd: RawFd,
+    listener: &Arc<OwnedFd>,
     parked: &mut ParkedSet,
     defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
+    let fd = listener.as_raw_fd();
     let policy = &ctx.policy;
 
     // Ensure every pid that produces a notification has per-process
@@ -3017,7 +3052,7 @@ async fn handle_notification(
         .then(|| OpenRequest::decode(&notif, fd, policy, &ctx.processes))
         .flatten()
         .map(Arc::new);
-    let mut action = {
+    let action = {
         let denied = has_denied
             && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr)
             && is_path_denied_for_notif(&*ctx.policy_fn.lock().await, &notif, fd);
@@ -3026,22 +3061,60 @@ async fn handle_notification(
         } else {
             // Dispatch runs first so /proc virtualization and the other
             // handlers still win for their paths.
-            let action = dispatch_table.dispatch(notif, fd, open.clone()).await;
-            // A bare Continue for an open is the racy window: the kernel
-            // re-resolves the path after it, and a racing thread can swap a
-            // link to reach a denied carve-out inside a granted tree (issue
-            // #111) or a procfs entry the handlers hide by name (issue
-            // #236). The open is done against the pinned inode instead.
-            let resolves = policy.chroot_root.is_none() && (has_denied || policy.resolves_opens());
-            match (&action, &open) {
-                (NotifAction::Continue, Some(open)) if resolves => {
-                    let pfs = ctx.policy_fn.lock().await;
-                    on_behalf_open(&notif, open, ctx, &pfs, fd, has_denied).await
-                }
-                _ => action,
-            }
+            dispatch_table
+                .dispatch(
+                    notif,
+                    Arc::clone(listener),
+                    open.clone(),
+                    Arc::clone(&parked.active_work),
+                )
+                .await
         }
     };
+
+    if let NotifAction::Suspend(work) = action {
+        match Arc::clone(defer_sem).try_acquire_owned() {
+            Ok(permit) => parked.spawn(&notif, async move {
+                let _permit = permit;
+                let action = tokio::time::timeout(DEFER_TIMEOUT, work.run())
+                    .await
+                    .unwrap_or(NotifAction::Errno(libc::EIO));
+                Parked::Dispatch {
+                    notif,
+                    action,
+                    open,
+                    has_denied,
+                }
+            }),
+            Err(_) => {
+                let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EAGAIN));
+            }
+        }
+        return;
+    }
+    finish_dispatch(notif, action, open, has_denied, ctx, fd, parked, defer_sem).await;
+}
+
+async fn finish_dispatch(
+    notif: SeccompNotif,
+    mut action: NotifAction,
+    open: Option<Arc<OpenRequest>>,
+    has_denied: bool,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    fd: RawFd,
+    parked: &mut ParkedSet,
+    defer_sem: &Arc<tokio::sync::Semaphore>,
+) {
+    let policy = &ctx.policy;
+    let nr = notif.data.nr as i64;
+    // Resuming a handler must still pass through pinned-open enforcement.
+    let resolves = policy.chroot_root.is_none() && (has_denied || policy.resolves_opens());
+    if let (NotifAction::Continue, Some(open)) = (&action, &open) {
+        if resolves {
+            let pfs = ctx.policy_fn.lock().await;
+            action = on_behalf_open(&notif, open, ctx, &pfs, fd, has_denied).await;
+        }
+    }
 
     if let Some(open) = &open {
         action = crate::procfs::net_dispatch::guard_injection(action, &notif, open, ctx).await;
@@ -3210,10 +3283,17 @@ async fn finish_notification(
     // From the freeze to its release nothing may await: the tracer is this
     // thread, and the loop must not release any parked task meanwhile.
     let mut exec_freeze = None;
+    let mut memory_quiescence = None;
     if let (NotifAction::Continue, Some(judged)) = (&action, &exec_image) {
-        let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd, parked);
-        action = frozen_action;
-        exec_freeze = Some(freeze);
+        match Arc::clone(&parked.active_work).try_acquire_many_owned(DEFER_MAX_INFLIGHT as u32) {
+            Ok(guard) => {
+                memory_quiescence = Some(guard);
+                let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd, parked);
+                action = frozen_action;
+                exec_freeze = Some(freeze);
+            }
+            Err(_) => action = NotifAction::Errno(libc::EAGAIN),
+        }
     }
 
     // Ignore error — child may have exited between recv and response.
@@ -3231,6 +3311,7 @@ async fn finish_notification(
         // reap the queued interrupts and detach.
         crate::freeze::reap_pending(&freeze.pending_tids);
     }
+    drop(memory_quiescence);
 
     if let Some(trace) = creation_trace {
         if send_result.is_ok() {
@@ -3263,6 +3344,16 @@ async fn settle_parked(
     defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     match parked {
+        Parked::Dispatch {
+            notif,
+            action,
+            open,
+            has_denied,
+        } => {
+            if id_valid(fd, notif.id).is_ok() {
+                finish_dispatch(notif, action, open, has_denied, ctx, fd, set, defer_sem).await;
+            }
+        }
         Parked::Approval(prepared, verdict) => {
             finish_notification(*prepared, Some(verdict), ctx, fd, set, defer_sem).await
         }
@@ -3291,14 +3382,16 @@ pub async fn supervisor(
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
-    let async_fd =
-        match tokio::io::unix::AsyncFd::with_interest(notif_fd, tokio::io::Interest::READABLE) {
-            Ok(fd) => fd,
-            Err(err) => {
-                let _ = startup.send(Err(err));
-                return;
-            }
-        };
+    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+        Arc::new(notif_fd),
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = startup.send(Err(err));
+            return;
+        }
+    };
     let fd = async_fd.get_ref().as_raw_fd();
 
     // Build the dispatch table once at startup.
@@ -3355,6 +3448,9 @@ pub async fn supervisor(
         drop(ready);
 
         loop {
+            if let Some(done) = parked.try_join_next() {
+                settle_parked(done, &ctx, fd, &mut parked, &defer_sem).await;
+            }
             match probe_notif_fd(fd) {
                 NotifFdState::Pending => {
                     let notif = match recv_notif(fd) {
@@ -3371,8 +3467,15 @@ pub async fn supervisor(
                         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
                     };
-                    handle_notification(notif, &ctx, &dispatch_table, fd, &mut parked, &defer_sem)
-                        .await;
+                    handle_notification(
+                        notif,
+                        &ctx,
+                        &dispatch_table,
+                        async_fd.get_ref(),
+                        &mut parked,
+                        &defer_sem,
+                    )
+                    .await;
                 }
                 NotifFdState::Empty => break,
                 NotifFdState::Terminal => break 'outer,

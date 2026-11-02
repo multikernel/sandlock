@@ -5,8 +5,9 @@
 //! dispatch loop can invoke C callbacks transparently.
 
 use std::future::Future;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use sandlock_core::seccomp::dispatch::{Handler, HandlerCtx};
 use sandlock_core::seccomp::notif::NotifAction;
@@ -44,7 +45,7 @@ pub(crate) const UNSAFE_PGID: i32 = i32::MIN;
 /// `Handler`. Constructed when the supervisor accepts handlers passed
 /// through `sandlock_run_with_handlers`.
 pub struct FfiHandler {
-    inner: Box<sandlock_handler_t>,
+    inner: Arc<sandlock_handler_t>,
 }
 
 impl FfiHandler {
@@ -58,7 +59,7 @@ impl FfiHandler {
     pub unsafe fn from_raw(raw: *mut sandlock_handler_t) -> Self {
         assert!(!raw.is_null(), "FfiHandler::from_raw on null pointer");
         Self {
-            inner: Box::from_raw(raw),
+            inner: Arc::from(Box::from_raw(raw)),
         }
     }
 
@@ -88,25 +89,14 @@ impl FfiHandler {
     }
 }
 
-/// `Send`-only wrapper around the C user-data pointer so it can travel
-/// into `spawn_blocking`. Only the move (not sharing across threads) is
-/// required; the deeper Send/Sync rationale for the underlying handler
-/// container lives on `sandlock_handler_t`.
-struct UdPtr(*mut std::ffi::c_void);
-// Safety: ud is opaque to Rust; the spawn_blocking pipeline only moves
-// (not shares) the wrapper. See `sandlock_handler_t` for the deeper
-// Send/Sync rationale that justifies the underlying handler container.
-unsafe impl Send for UdPtr {}
-
 impl Handler for FfiHandler {
     fn handle<'a>(
         &'a self,
         cx: &'a HandlerCtx,
     ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
-        // Capture the pieces we need by value so spawn_blocking can run
-        // the C callback on a worker thread without &self lifetime games.
+        // Native work retains both the callback state and the listener after timeout.
         let notif_snap = crate::notif_repr::sandlock_notif_data_t::from(&cx.notif);
-        let notif_fd = cx.notif_fd;
+        let listener = cx.listener();
         let notif_id = cx.notif.id;
         let pid = cx.notif.pid;
         // Resolve the trapped child's process group id for use as a fallback
@@ -156,73 +146,61 @@ impl Handler for FfiHandler {
                 }
             }
         };
-        let handler_fn = self.inner.handler_fn;
-        let ud = UdPtr(self.inner.ud);
+        let handler = Arc::clone(&self.inner);
         let on_exception_fallback = self.exception_action(child_pgid);
         let deferred = self.inner.deferred;
+        let work_guard = match cx.blocking_guard() {
+            Ok(guard) => guard,
+            Err(e) => {
+                return Box::pin(async move {
+                    NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO))
+                })
+            }
+        };
 
-        // The whole callback (including its slow work) runs on a blocking
-        // worker. When `deferred` is set we hand this future to the
-        // supervisor as `NotifAction::Defer` so it runs off the notification
-        // loop; otherwise the supervisor awaits it inline as before. The
-        // future is fully owned (`'static`) either way — nothing borrows
-        // `self`/`cx`.
         let run = async move {
-            let join = tokio::task::spawn_blocking(move || {
-                // Rust 2021 disjoint closure captures (RFC 2229) would
-                // otherwise capture `ud.0` (a bare `*mut c_void`, not
-                // `Send`) rather than the whole `UdPtr`. Binding `ud` to
-                // a fresh local at the top of the closure forces a
-                // whole-struct capture so the `Send` impl on `UdPtr`
-                // applies to the outer closure.
-                let ud = ud;
-                let UdPtr(ud_raw) = ud;
-                let mut mem = sandlock_mem_handle_t::new(notif_fd, notif_id, pid);
+            sandlock_core::blocking::run(move || {
+                let _work_guard = work_guard;
+                let mut mem = sandlock_mem_handle_t::new(listener.as_raw_fd(), notif_id, pid);
                 let mut out = sandlock_action_out_t::zeroed();
-                let rc = match handler_fn {
+                let rc_or_panic = match handler.handler_fn {
                     Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        f(ud_raw, &notif_snap, &mut mem, &mut out)
+                        f(handler.ud, &notif_snap, &mut mem, &mut out)
                     })),
                     None => Ok(-1),
                 };
-                (rc, out)
-            })
-            .await;
-
-            let (rc_or_panic, out) = match join {
-                Ok(pair) => pair,
-                Err(_join_err) => return on_exception_fallback,
-            };
-
-            match rc_or_panic {
-                Ok(0) => match translate_action(&out, child_pgid) {
-                    Some(action) => action,
-                    None => {
-                        // Action kind ended up Unset, unknown, or the
-                        // reserved InjectFdSendTracked discriminant.
-                        // Drain any inject-fd payload before falling
-                        // back to the exception policy — otherwise the
-                        // supervisor leaks the srcfd that was armed by
-                        // the (failed) callback.
-                        // SAFETY: `drain_pending_inject_fd` inspects
-                        // `out.kind` itself before touching the union,
-                        // and `out.kind` matches the union variant per
-                        // the action setters' contract.
+                match rc_or_panic {
+                    Ok(0) => match translate_action(&out, child_pgid) {
+                        Some(action) => action,
+                        None => {
+                            // Action kind ended up Unset, unknown, or the
+                            // reserved InjectFdSendTracked discriminant.
+                            // Drain any inject-fd payload before falling
+                            // back to the exception policy — otherwise the
+                            // supervisor leaks the srcfd that was armed by
+                            // the (failed) callback.
+                            // SAFETY: `drain_pending_inject_fd` inspects
+                            // `out.kind` itself before touching the union,
+                            // and `out.kind` matches the union variant per
+                            // the action setters' contract.
+                            unsafe { drain_pending_inject_fd(&out) };
+                            on_exception_fallback
+                        }
+                    },
+                    _ => {
+                        // Either the callback returned a non-zero rc OR
+                        // `catch_unwind` caught a panic. The callback may
+                        // have armed an InjectFdSend{,Tracked} payload
+                        // before failing; drain it so its srcfd doesn't
+                        // leak in the supervisor.
+                        // SAFETY: see the `Ok(0) -> None` branch above.
                         unsafe { drain_pending_inject_fd(&out) };
                         on_exception_fallback
                     }
-                },
-                _ => {
-                    // Either the callback returned a non-zero rc OR
-                    // `catch_unwind` caught a panic. The callback may
-                    // have armed an InjectFdSend{,Tracked} payload
-                    // before failing; drain it so its srcfd doesn't
-                    // leak in the supervisor.
-                    // SAFETY: see the `Ok(0) -> None` branch above.
-                    unsafe { drain_pending_inject_fd(&out) };
-                    on_exception_fallback
                 }
-            }
+            })
+            .await
+            .unwrap_or_else(|e| NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO)))
         };
 
         if deferred {
@@ -230,7 +208,7 @@ impl Handler for FfiHandler {
             // a worker task and sends the response when it completes.
             Box::pin(async move { NotifAction::defer(run) })
         } else {
-            Box::pin(run)
+            Box::pin(async move { NotifAction::suspend(run) })
         }
     }
 }
