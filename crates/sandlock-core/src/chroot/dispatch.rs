@@ -475,6 +475,39 @@ fn resolve_chroot_path_existing(
     resolve_existing_in_root(ctx.root, &full_path)
 }
 
+/// Pin the socket inode a named unix address reaches in the sandbox's view
+/// and require write access to it, as the kernel's connect does.
+///
+/// The child's real root and cwd are the host's, so the kernel cannot be left
+/// to resolve the address: the grant is checked on where the pinned inode
+/// actually sits, after symlinks inside the root are followed.
+pub(crate) fn pin_writable_unix_target(
+    notif: &SeccompNotif,
+    ctx: &ChrootCtx<'_>,
+    sun_path: &Path,
+) -> Result<OwnedFd, i32> {
+    let vpath = build_virtual_path(
+        notif,
+        libc::AT_FDCWD as i64,
+        sun_path.to_str().ok_or(libc::ECONNREFUSED)?,
+        ctx,
+    )
+    .ok_or(libc::ECONNREFUSED)?;
+    let confined = confine(&vpath);
+    let (root, sub) = match ctx.mount_target(&confined) {
+        Some((mount, sub)) => (mount, sub),
+        None => (ctx.root, confined.to_string_lossy().into_owned()),
+    };
+    let fd = openat2_in_root(root, &sub, libc::O_PATH | libc::O_CLOEXEC, 0)
+        .map_err(|_| libc::ECONNREFUSED)?;
+    let pinned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let host = std::fs::read_link(format!("/proc/self/fd/{}", fd)).map_err(|_| libc::EACCES)?;
+    match ctx.host_to_virtual(&host) {
+        Some(virtual_path) if ctx.can_write(&virtual_path) => Ok(pinned),
+        _ => Err(libc::EACCES),
+    }
+}
+
 /// Convert a Path to CString, returning Errno on failure.
 fn path_cstr(path: &Path, err: i32) -> Result<CString, NotifAction> {
     CString::new(path.to_str().unwrap_or("")).map_err(|_| NotifAction::Errno(err))

@@ -458,11 +458,8 @@ pub struct sandlock_handler_t {
     pub(super) ud: *mut std::ffi::c_void,
     pub(super) ud_drop: Option<sandlock_handler_ud_drop_t>,
     pub(super) on_exception: sandlock_exception_policy_t,
-    /// When true, the supervisor runs this handler's callback off the
-    /// notification loop (as a deferred future) instead of inline, so a
-    /// slow callback (network round-trip, blocking syscall) does not stall
-    /// every other trapped syscall. The container is an opaque box — C
-    /// never sees this field's layout — so adding it is not a C ABI break.
+    /// Terminal deferral skips later handlers; ordinary callbacks suspend
+    /// dispatch and resume the chain on Continue. Both run off the loop.
     pub(super) deferred: bool,
 }
 
@@ -555,16 +552,16 @@ pub unsafe extern "C" fn sandlock_handler_new(
     Box::into_raw(h)
 }
 
-/// Mark a handler as deferred: the supervisor will run its callback off the
-/// notification loop so a slow callback does not block other trapped
-/// syscalls. Must be called before the handler is registered with a run.
+/// Select terminal deferral. All callbacks run off the notification loop;
+/// the default resumes the handler chain after the callback returns Continue.
+/// Must be called before the handler is registered with a run.
 ///
 /// A deferred handler makes a *terminal* decision: deferral short-circuits
 /// the handler chain, so if a deferred handler would `Continue` and other
 /// user handlers are registered on the same syscall, those later handlers do
 /// not run. Builtins always run first regardless. Deferral is refused at
 /// dispatch time for syscalls whose Continue path needs the execve
-/// argv-safety freeze (`execve`/`execveat`) or fork creation-tracking.
+/// argv-safety freeze (`execve`/`execveat`) or fork accounting.
 ///
 /// # Safety
 /// `h` must be a non-null pointer returned by `sandlock_handler_new` that has

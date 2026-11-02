@@ -1,4 +1,5 @@
 pub(crate) mod arch;
+pub mod blocking;
 pub(crate) mod ca_inject;
 #[cfg(feature = "checkpoint")]
 pub(crate) mod checkpoint;

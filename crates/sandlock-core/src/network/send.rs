@@ -20,9 +20,7 @@ use super::unix::{
     mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf, sendto_named_unix_on_behalf,
     sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
 };
-use super::verdict::{
-    check_ip_destination, classify_send_path, path_under_any, DestShape, Destination, SendPath,
-};
+use super::verdict::{check_ip_destination, classify_send_path, DestShape, Destination, SendPath};
 use super::{query_socket_protocol, socket_is_unix, Protocol};
 
 // ============================================================
@@ -110,26 +108,9 @@ pub(super) async fn sendto_on_behalf(
         // sendto to a named socket is a WRITE on its inode, so deny unless the
         // resolved real target is under an fs-write grant.
         match named_unix_socket_path(&addr_bytes) {
-            Some(path) if ctx.policy.supervises_unix_send() => {
-                if ctx.policy.chroot_root.is_some() {
-                    if path_under_any(&path, &ctx.policy.chroot_writable) {
-                        NotifAction::Continue
-                    } else {
-                        NotifAction::Errno(libc::EACCES)
-                    }
-                } else {
-                    sendto_named_unix_on_behalf(
-                        notif,
-                        notif_fd,
-                        sockfd,
-                        buf_ptr,
-                        buf_len,
-                        flags,
-                        &path,
-                        &ctx.policy.chroot_writable,
-                    )
-                }
-            }
+            Some(path) if ctx.policy.supervises_unix_send() => sendto_named_unix_on_behalf(
+                notif, ctx, notif_fd, sockfd, buf_ptr, buf_len, flags, &path,
+            ),
             _ => {
                 // Non-IP destination with no fs-path gate: an abstract unix
                 // address, a named unix address with the fs-gate off, a non-unix
@@ -475,29 +456,9 @@ pub(super) async fn sendmmsg_on_behalf(
             }
         }
         if named_unix {
-            if ctx.policy.chroot_root.is_some() {
-                // Chroot: lexical check; deny the whole call if any named-unix
-                // entry is outside the (virtual) write grants.
-                for i in 0..vlen {
-                    let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
-                    if let Some(path) = mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr) {
-                        if !path_under_any(&path, &ctx.policy.chroot_writable) {
-                            return NotifAction::Errno(libc::EACCES);
-                        }
-                    }
-                }
-                // All granted: fall through to the existing path.
-            } else {
-                return sendmmsg_named_unix_on_behalf(
-                    notif,
-                    notif_fd,
-                    sockfd,
-                    msgvec_ptr,
-                    vlen,
-                    flags,
-                    &ctx.policy.chroot_writable,
-                );
-            }
+            return sendmmsg_named_unix_on_behalf(
+                notif, ctx, notif_fd, sockfd, msgvec_ptr, vlen, flags,
+            );
         }
     }
 

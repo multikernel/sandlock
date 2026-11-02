@@ -17,7 +17,8 @@
 //     them approve a syscall based on user-memory contents.
 
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::ctx::SupervisorCtx;
@@ -76,21 +77,79 @@ pub trait Handler: Send + Sync + 'static {
 pub struct HandlerCtx {
     pub notif: SeccompNotif,
     pub notif_fd: RawFd,
+    listener: Arc<OwnedFd>,
+    active_work: Arc<AtomicUsize>,
     /// The open-family request decoded once for this notification.
     open: Option<Arc<OpenRequest>>,
 }
 
 impl HandlerCtx {
-    pub fn new(notif: SeccompNotif, notif_fd: RawFd) -> Self {
+    pub fn new(notif: SeccompNotif, notif_fd: OwnedFd) -> Self {
+        Self::with_listener(
+            notif,
+            Arc::new(notif_fd),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    fn with_listener(
+        notif: SeccompNotif,
+        listener: Arc<OwnedFd>,
+        open: Option<Arc<OpenRequest>>,
+        active_work: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             notif,
-            notif_fd,
-            open: None,
+            notif_fd: listener.as_raw_fd(),
+            listener,
+            active_work,
+            open,
         }
+    }
+
+    pub fn listener(&self) -> Arc<OwnedFd> {
+        Arc::clone(&self.listener)
+    }
+
+    /// Retain this guard inside native work that can access child memory.
+    /// Exec argument validation requires all such work to have finished.
+    pub fn blocking_guard(&self) -> BlockingGuard {
+        self.active_work.fetch_add(1, Ordering::Relaxed);
+        BlockingGuard(Arc::clone(&self.active_work))
+    }
+
+    fn filesystem(
+        &self,
+        work: impl std::future::Future<Output = NotifAction> + Send + 'static,
+    ) -> NotifAction {
+        let guard = self.blocking_guard();
+        let listener = self.listener();
+        let runtime = tokio::runtime::Handle::current();
+        NotifAction::suspend_filesystem(async move {
+            crate::blocking::filesystem(move || {
+                let _guard = guard;
+                let _listener = listener;
+                // Filesystem handlers await state locks, but perform synchronous I/O.
+                runtime.block_on(work)
+            })
+            .await
+            .unwrap_or_else(|e| NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO)))
+        })
     }
 
     pub(crate) fn open(&self) -> Option<Arc<OpenRequest>> {
         self.open.clone()
+    }
+}
+
+/// Tracks native child-memory access until its worker finishes.
+#[must_use = "retain the guard until native child-memory access finishes"]
+pub struct BlockingGuard(Arc<AtomicUsize>);
+
+impl Drop for BlockingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -246,28 +305,74 @@ impl DispatchTable {
             .push(handler);
     }
 
-    /// Dispatch a notification through the handler chain for its syscall number.
+    /// Dispatch until a handler produces an action or suspends.
     pub(crate) async fn dispatch(
         &self,
         notif: SeccompNotif,
-        notif_fd: RawFd,
+        listener: Arc<OwnedFd>,
         open: Option<Arc<OpenRequest>>,
-    ) -> NotifAction {
-        let nr = notif.data.nr as i64;
-        if let Some(chain) = self.chains.get(&nr) {
-            let handler_ctx = HandlerCtx {
-                notif,
-                notif_fd,
-                open,
-            };
-            for handler in &chain.handlers {
-                let action = handler.handle(&handler_ctx).await;
-                if !matches!(action, NotifAction::Continue) {
-                    return action;
-                }
-            }
+        active_work: Arc<AtomicUsize>,
+    ) -> DispatchState {
+        let handlers = self
+            .chains
+            .get(&(notif.data.nr as i64))
+            .map(|chain| chain.handlers.clone())
+            .unwrap_or_default();
+        DispatchState {
+            action: NotifAction::Continue,
+            handlers: handlers.into_iter(),
+            cx: HandlerCtx::with_listener(notif, listener, open, active_work),
+            deadline: tokio::time::Instant::now() + super::notif::DEFER_TIMEOUT,
         }
-        NotifAction::Continue
+        .advance()
+        .await
+    }
+}
+
+pub(crate) struct DispatchState {
+    action: NotifAction,
+    handlers: std::vec::IntoIter<Arc<dyn Handler>>,
+    cx: HandlerCtx,
+    deadline: tokio::time::Instant,
+}
+
+impl DispatchState {
+    pub(crate) fn pending(&self) -> Option<bool> {
+        match &self.action {
+            NotifAction::Suspend(work) => Some(work.filesystem),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn wait(mut self) -> Self {
+        if let NotifAction::Suspend(work) =
+            std::mem::replace(&mut self.action, NotifAction::Errno(libc::EIO))
+        {
+            self.action = tokio::time::timeout_at(self.deadline, work.run())
+                .await
+                .unwrap_or(NotifAction::Errno(libc::EIO));
+        }
+        self
+    }
+
+    // Only the notification loop advances handlers; they may write child memory.
+    pub(crate) async fn advance(mut self) -> Self {
+        while matches!(self.action, NotifAction::Continue) {
+            let Some(handler) = self.handlers.next() else {
+                break;
+            };
+            self.action = handler.handle(&self.cx).await;
+        }
+        self
+    }
+
+    pub(crate) fn into_action(self) -> NotifAction {
+        match self.action {
+            NotifAction::Defer(work) => {
+                NotifAction::Defer(work.retain_listener(self.cx.listener()))
+            }
+            other => other,
+        }
     }
 }
 
@@ -290,20 +395,6 @@ pub(crate) fn build_dispatch_table(
     pending_handlers: Vec<(i64, std::sync::Arc<dyn Handler>)>,
 ) -> DispatchTable {
     let mut table = DispatchTable::new();
-
-    // ------------------------------------------------------------------
-    // Fork/clone family (always on)
-    // ------------------------------------------------------------------
-    for nr in arch::fork_like_syscalls() {
-        let policy_for_fork = Arc::clone(policy);
-        let ctx_for_fork = Arc::clone(ctx);
-        table.register(nr, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let policy = Arc::clone(&policy_for_fork);
-            let ctx = Arc::clone(&ctx_for_fork);
-            async move { crate::resource::handle_fork(&notif, &ctx, &policy).await }
-        });
-    }
 
     // ------------------------------------------------------------------
     // Process groups (always on)
@@ -814,10 +905,11 @@ fn register_chroot_handlers(
                 let processes = Arc::clone(&processes);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
-                async move {
+                let action = cx.filesystem(async move {
                     let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
-                }
+                });
+                async move { action }
             }
         }};
     }
@@ -837,10 +929,11 @@ fn register_chroot_handlers(
                 let processes = Arc::clone(&processes);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
-                async move {
+                let action = cx.filesystem(async move {
                     let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
-                }
+                });
+                async move { action }
             }
         }};
     }
@@ -1109,7 +1202,11 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
                 let cow_state = Arc::clone(&cow_state);
                 let processes_state = Arc::clone(&processes_state);
                 let notif_fd = cx.notif_fd;
-                async move { $handler(&notif, &cow_state, &processes_state, notif_fd).await }
+                let action = cx.filesystem(async move {
+                    let mut state = cow_state.lock_owned().await;
+                    $handler(&notif, &mut state, &processes_state, notif_fd).await
+                });
+                async move { action }
             }
         }};
     }
@@ -1369,8 +1466,14 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
-            .await;
+            .dispatch(
+                fake_notif(libc::SYS_openat as i32),
+                fake_listener(),
+                None,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await
+            .into_action();
 
         assert!(matches!(action, NotifAction::Continue));
         let recorded = order.lock().unwrap();
@@ -1416,8 +1519,14 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
-            .await;
+            .dispatch(
+                fake_notif(libc::SYS_openat as i32),
+                fake_listener(),
+                None,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await
+            .into_action();
 
         assert!(matches!(action, NotifAction::Continue));
         let recorded = order.lock().unwrap();
@@ -1461,8 +1570,14 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
-            .await;
+            .dispatch(
+                fake_notif(libc::SYS_openat as i32),
+                fake_listener(),
+                None,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await
+            .into_action();
 
         match action {
             NotifAction::Errno(e) => assert_eq!(e, libc::EACCES),
@@ -1473,6 +1588,133 @@ mod handler_tests {
             1,
             "second handler must not run after first returned non-Continue"
         );
+    }
+
+    fn fake_listener() -> Arc<OwnedFd> {
+        Arc::new(std::fs::File::open("/dev/null").unwrap().into())
+    }
+
+    #[tokio::test]
+    async fn native_memory_tracking_does_not_limit_filesystem_admission() {
+        let cx = HandlerCtx::new(
+            fake_notif(libc::SYS_openat as i32),
+            std::fs::File::open("/dev/null").unwrap().into(),
+        );
+        let _stalled: Vec<_> = (0..super::super::notif::DEFER_MAX_INFLIGHT)
+            .map(|_| cx.blocking_guard())
+            .collect();
+        let NotifAction::Suspend(work) = cx.filesystem(async { NotifAction::ReturnValue(42) })
+        else {
+            panic!("filesystem admission depends on unrelated native work");
+        };
+        assert!(matches!(work.run().await, NotifAction::ReturnValue(42)));
+    }
+
+    #[tokio::test]
+    async fn suspended_fork_does_not_reserve_a_process_slot() {
+        let ctx = fake_supervisor_ctx();
+        ctx.resource.lock().await.max_processes = 2;
+        let mut table = build_dispatch_table(&ctx.policy, &ctx.resource, &ctx, Vec::new());
+        table.register(libc::SYS_clone, |_cx: &HandlerCtx| async {
+            NotifAction::suspend(async { NotifAction::Errno(libc::EIO) })
+        });
+        let state = table
+            .dispatch(
+                fake_notif(libc::SYS_clone as i32),
+                fake_listener(),
+                None,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+        assert!(state.pending().is_some());
+        assert_eq!(ctx.resource.lock().await.proc_count, 0);
+        let action = state.wait().await.advance().await.into_action();
+        assert!(matches!(action, NotifAction::Errno(libc::EIO)));
+        assert_eq!(ctx.resource.lock().await.proc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn filesystem_work_retains_state_and_exec_guard_after_waiter_abort() {
+        let cx = HandlerCtx::new(
+            fake_notif(libc::SYS_openat as i32),
+            std::fs::File::open("/dev/null").unwrap().into(),
+        );
+        let state = Arc::new(Mutex::new(0));
+        let work_state = Arc::clone(&state);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let action = cx.filesystem(async move {
+            let mut state = work_state.lock_owned().await;
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            *state = 42;
+            NotifAction::Continue
+        });
+        let NotifAction::Suspend(work) = action else {
+            panic!("expected suspension")
+        };
+        let waiter = tokio::spawn(work.run());
+        started_rx.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(state.try_lock().is_err());
+        assert_eq!(cx.active_work.load(Ordering::Acquire), 1);
+        release_tx.send(()).unwrap();
+        assert_eq!(*state.lock().await, 42);
+        while cx.active_work.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_continue_resumes_remaining_handlers() {
+        let mut table = DispatchTable::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        table.register(libc::SYS_openat, |_cx: &HandlerCtx| async {
+            NotifAction::suspend(async { NotifAction::Continue })
+        });
+        let later_calls = Arc::clone(&calls);
+        table.register(libc::SYS_openat, move |_cx: &HandlerCtx| {
+            later_calls.fetch_add(1, Ordering::SeqCst);
+            async { NotifAction::ReturnValue(42) }
+        });
+        let action = table
+            .dispatch(
+                fake_notif(libc::SYS_openat as i32),
+                fake_listener(),
+                None,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(action.pending().is_some());
+        let state = action.wait().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let action = state.advance().await.into_action();
+        assert!(matches!(action, NotifAction::ReturnValue(42)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn suspended_terminal_action_stops_remaining_handlers() {
+        let mut table = DispatchTable::new();
+        table.register(libc::SYS_openat, |_cx: &HandlerCtx| async {
+            NotifAction::suspend(async { NotifAction::Errno(libc::EACCES) })
+        });
+        table.register(libc::SYS_openat, |_cx: &HandlerCtx| async {
+            panic!("handler ran after a terminal action")
+        });
+        let action = table
+            .dispatch(
+                fake_notif(libc::SYS_openat as i32),
+                fake_listener(),
+                None,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+        assert!(action.pending().is_some());
+        let action = action.wait().await.advance().await.into_action();
+        assert!(matches!(action, NotifAction::Errno(libc::EACCES)));
     }
 
     /// A handler returning `Defer` is non-`Continue`, so it must short-circuit
@@ -1498,8 +1740,14 @@ mod handler_tests {
 
         let _ctx = fake_supervisor_ctx();
         let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
-            .await;
+            .dispatch(
+                fake_notif(libc::SYS_openat as i32),
+                fake_listener(),
+                None,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await
+            .into_action();
 
         assert!(
             matches!(action, NotifAction::Defer(_)),
@@ -1562,7 +1810,7 @@ mod handler_tests {
 
         let _sup = fake_supervisor_ctx();
         let notif = fake_notif(libc::SYS_openat as i32);
-        let cx = HandlerCtx::new(notif, -1);
+        let cx = HandlerCtx::new(notif, std::fs::File::open("/dev/null").unwrap().into());
 
         let action = h.handle(&cx).await;
         assert!(matches!(action, NotifAction::Continue));
@@ -1614,7 +1862,10 @@ mod handler_tests {
         // Walker MUST hit the struct's handle() each time, accumulating
         // state on &self.calls.
         for _ in 0..3 {
-            let action = table.dispatch(notif, -1, None).await;
+            let action = table
+                .dispatch(notif, fake_listener(), None, Arc::new(AtomicUsize::new(0)))
+                .await
+                .into_action();
             assert!(matches!(action, NotifAction::Continue));
         }
 

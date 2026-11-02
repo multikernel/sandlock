@@ -17,7 +17,7 @@ use super::materialize::{
 };
 use super::query_socket_protocol;
 use super::unix::connect_named_unix_on_behalf;
-use super::verdict::{classify_destination, path_under_any, Destination};
+use super::verdict::{classify_destination, Destination};
 
 // ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
@@ -101,7 +101,7 @@ pub(super) async fn connect_on_behalf(
         };
 
         let metadata_addr = addr_bytes.clone();
-        NotifAction::prepare(&metadata_addr, dup_fd.as_raw_fd(), move || {
+        NotifAction::prepare_blocking(&metadata_addr, dup_fd.as_raw_fd(), move || {
             // Record the original destination before connect so the proxy
             // cannot receive the connection before its mapping is available.
             if plan.record_orig_dest {
@@ -126,28 +126,11 @@ pub(super) async fn connect_on_behalf(
         // never return Continue on the deny path, so it is TOCTOU-safe.
         // Abstract sockets (no path) are handled by the Landlock abstract scope.
         match named_unix_socket_path(&addr_bytes) {
+            // Resolve the symlink-followed target and connect on-behalf to
+            // the pinned inode, so a symlink inside a granted dir cannot
+            // redirect to an ungranted socket.
             Some(path) if ctx.policy.supervises_unix_connect() => {
-                if ctx.policy.chroot_root.is_some() {
-                    // Chroot mode: the child's paths are virtual, so a lexical
-                    // check against the (virtual) write grants is consistent,
-                    // and host socket paths are absent from the chroot view
-                    // anyway. Deny unless under a write grant.
-                    if path_under_any(&path, &ctx.policy.chroot_writable) {
-                        NotifAction::Continue
-                    } else {
-                        NotifAction::Errno(libc::EACCES)
-                    }
-                } else {
-                    // Non-chroot: resolve the symlink-followed real target and
-                    // connect on-behalf to the pinned inode, so a symlink inside
-                    // a granted dir cannot redirect to an ungranted socket.
-                    connect_named_unix_on_behalf(
-                        notif.pid,
-                        sockfd,
-                        &path,
-                        &ctx.policy.chroot_writable,
-                    )
-                }
+                connect_named_unix_on_behalf(notif, ctx, sockfd, &path)
             }
             // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
             _ => NotifAction::Continue,

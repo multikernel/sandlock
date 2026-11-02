@@ -19,8 +19,10 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
@@ -877,10 +879,41 @@ static int cmd_fexecve(int argc, char **argv) {
     return 1;
 }
 
+/* ── unix-send (deliver a payload to a named unix socket) ───── */
+/*
+ * unix-send stream|dgram <dir> <path> <payload>: chdir(<dir>) so a relative
+ * <path> has a cwd to resolve against, then connect+send (stream) or sendto
+ * (dgram) <payload>.
+ */
+static int cmd_unix_send(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "unix-send: need stream|dgram <dir> <path> <payload>\n"); return 1; }
+    int dgram = strcmp(argv[0], "dgram") == 0;
+    if (chdir(argv[1]) != 0) { fprintf(stderr, "unix-send: chdir %s: %s\n", argv[1], strerror(errno)); return 1; }
+    struct sockaddr_un sun = { .sun_family = AF_UNIX };
+    strncpy(sun.sun_path, argv[2], sizeof(sun.sun_path) - 1);
+    int s = socket(AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
+    if (s < 0) { fprintf(stderr, "unix-send: socket: %s\n", strerror(errno)); return 1; }
+    size_t len = strlen(argv[3]);
+    ssize_t n;
+    if (dgram) {
+        n = sendto(s, argv[3], len, 0, (struct sockaddr *)&sun, sizeof(sun));
+    } else {
+        if (connect(s, (struct sockaddr *)&sun, sizeof(sun)) != 0) {
+            fprintf(stderr, "unix-send: connect %s: %s\n", argv[2], strerror(errno));
+            return 1;
+        }
+        n = send(s, argv[3], len, 0);
+    }
+    if (n != (ssize_t)len) { fprintf(stderr, "unix-send: send %s: %s\n", argv[2], strerror(errno)); return 1; }
+    close(s);
+    return 0;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
+    if (strcmp(cmd, "unix-send") == 0)      return cmd_unix_send(argc, argv);
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);

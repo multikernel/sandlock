@@ -140,16 +140,6 @@ pub(crate) fn real_path_under_any(real: &std::path::Path, grants: &[crate::grant
     })
 }
 
-/// True if `path`, lexically normalized (`.`/`..` resolved without touching the
-/// filesystem), is at or under any of the granted `prefixes`. Mirrors the
-/// prefix matching the chroot fs enforcement uses.
-pub(crate) fn path_under_any(path: &std::path::Path, grants: &[crate::grant::Grant]) -> bool {
-    let norm = crate::chroot::resolve::confine(&path.to_string_lossy());
-    grants
-        .iter()
-        .any(|grant| grant.covers(std::path::Path::new(&norm)))
-}
-
 /// The shape of a non-IP destination sockaddr, keyed on its ADDRESS FAMILY
 /// first. Produced by `materialize::classify_dest_shape` from the copied
 /// address bytes.
