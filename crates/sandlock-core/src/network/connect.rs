@@ -101,7 +101,7 @@ pub(super) async fn connect_on_behalf(
         };
 
         let metadata_addr = addr_bytes.clone();
-        NotifAction::prepare(&metadata_addr, dup_fd.as_raw_fd(), move || {
+        NotifAction::prepare_blocking(&metadata_addr, dup_fd.as_raw_fd(), move || {
             // Record the original destination before connect so the proxy
             // cannot receive the connection before its mapping is available.
             if plan.record_orig_dest {

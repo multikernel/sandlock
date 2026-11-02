@@ -132,7 +132,7 @@ pub(super) fn connect_named_unix_on_behalf(
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
     let addr = sockaddr_un_bytes(&sun, len);
-    NotifAction::prepare(&addr.clone(), dup_fd.as_raw_fd(), move || {
+    NotifAction::prepare_blocking(&addr.clone(), dup_fd.as_raw_fd(), move || {
         let _pinned = pinned;
         let ret = unsafe {
             libc::connect(
