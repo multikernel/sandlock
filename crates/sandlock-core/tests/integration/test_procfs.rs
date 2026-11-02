@@ -184,7 +184,6 @@ async fn test_sysinfo_virtualization() {
         .fs_read("/etc")
         .fs_read("/proc")
         .max_memory(ByteSize::mib(256))
-        .time_start(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(961027200))
         .build()
         .unwrap();
 
@@ -202,6 +201,7 @@ async fn test_sysinfo_virtualization() {
         "print('total', si.totalram * si.mem_unit)\n",
         "print('swap', si.totalswap)\n",
         "print('uptime', si.uptime)\n",
+        "print('procuptime', int(float(open('/proc/uptime').read().split()[0])))\n",
         "print('procs', si.procs)\n",
         "print('phys', os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))\n",
     );
@@ -222,6 +222,10 @@ async fn test_sysinfo_virtualization() {
     assert_eq!(field("phys"), 256 << 20);
     assert_eq!(field("swap"), 0);
     assert!(field("uptime") < 120, "host uptime leaked: {stdout}");
+    assert!(
+        field("procuptime") < 120,
+        "host /proc/uptime leaked: {stdout}"
+    );
     let procs = field("procs");
     assert!(
         (1..100).contains(&procs),

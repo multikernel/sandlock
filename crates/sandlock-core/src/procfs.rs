@@ -173,7 +173,7 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
             VirtualFile::CpuList
         }
         "/proc/meminfo" if policy.max_memory_bytes > 0 => VirtualFile::MemInfo,
-        "/proc/uptime" if policy.has_time_start => VirtualFile::Uptime,
+        "/proc/uptime" => VirtualFile::Uptime,
         "/proc/loadavg" => VirtualFile::LoadAvg,
         "/proc/mounts" | "/proc/self/mounts" => VirtualFile::Mounts,
         "/proc/self/mountinfo" => VirtualFile::MountInfo,
@@ -375,7 +375,6 @@ pub(crate) fn generate_cpuinfo(num_cpus: u32) -> Vec<u8> {
 
 /// Generate /proc/uptime showing virtual uptime since sandbox start.
 /// Format: "<uptime_secs> <idle_secs>\n"
-/// When time_start is set, uptime starts at 0 and ticks forward from sandbox creation.
 pub(crate) fn generate_uptime(elapsed_secs: f64) -> Vec<u8> {
     // idle time is reported as 0 — the sandbox has no meaningful idle metric.
     format!("{:.2} 0.00\n", elapsed_secs.max(0.0)).into_bytes()
@@ -1085,7 +1084,7 @@ struct SysinfoView {
     procs: usize,
     /// `(total, used)` bytes when a memory limit is set.
     memory: Option<(u64, u64)>,
-    uptime_secs: Option<f64>,
+    uptime_secs: f64,
 }
 
 const SI_LOAD_SHIFT: u32 = 16;
@@ -1112,9 +1111,7 @@ fn patch_sysinfo(info: &mut libc::sysinfo, view: &SysinfoView) {
         info.totalhigh = 0;
         info.freehigh = 0;
     }
-    if let Some(secs) = view.uptime_secs {
-        info.uptime = secs.max(0.0).ceil() as _;
-    }
+    info.uptime = view.uptime_secs.max(0.0).ceil() as _;
 }
 
 /// Handle sysinfo(): agree with the virtual /proc/loadavg, /proc/meminfo and
@@ -1143,9 +1140,7 @@ pub(crate) async fn handle_sysinfo(
             loads: [rs.load_avg.avg_1, rs.load_avg.avg_5, rs.load_avg.avg_15],
             procs,
             memory: (policy.max_memory_bytes > 0).then(|| (policy.max_memory_bytes, rs.mem_used)),
-            uptime_secs: policy
-                .has_time_start
-                .then(|| rs.start_instant.elapsed().as_secs_f64()),
+            uptime_secs: rs.start_instant.elapsed().as_secs_f64(),
         }
     };
     patch_sysinfo(&mut info, &view);
@@ -2022,7 +2017,7 @@ mod tests {
                 loads: [1.5, 0.25, 0.0],
                 procs: 3,
                 memory: Some((256 << 20, 56 << 20)),
-                uptime_secs: Some(41.2),
+                uptime_secs: 41.2,
             },
         );
 
@@ -2040,7 +2035,6 @@ mod tests {
     #[test]
     fn test_patch_sysinfo_keeps_unvirtualized_fields() {
         let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
-        info.uptime = 1234;
         info.totalram = 64;
         info.mem_unit = 4096;
         patch_sysinfo(
@@ -2050,7 +2044,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(info.uptime, 1234);
         assert_eq!((info.totalram, info.mem_unit), (64, 4096));
         assert_eq!(info.procs, u16::MAX);
     }
