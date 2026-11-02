@@ -104,6 +104,7 @@ fn block_on_run(
     handlers: Vec<(i64, FfiHandler)>,
     interactive: bool,
 ) -> Option<Result<RunResult, SandlockError>> {
+    let _callback_guards: Vec<_> = handlers.iter().map(|(_, h)| h.run_guard()).collect();
     let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
     // Apply `name` via the builder method on a clone — mirrors the
     // pattern used by `sandlock_run` in lib.rs. A `None` here means

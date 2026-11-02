@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sandlock_core::seccomp::dispatch::{Handler, HandlerCtx};
 use sandlock_core::seccomp::notif::NotifAction;
@@ -45,7 +45,29 @@ pub(crate) const UNSAFE_PGID: i32 = i32::MIN;
 /// `Handler`. Constructed when the supervisor accepts handlers passed
 /// through `sandlock_run_with_handlers`.
 pub struct FfiHandler {
-    inner: Arc<sandlock_handler_t>,
+    inner: Arc<CallbackState>,
+    on_exception: sandlock_exception_policy_t,
+    deferred: bool,
+}
+
+struct CallbackState {
+    handler: RwLock<Option<Box<sandlock_handler_t>>>,
+}
+
+pub(super) struct CallbackRunGuard(Arc<CallbackState>);
+
+impl Drop for CallbackRunGuard {
+    fn drop(&mut self) {
+        // Userdata may be borrowed until the FFI run returns. Drain readers
+        // and remove the callback so queued work cannot borrow it afterward.
+        let handler = self
+            .0
+            .handler
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop(handler);
+    }
 }
 
 impl FfiHandler {
@@ -58,13 +80,22 @@ impl FfiHandler {
     /// supervisor owns the container.
     pub unsafe fn from_raw(raw: *mut sandlock_handler_t) -> Self {
         assert!(!raw.is_null(), "FfiHandler::from_raw on null pointer");
+        let handler = Box::from_raw(raw);
         Self {
-            inner: Arc::from(Box::from_raw(raw)),
+            on_exception: handler.on_exception,
+            deferred: handler.deferred,
+            inner: Arc::new(CallbackState {
+                handler: RwLock::new(Some(handler)),
+            }),
         }
     }
 
+    pub(super) fn run_guard(&self) -> CallbackRunGuard {
+        CallbackRunGuard(Arc::clone(&self.inner))
+    }
+
     fn exception_action(&self, child_pgid: i32) -> NotifAction {
-        match self.inner.on_exception {
+        match self.on_exception {
             sandlock_exception_policy_t::Kill => {
                 if child_pgid == UNSAFE_PGID {
                     // No safe pgid is available (nested PID namespace,
@@ -148,12 +179,16 @@ impl Handler for FfiHandler {
         };
         let handler = Arc::clone(&self.inner);
         let on_exception_fallback = self.exception_action(child_pgid);
-        let deferred = self.inner.deferred;
+        let deferred = self.deferred;
         let work_guard = cx.blocking_guard();
 
         let run = async move {
             sandlock_core::blocking::run(move || {
                 let _work_guard = work_guard;
+                let callback = handler.handler.read().unwrap_or_else(|e| e.into_inner());
+                let Some(handler) = callback.as_ref() else {
+                    return NotifAction::Errno(libc::EIO);
+                };
                 let mut mem = sandlock_mem_handle_t::new(listener.as_raw_fd(), notif_id, pid);
                 let mut out = sandlock_action_out_t::zeroed();
                 let rc_or_panic = match handler.handler_fn {
@@ -328,4 +363,135 @@ fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<Noti
         }
     };
     Some(action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use super::super::abi::{sandlock_action_set_return_value, sandlock_handler_new};
+    use sandlock_core::{SeccompData, SeccompNotif};
+
+    fn context() -> HandlerCtx {
+        HandlerCtx::new(
+            SeccompNotif {
+                id: 1,
+                pid: 0,
+                flags: 0,
+                data: SeccompData {
+                    nr: libc::SYS_getpid as i32,
+                    arch: 0,
+                    instruction_pointer: 0,
+                    args: [0; 6],
+                },
+            },
+            std::fs::File::open("/dev/null").unwrap().into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn run_guard_waits_for_abandoned_callback_using_borrowed_data() {
+        struct State {
+            started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            finished: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+        extern "C-unwind" fn callback(
+            ud: *mut std::ffi::c_void,
+            _: *const crate::notif_repr::sandlock_notif_data_t,
+            _: *mut sandlock_mem_handle_t,
+            out: *mut sandlock_action_out_t,
+        ) -> i32 {
+            let state = unsafe { &*ud.cast::<State>() };
+            let _ = state.started.lock().unwrap().take().unwrap().send(());
+            let _ = state.release.lock().unwrap().recv();
+            let finished = state.finished.lock().unwrap().take().unwrap();
+            unsafe { sandlock_action_set_return_value(out, 42) };
+            let _ = finished.send(());
+            0
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let state = Box::new(State {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+            finished: Mutex::new(Some(finished_tx)),
+        });
+        let raw = unsafe {
+            sandlock_handler_new(
+                Some(callback),
+                (&*state as *const State).cast_mut().cast(),
+                None,
+                sandlock_exception_policy_t::DenyEio as u32,
+            )
+        };
+        let handler = unsafe { FfiHandler::from_raw(raw) };
+        let run_guard = handler.run_guard();
+        let cx = context();
+        let NotifAction::Suspend(work) = handler.handle(&cx).await else {
+            panic!("expected suspension");
+        };
+        let waiter = tokio::spawn(work.run());
+        started_rx.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        drop(handler);
+
+        let (draining_tx, draining_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let drain = std::thread::spawn(move || {
+            let _ = draining_tx.send(());
+            drop(run_guard);
+            let _ = done_tx.send(());
+        });
+        draining_rx.await.unwrap();
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), &mut done_rx)
+            .await
+            .is_err();
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        drain.join().unwrap();
+        assert!(
+            waited,
+            "run returned while the callback could still access userdata"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_guard_releases_userdata_and_rejects_unstarted_callbacks() {
+        extern "C-unwind" fn callback(
+            _: *mut std::ffi::c_void,
+            _: *const crate::notif_repr::sandlock_notif_data_t,
+            _: *mut sandlock_mem_handle_t,
+            _: *mut sandlock_action_out_t,
+        ) -> i32 {
+            panic!("callback started after its run ended");
+        }
+        extern "C-unwind" fn destroy(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<AtomicBool>() }.store(true, Ordering::Release);
+        }
+
+        let dropped = Box::new(AtomicBool::new(false));
+        let raw = unsafe {
+            sandlock_handler_new(
+                Some(callback),
+                (&*dropped as *const AtomicBool).cast_mut().cast(),
+                Some(destroy),
+                sandlock_exception_policy_t::Continue as u32,
+            )
+        };
+        let handler = unsafe { FfiHandler::from_raw(raw) };
+        let run_guard = handler.run_guard();
+        let cx = context();
+        let NotifAction::Suspend(work) = handler.handle(&cx).await else {
+            panic!("expected suspension");
+        };
+        drop(run_guard);
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(matches!(work.run().await, NotifAction::Errno(libc::EIO)));
+    }
 }

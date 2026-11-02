@@ -506,6 +506,8 @@ impl Drop for sandlock_handler_t {
 /// remains valid until either (a) `sandlock_handler_free` is called or
 /// (b) the supervisor takes ownership via `sandlock_run_with_handlers`
 /// and the run completes.
+/// The run waits for active callbacks before returning, even after a syscall
+/// timeout or child exit. A callback that never returns prevents run completion.
 /// If `on_exception` does not match a defined `sandlock_exception_policy_t`
 /// discriminant (0, 1, 2, or 3), the call returns null and no allocation occurs.
 // The two callback parameters are spelled inline rather than via the
