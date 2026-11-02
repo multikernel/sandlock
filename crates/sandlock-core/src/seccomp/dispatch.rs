@@ -119,6 +119,28 @@ impl HandlerCtx {
             .map_err(|_| std::io::Error::from_raw_os_error(libc::EAGAIN))
     }
 
+    fn filesystem(
+        &self,
+        work: impl std::future::Future<Output = NotifAction> + Send + 'static,
+    ) -> NotifAction {
+        let guard = match self.blocking_guard() {
+            Ok(guard) => guard,
+            Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO)),
+        };
+        let listener = self.listener();
+        let runtime = tokio::runtime::Handle::current();
+        NotifAction::suspend(async move {
+            crate::blocking::filesystem(move || {
+                let _guard = guard;
+                let _listener = listener;
+                // Filesystem handlers await state locks, but perform synchronous I/O.
+                runtime.block_on(work)
+            })
+            .await
+            .unwrap_or_else(|e| NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO)))
+        })
+    }
+
     pub(crate) fn open(&self) -> Option<Arc<OpenRequest>> {
         self.open.clone()
     }
@@ -864,10 +886,11 @@ fn register_chroot_handlers(
                 let processes = Arc::clone(&processes);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
-                async move {
+                let action = cx.filesystem(async move {
                     let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
-                }
+                });
+                async move { action }
             }
         }};
     }
@@ -887,10 +910,11 @@ fn register_chroot_handlers(
                 let processes = Arc::clone(&processes);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
-                async move {
+                let action = cx.filesystem(async move {
                     let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
-                }
+                });
+                async move { action }
             }
         }};
     }
@@ -1159,7 +1183,11 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
                 let cow_state = Arc::clone(&cow_state);
                 let processes_state = Arc::clone(&processes_state);
                 let notif_fd = cx.notif_fd;
-                async move { $handler(&notif, &cow_state, &processes_state, notif_fd).await }
+                let action = cx.filesystem(async move {
+                    let mut state = cow_state.lock_owned().await;
+                    $handler(&notif, &mut state, &processes_state, notif_fd).await
+                });
+                async move { action }
             }
         }};
     }
@@ -1542,6 +1570,42 @@ mod handler_tests {
 
     fn fake_listener() -> Arc<OwnedFd> {
         Arc::new(std::fs::File::open("/dev/null").unwrap().into())
+    }
+
+    #[tokio::test]
+    async fn filesystem_work_retains_state_and_exec_guard_after_waiter_abort() {
+        let cx = HandlerCtx::new(
+            fake_notif(libc::SYS_openat as i32),
+            std::fs::File::open("/dev/null").unwrap().into(),
+        );
+        let state = Arc::new(Mutex::new(0));
+        let work_state = Arc::clone(&state);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let action = cx.filesystem(async move {
+            let mut state = work_state.lock_owned().await;
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            *state = 42;
+            NotifAction::Continue
+        });
+        let NotifAction::Suspend(work) = action else {
+            panic!("expected suspension")
+        };
+        let waiter = tokio::spawn(work.run());
+        started_rx.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(state.try_lock().is_err());
+        assert!(Arc::clone(&cx.active_work)
+            .try_acquire_many_owned(super::super::notif::DEFER_MAX_INFLIGHT as u32)
+            .is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(*state.lock().await, 42);
+        let _quiescent = Arc::clone(&cx.active_work)
+            .acquire_many_owned(super::super::notif::DEFER_MAX_INFLIGHT as u32)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

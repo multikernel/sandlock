@@ -206,7 +206,7 @@ fn resolve_working_dir(rootfs: &Path, dir: &str) -> Result<String, SandlockError
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, SandlockError> + Send + 'static,
 ) -> Result<T, SandlockError> {
-    tokio::task::spawn_blocking(f)
+    crate::blocking::filesystem(f)
         .await
         .map_err(|e| SandboxRuntimeError::Child(format!("image task failed: {e}")))?
 }

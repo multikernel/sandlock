@@ -1247,7 +1247,7 @@ impl SeccompCowBranch {
     }
 
     /// Execute a file copy synchronously. Used by `ensure_cow_copy` and the
-    /// async dispatch (via `spawn_blocking`).
+    /// filesystem dispatch worker.
     pub fn execute_copy(
         workdir_root: &Path,
         upper_root: &Path,

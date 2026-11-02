@@ -28,7 +28,6 @@ use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::arch;
@@ -200,7 +199,7 @@ pub(crate) fn open_confined(
 /// Handle open/openat/openat2 under workdir: redirect to COW upper/lower.
 pub(crate) async fn handle_cow_open(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -222,9 +221,9 @@ pub(crate) async fn handle_cow_open(
     };
     let mut path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
-    // Phase 1: determine plan under lock (no heavy I/O)
+    // Keep preparation, copy and bookkeeping under the same owned state guard.
     let (plan, upper_root, workdir_root) = {
-        let mut st = cow_state.lock().await;
+        let st = &mut *cow_state;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -253,9 +252,8 @@ pub(crate) async fn handle_cow_open(
         };
         (plan, upper_root, workdir_root)
     };
-    // Lock is released here
 
-    // Phase 2: execute I/O plan without holding the lock
+    // Execute the copy before exposing the upper file to another handler.
     let real_path = match plan {
         CowOpenPlan::Skip => return NotifAction::Continue,
         // Deleted in this branch (whiteout): the lower file still exists, so
@@ -268,41 +266,22 @@ pub(crate) async fn handle_cow_open(
             lower: _lower,
             file_size,
             rel_path,
-        } => {
-            // Do the potentially-expensive copy on a blocking thread
-            let root = workdir_root.clone();
-            let uroot = upper_root.clone();
-            let rel = rel_path.clone();
-            let copy_result = tokio::task::spawn_blocking(move || {
-                crate::cow::seccomp::SeccompCowBranch::execute_copy(&root, &uroot, &rel)
-            })
-            .await;
-
-            match copy_result {
-                Ok(Ok(digest)) => {
-                    if let Some(d) = digest {
-                        let mut st = cow_state.lock().await;
-                        if let Some(cow) = st.branch.as_mut() {
-                            cow.record_digest(&rel_path, d);
-                        }
+        } => match SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel_path) {
+            Ok(digest) => {
+                if let Some(d) = digest {
+                    if let Some(cow) = cow_state.branch.as_mut() {
+                        cow.record_digest(&rel_path, d);
                     }
-                    upper
                 }
-                Ok(Err(_)) | Err(_) => {
-                    // Continuing would let the kernel open the lower file
-                    // itself, so a write would land outside the branch.
-                    let mut st = cow_state.lock().await;
-                    if let Some(cow) = st.branch.as_mut() {
-                        cow.rollback_copy(file_size);
-                    }
-                    let errno = match copy_result {
-                        Ok(Err(e)) => e.raw_os_error().unwrap_or(libc::EIO),
-                        _ => libc::EIO,
-                    };
-                    return NotifAction::Errno(errno);
-                }
+                upper
             }
-        }
+            Err(e) => {
+                if let Some(cow) = cow_state.branch.as_mut() {
+                    cow.rollback_copy(file_size);
+                }
+                return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+        },
     };
 
     // Phase 3: open the resolved path and inject fd
@@ -617,34 +596,27 @@ fn cow_copy_rel<'a>(
     cow.safe_rel(copy_path).map(|rel| (match_path, rel))
 }
 
-/// Execute a deferred `CowCopyPlan::NeedsCopy` on a blocking thread.
+/// Execute a copy plan on the filesystem worker.
 /// Returns the upper path on success, or rolls back quota on failure.
 async fn execute_deferred_copy(
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     workdir_root: std::path::PathBuf,
     upper_root: std::path::PathBuf,
     rel: String,
     upper: std::path::PathBuf,
     file_size: u64,
 ) -> Option<std::path::PathBuf> {
-    let rel_path = rel.clone();
-    let copy_result = tokio::task::spawn_blocking(move || {
-        crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel)
-    })
-    .await;
-    match copy_result {
-        Ok(Ok(digest)) => {
+    match SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel) {
+        Ok(digest) => {
             if let Some(d) = digest {
-                let mut st = cow_state.lock().await;
-                if let Some(cow) = st.branch.as_mut() {
-                    cow.record_digest(&rel_path, d);
+                if let Some(cow) = cow_state.branch.as_mut() {
+                    cow.record_digest(&rel, d);
                 }
             }
             Some(upper)
         }
-        _ => {
-            let mut st = cow_state.lock().await;
-            if let Some(cow) = st.branch.as_mut() {
+        Err(_) => {
+            if let Some(cow) = cow_state.branch.as_mut() {
                 cow.rollback_copy(file_size);
             }
             None
@@ -655,14 +627,11 @@ async fn execute_deferred_copy(
 /// Handle all write-type syscalls: both *at variants (unlinkat, mkdirat, etc.)
 /// and legacy variants (unlink, rmdir, mkdir, etc.).
 ///
-/// For operations that modify existing files (chmod, chown, rename, link,
-/// truncate), the handler uses a two-phase pattern: prepare the copy plan
-/// under the lock, execute the potentially expensive file copy outside the
-/// lock, then re-acquire the lock and run the actual operation (which finds
-/// the file already in upper).
+/// The worker owns COW state through preparation, copying and mutation so
+/// another handler or branch finalization cannot observe a partial copy.
 pub(crate) async fn handle_cow_write(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -672,10 +641,9 @@ pub(crate) async fn handle_cow_write(
         None => return NotifAction::Continue,
     };
 
-    // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O).
-    // Capture both layer roots here so Phase 2 needs no second lock.
+    // Pre-copy existing data before applying the mutation.
     let (copy_plan, copy_workdir, copy_upper, copy_rel) = {
-        let mut st = cow_state.lock().await;
+        let st = &mut *cow_state;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -712,9 +680,8 @@ pub(crate) async fn handle_cow_write(
             ),
         }
     };
-    // Lock is released here
 
-    // Phase 2: execute the file copy outside the lock (if needed)
+    // Execute the copy before mutating the staged file.
     if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy {
         upper,
         lower: _lower,
@@ -732,13 +699,12 @@ pub(crate) async fn handle_cow_write(
         .await
         .is_none()
         {
-            return NotifAction::Continue;
+            return NotifAction::Errno(libc::EIO);
         }
     }
 
-    // Phase 3: execute the operation under lock (ensure_cow_copy is now a no-op
-    // for the pre-copied file since it's already in upper)
-    let mut st = cow_state.lock().await;
+    // ensure_cow_copy is now a no-op for the staged file.
+    let st = &mut *cow_state;
     let cow = match st.branch.as_mut() {
         Some(c) => c,
         None => return NotifAction::Continue,
@@ -842,7 +808,7 @@ pub(crate) async fn handle_cow_write(
 /// don't fail before the COW layer can redirect their writes.
 pub(crate) async fn handle_cow_access(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -876,7 +842,7 @@ pub(crate) async fn handle_cow_access(
         return NotifAction::Continue;
     }
 
-    let st = cow_state.lock().await;
+    let st = &*cow_state;
     let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
@@ -905,7 +871,7 @@ pub(crate) async fn handle_cow_access(
 /// utimensat(dirfd, pathname, times, flags)
 pub(crate) async fn handle_cow_utimensat(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -925,7 +891,7 @@ pub(crate) async fn handle_cow_utimensat(
     };
 
     let (upper_path, upper_root, workdir_root) = {
-        let mut st = cow_state.lock().await;
+        let st = &mut *cow_state;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -987,7 +953,7 @@ pub(crate) async fn handle_cow_utimensat(
 /// Actually, simpler: for stat, we do the stat ourselves and write the result.
 pub(crate) async fn handle_cow_stat(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -1019,7 +985,7 @@ pub(crate) async fn handle_cow_stat(
     };
 
     let (real_path, upper_root, workdir_root) = {
-        let st = cow_state.lock().await;
+        let st = &*cow_state;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -1098,7 +1064,7 @@ pub(crate) async fn handle_cow_stat(
 /// statx the resolved path in the supervisor and write the buffer back.
 pub(crate) async fn handle_cow_statx(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -1123,7 +1089,7 @@ pub(crate) async fn handle_cow_statx(
     };
 
     let (real_path, upper_root, workdir_root) = {
-        let st = cow_state.lock().await;
+        let st = &*cow_state;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -1172,7 +1138,7 @@ pub(crate) async fn handle_cow_statx(
 /// them alone.
 pub(crate) async fn handle_cow_exec(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -1208,7 +1174,7 @@ pub(crate) async fn handle_cow_exec(
     let resolved = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
     let (upper_path, upper_root, workdir_root) = {
-        let st = cow_state.lock().await;
+        let st = &*cow_state;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -1282,7 +1248,7 @@ pub(crate) async fn handle_cow_exec(
 /// Handle readlinkat — read symlink from upper/lower, write to child buffer.
 pub(crate) async fn handle_cow_readlink(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -1296,7 +1262,7 @@ pub(crate) async fn handle_cow_readlink(
     let buf_addr = notif.data.args[2];
     let bufsiz = (notif.data.args[3] & 0xFFFFFFFF) as usize;
 
-    let st = cow_state.lock().await;
+    let st = &*cow_state;
     let cow = match st.branch.as_ref() {
         Some(c) => c,
         None => return NotifAction::Continue,
@@ -1311,8 +1277,6 @@ pub(crate) async fn handle_cow_readlink(
         Some(t) => t,
         None => return NotifAction::Errno(libc::ENOENT),
     };
-    drop(st);
-
     let target_bytes = target.as_bytes();
     let write_len = target_bytes.len().min(bufsiz);
 
@@ -1334,7 +1298,7 @@ pub(crate) async fn handle_cow_readlink(
 /// Handle getdents64 for COW directories — merge upper + lower entries.
 pub(crate) async fn handle_cow_getdents(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -1356,10 +1320,9 @@ pub(crate) async fn handle_cow_getdents(
         return NotifAction::Continue;
     }
 
-    // Compute rel_path under the global COW lock, but do not hold it
-    // across the per-process lock acquired below.
+    // COW handlers acquire branch state before per-process state.
     let rel_path = {
-        let st = cow_state.lock().await;
+        let st = &*cow_state;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -1403,7 +1366,7 @@ pub(crate) async fn handle_cow_getdents(
     // Build cache on first call.
     if !perproc.cow_dir_cache.contains_key(&child_fd) {
         let entries = {
-            let st = cow_state.lock().await;
+            let st = &*cow_state;
             let cow = match st.branch.as_ref() {
                 Some(c) => c,
                 None => return NotifAction::Continue,
@@ -1481,7 +1444,7 @@ pub(crate) async fn handle_cow_getdents(
 /// the path arg to /proc/self/fd/N so the kernel chdir succeeds.
 pub(crate) async fn handle_cow_chdir(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -1497,7 +1460,7 @@ pub(crate) async fn handle_cow_chdir(
         resolve_at_path_with_virtual(notif, libc::AT_FDCWD as i64, &path, virtual_cwd.as_deref());
 
     let (abs_path, upper_path, upper_root, workdir_root) = {
-        let st = cow_state.lock().await;
+        let st = &*cow_state;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
@@ -1592,7 +1555,7 @@ pub(crate) async fn handle_cow_chdir(
 /// Handle getcwd after chdir into a COW-only directory.
 pub(crate) async fn handle_cow_getcwd(
     notif: &SeccompNotif,
-    cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &mut CowState,
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
@@ -1603,7 +1566,7 @@ pub(crate) async fn handle_cow_getcwd(
     let virtual_cwd = if let Some(cwd) = cached_virtual_cwd {
         cwd
     } else {
-        let st = cow_state.lock().await;
+        let st = &*cow_state;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
