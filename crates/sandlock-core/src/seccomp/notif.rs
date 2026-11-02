@@ -175,6 +175,14 @@ pub enum NotifAction {
 }
 
 impl NotifAction {
+    pub(crate) fn prepare_blocking(
+        addr: &[u8],
+        socket: RawFd,
+        execute: impl FnOnce() -> NotifAction + Send + Sync + 'static,
+    ) -> Self {
+        Self::prepare(addr, socket, move || Self::blocking(execute))
+    }
+
     pub(crate) fn prepare(
         addr: &[u8],
         socket: RawFd,
@@ -210,6 +218,16 @@ impl NotifAction {
     /// shorthand for `NotifAction::Defer(Deferred::new(fut))`.
     pub fn defer<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
         NotifAction::Defer(Deferred::new(fut))
+    }
+
+    /// Defer owned synchronous work with admission held until the work returns.
+    pub fn blocking(work: impl FnOnce() -> NotifAction + Send + 'static) -> Self {
+        Self::defer(async move {
+            match crate::blocking::run(work).await {
+                Ok(action) => action,
+                Err(e) => Self::Errno(e.raw_os_error().unwrap_or(libc::EIO)),
+            }
+        })
     }
 
     /// Inject `content` into the child as the syscall's returned fd, backed by
@@ -3812,6 +3830,37 @@ mod tests {
             panic!("defer() must construct a NotifAction::Defer");
         };
         assert!(matches!(deferred.run().await, NotifAction::ReturnValue(7)));
+    }
+
+    #[tokio::test]
+    async fn prepared_blocking_work_starts_only_when_admitted() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let work_ran = Arc::clone(&ran);
+        let action = NotifAction::prepare_blocking(&[], -1, move || {
+            work_ran.store(true, Ordering::SeqCst);
+            NotifAction::ReturnValue(7)
+        });
+        let NotifAction::Prepared(operation) = action else {
+            panic!("expected prepared operation");
+        };
+        let action = operation.execute();
+        assert!(!ran.load(Ordering::SeqCst));
+        let NotifAction::Defer(deferred) = action else {
+            panic!("expected deferred work");
+        };
+        assert!(matches!(deferred.run().await, NotifAction::ReturnValue(7)));
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rejected_blocking_work_never_starts() {
+        let action = NotifAction::prepare_blocking(&[], -1, || {
+            panic!("denied operation executed");
+        });
+        drop(action);
+        let action = NotifAction::blocking(|| panic!("unadmitted operation executed"));
+        drop(action);
     }
 
     #[tokio::test(start_paused = true)]
