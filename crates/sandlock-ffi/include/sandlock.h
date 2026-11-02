@@ -1862,7 +1862,7 @@ sandlock_handler_t *sandlock_handler_new(int32_t (*handler_fn)(void *ud,
  * user handlers are registered on the same syscall, those later handlers do
  * not run. Builtins always run first regardless. Deferral is refused at
  * dispatch time for syscalls whose Continue path needs the execve
- * argv-safety freeze (`execve`/`execveat`) or fork creation-tracking.
+ * argv-safety freeze (`execve`/`execveat`) or fork accounting.
  *
  * # Safety
  * `h` must be a non-null pointer returned by `sandlock_handler_new` that has

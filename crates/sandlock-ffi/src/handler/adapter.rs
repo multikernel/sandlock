@@ -149,14 +149,7 @@ impl Handler for FfiHandler {
         let handler = Arc::clone(&self.inner);
         let on_exception_fallback = self.exception_action(child_pgid);
         let deferred = self.inner.deferred;
-        let work_guard = match cx.blocking_guard() {
-            Ok(guard) => guard,
-            Err(e) => {
-                return Box::pin(async move {
-                    NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EIO))
-                })
-            }
-        };
+        let work_guard = cx.blocking_guard();
 
         let run = async move {
             sandlock_core::blocking::run(move || {
