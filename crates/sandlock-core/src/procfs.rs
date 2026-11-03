@@ -224,8 +224,8 @@ pub(crate) async fn render_virtual_file(
             generate_meminfo(policy.max_memory_bytes, rs.mem_used)
         }
         VirtualFile::Uptime => {
-            let rs = resource.lock().await;
-            generate_uptime(rs.start_instant.elapsed().as_secs_f64())
+            let real = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+            generate_uptime(&real)
         }
         VirtualFile::LoadAvg => {
             let total = processes.len() as u32;
@@ -373,11 +373,12 @@ pub(crate) fn generate_cpuinfo(num_cpus: u32) -> Vec<u8> {
 // ============================================================
 // /proc/uptime generator
 
-/// Generate /proc/uptime showing virtual uptime since sandbox start.
-/// Format: "<uptime_secs> <idle_secs>\n"
-pub(crate) fn generate_uptime(elapsed_secs: f64) -> Vec<u8> {
-    // idle time is reported as 0 — the sandbox has no meaningful idle metric.
-    format!("{:.2} 0.00\n", elapsed_secs.max(0.0)).into_bytes()
+/// Keep the boot origin used by /proc/<pid>/stat, but hide host idle time.
+pub(crate) fn generate_uptime(real: &str) -> Vec<u8> {
+    match real.split_whitespace().next() {
+        Some(uptime) => format!("{} 0.00\n", uptime).into_bytes(),
+        None => Vec::new(),
+    }
 }
 
 // ============================================================
@@ -1084,7 +1085,6 @@ struct SysinfoView {
     procs: usize,
     /// `(total, used)` bytes when a memory limit is set.
     memory: Option<(u64, u64)>,
-    uptime_secs: f64,
 }
 
 const SI_LOAD_SHIFT: u32 = 16;
@@ -1095,6 +1095,7 @@ const KERNEL_SYSINFO_LEN: usize = (std::mem::offset_of!(libc::sysinfo, mem_unit)
     + std::mem::size_of::<libc::c_uint>())
 .next_multiple_of(std::mem::align_of::<libc::c_ulong>());
 
+// Keep uptime boot-relative while /proc/<pid>/stat timestamps remain unmodified.
 fn patch_sysinfo(info: &mut libc::sysinfo, view: &SysinfoView) {
     for (slot, avg) in info.loads.iter_mut().zip(view.loads) {
         *slot = (avg.max(0.0) * f64::from(1u32 << SI_LOAD_SHIFT)) as libc::c_ulong;
@@ -1111,11 +1112,9 @@ fn patch_sysinfo(info: &mut libc::sysinfo, view: &SysinfoView) {
         info.totalhigh = 0;
         info.freehigh = 0;
     }
-    info.uptime = view.uptime_secs.max(0.0).ceil() as _;
 }
 
-/// Handle sysinfo(): agree with the virtual /proc/loadavg, /proc/meminfo and
-/// /proc/uptime so callers can't read the host's values around them.
+/// Handle sysinfo(): agree with the virtual /proc/loadavg and /proc/meminfo.
 pub(crate) async fn handle_sysinfo(
     notif: &SeccompNotif,
     processes: &ProcessIndex,
@@ -1140,7 +1139,6 @@ pub(crate) async fn handle_sysinfo(
             loads: [rs.load_avg.avg_1, rs.load_avg.avg_5, rs.load_avg.avg_15],
             procs,
             memory: (policy.max_memory_bytes > 0).then(|| (policy.max_memory_bytes, rs.mem_used)),
-            uptime_secs: rs.start_instant.elapsed().as_secs_f64(),
         }
     };
     patch_sysinfo(&mut info, &view);
@@ -1972,24 +1970,19 @@ mod tests {
 
     #[test]
     fn test_generate_uptime() {
-        let info = generate_uptime(123.456);
-        let text = String::from_utf8(info).unwrap();
-        assert!(text.starts_with("123.46"));
-        assert!(text.contains("0.00"));
+        let info = generate_uptime("123.45 987.65\n");
+        assert_eq!(info, b"123.45 0.00\n");
     }
 
     #[test]
     fn test_generate_uptime_zero() {
-        let info = generate_uptime(0.0);
-        let text = String::from_utf8(info).unwrap();
-        assert!(text.starts_with("0.00"));
+        let info = generate_uptime("0.00 0.00\n");
+        assert_eq!(info, b"0.00 0.00\n");
     }
 
     #[test]
-    fn test_generate_uptime_negative_clamped() {
-        let info = generate_uptime(-5.0);
-        let text = String::from_utf8(info).unwrap();
-        assert!(text.starts_with("0.00"));
+    fn test_generate_uptime_unavailable() {
+        assert!(generate_uptime("").is_empty());
     }
 
     #[test]
@@ -2017,7 +2010,6 @@ mod tests {
                 loads: [1.5, 0.25, 0.0],
                 procs: 3,
                 memory: Some((256 << 20, 56 << 20)),
-                uptime_secs: 41.2,
             },
         );
 
@@ -2029,7 +2021,7 @@ mod tests {
         assert_eq!(info.totalram, 256 << 20);
         assert_eq!(info.freeram, 200 << 20);
         assert_eq!((info.totalswap, info.freeswap), (0, 0));
-        assert_eq!(info.uptime, 42);
+        assert_eq!(info.uptime, 999_999);
     }
 
     #[test]
