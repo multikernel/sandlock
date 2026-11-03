@@ -162,7 +162,7 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
     let uname = &policy.uname;
     Some(match canon_proc_namespace(path).as_ref() {
         "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
-        "/proc/stat" if policy.num_cpus.is_some() => VirtualFile::Stat,
+        "/proc/stat" if policy.num_cpus.is_some() || policy.has_time_start => VirtualFile::Stat,
         // glibc's sysconf(_SC_NPROCESSORS_ONLN/CONF) counts these, not the
         // affinity mask, so `make -j$(getconf _NPROCESSORS_ONLN)` sees them.
         "/sys/devices/system/cpu/online"
@@ -217,7 +217,7 @@ pub(crate) async fn render_virtual_file(
         VirtualFile::CpuList => generate_cpu_list(policy.num_cpus.unwrap_or(1)),
         VirtualFile::Stat => {
             let real = std::fs::read_to_string("/proc/stat").unwrap_or_default();
-            filter_proc_stat(&real, policy.num_cpus.unwrap_or(1))
+            filter_proc_stat(&real, policy.num_cpus, policy.time_offset)
         }
         VirtualFile::MemInfo => {
             let rs = resource.lock().await;
@@ -270,10 +270,32 @@ pub(crate) fn generate_cpu_list(num_cpus: u32) -> Vec<u8> {
     }
 }
 
-/// /proc/stat with only the first `num_cpus` per-CPU lines. The aggregate
-/// `cpu` line is summed from those, so usage ratios computed from it agree
-/// with the per-CPU lines.
-pub(crate) fn filter_proc_stat(real: &str, num_cpus: u32) -> Vec<u8> {
+/// /proc/stat as the sandbox sees it. `btime` moves with the shifted wall
+/// clock so it agrees with "now minus /proc/uptime", which stays boot-relative.
+pub(crate) fn filter_proc_stat(real: &str, num_cpus: Option<u32>, time_offset: i64) -> Vec<u8> {
+    let cpus = match num_cpus {
+        Some(n) => limit_proc_stat_cpus(real, n),
+        None => real.to_owned(),
+    };
+    let mut out = String::with_capacity(cpus.len());
+    for line in cpus.lines() {
+        match line
+            .strip_prefix("btime ")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+        {
+            Some(btime) => out.push_str(&format!("btime {}\n", btime.saturating_add(time_offset))),
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.into_bytes()
+}
+
+/// Only the first `num_cpus` per-CPU lines. The aggregate `cpu` line is
+/// summed from those, so usage ratios computed from it agree with them.
+fn limit_proc_stat_cpus(real: &str, num_cpus: u32) -> String {
     let kept: Vec<&str> = real
         .lines()
         .filter(|line| {
@@ -306,7 +328,7 @@ pub(crate) fn filter_proc_stat(real: &str, num_cpus: u32) -> Vec<u8> {
             out.push('\n');
         }
     }
-    out.into_bytes()
+    out
 }
 
 fn uts_line(value: &Option<String>) -> Vec<u8> {
@@ -1873,8 +1895,17 @@ mod tests {
     fn test_filter_proc_stat() {
         let real = "cpu  6 0 9\ncpu0 1 0 2\ncpu1 2 0 3\ncpu2 3 0 4\nintr 7\nctxt 8\n";
         assert_eq!(
-            String::from_utf8(filter_proc_stat(real, 2)).unwrap(),
+            String::from_utf8(filter_proc_stat(real, Some(2), 0)).unwrap(),
             "cpu  3 0 5\ncpu0 1 0 2\ncpu1 2 0 3\nintr 7\nctxt 8\n"
+        );
+    }
+
+    #[test]
+    fn test_filter_proc_stat_shifts_btime() {
+        let real = "cpu  6 0 9\ncpu0 6 0 9\nbtime 1700000000\nprocesses 5\n";
+        assert_eq!(
+            String::from_utf8(filter_proc_stat(real, None, -1000)).unwrap(),
+            "cpu  6 0 9\ncpu0 6 0 9\nbtime 1699999000\nprocesses 5\n"
         );
     }
 

@@ -200,7 +200,7 @@ async fn check_sysinfo_virtualization(shift_time: bool) {
     let policy = builder.build().unwrap();
 
     let script = concat!(
-        "import ctypes, os\n",
+        "import ctypes, os, time\n",
         "UL = ctypes.c_ulong\n",
         "class Sysinfo(ctypes.Structure):\n",
         "  _fields_ = [('uptime', ctypes.c_long), ('loads', UL * 3),\n",
@@ -217,6 +217,9 @@ async fn check_sysinfo_virtualization(shift_time: bool) {
         "stat = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()\n",
         "print('start', int(stat[19]) // os.sysconf('SC_CLK_TCK'))\n",
         "print('procs', si.procs)\n",
+        "btime = next(int(l.split()[1]) for l in open('/proc/stat') if l.startswith('btime '))\n",
+        "up = float(open('/proc/uptime').read().split()[0])\n",
+        "print('bootskew', abs(round(time.time() - up) - btime))\n",
         "print('phys', os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))\n",
     );
     let host_uptime = || {
@@ -252,6 +255,10 @@ async fn check_sysinfo_virtualization(shift_time: bool) {
             "{name} gives a negative process age: {stdout}"
         );
     }
+    assert!(
+        field("bootskew") <= 2,
+        "/proc/stat btime disagrees with the clock minus /proc/uptime: {stdout}"
+    );
     let procs = field("procs");
     assert!(
         (1..100).contains(&procs),
