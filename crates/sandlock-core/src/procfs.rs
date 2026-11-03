@@ -162,7 +162,7 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
     let uname = &policy.uname;
     Some(match canon_proc_namespace(path).as_ref() {
         "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
-        "/proc/stat" if policy.num_cpus.is_some() => VirtualFile::Stat,
+        "/proc/stat" if policy.num_cpus.is_some() || policy.has_time_start => VirtualFile::Stat,
         // glibc's sysconf(_SC_NPROCESSORS_ONLN/CONF) counts these, not the
         // affinity mask, so `make -j$(getconf _NPROCESSORS_ONLN)` sees them.
         "/sys/devices/system/cpu/online"
@@ -173,7 +173,7 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
             VirtualFile::CpuList
         }
         "/proc/meminfo" if policy.max_memory_bytes > 0 => VirtualFile::MemInfo,
-        "/proc/uptime" if policy.has_time_start => VirtualFile::Uptime,
+        "/proc/uptime" => VirtualFile::Uptime,
         "/proc/loadavg" => VirtualFile::LoadAvg,
         "/proc/mounts" | "/proc/self/mounts" => VirtualFile::Mounts,
         "/proc/self/mountinfo" => VirtualFile::MountInfo,
@@ -217,15 +217,15 @@ pub(crate) async fn render_virtual_file(
         VirtualFile::CpuList => generate_cpu_list(policy.num_cpus.unwrap_or(1)),
         VirtualFile::Stat => {
             let real = std::fs::read_to_string("/proc/stat").unwrap_or_default();
-            filter_proc_stat(&real, policy.num_cpus.unwrap_or(1))
+            filter_proc_stat(&real, policy.num_cpus, policy.time_offset)
         }
         VirtualFile::MemInfo => {
             let rs = resource.lock().await;
             generate_meminfo(policy.max_memory_bytes, rs.mem_used)
         }
         VirtualFile::Uptime => {
-            let rs = resource.lock().await;
-            generate_uptime(rs.start_instant.elapsed().as_secs_f64())
+            let real = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+            generate_uptime(&real)
         }
         VirtualFile::LoadAvg => {
             let total = processes.len() as u32;
@@ -270,10 +270,32 @@ pub(crate) fn generate_cpu_list(num_cpus: u32) -> Vec<u8> {
     }
 }
 
-/// /proc/stat with only the first `num_cpus` per-CPU lines. The aggregate
-/// `cpu` line is summed from those, so usage ratios computed from it agree
-/// with the per-CPU lines.
-pub(crate) fn filter_proc_stat(real: &str, num_cpus: u32) -> Vec<u8> {
+/// /proc/stat as the sandbox sees it. `btime` moves with the shifted wall
+/// clock so it agrees with "now minus /proc/uptime", which stays boot-relative.
+pub(crate) fn filter_proc_stat(real: &str, num_cpus: Option<u32>, time_offset: i64) -> Vec<u8> {
+    let cpus = match num_cpus {
+        Some(n) => limit_proc_stat_cpus(real, n),
+        None => real.to_owned(),
+    };
+    let mut out = String::with_capacity(cpus.len());
+    for line in cpus.lines() {
+        match line
+            .strip_prefix("btime ")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+        {
+            Some(btime) => out.push_str(&format!("btime {}\n", btime.saturating_add(time_offset))),
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.into_bytes()
+}
+
+/// Only the first `num_cpus` per-CPU lines. The aggregate `cpu` line is
+/// summed from those, so usage ratios computed from it agree with them.
+fn limit_proc_stat_cpus(real: &str, num_cpus: u32) -> String {
     let kept: Vec<&str> = real
         .lines()
         .filter(|line| {
@@ -306,7 +328,7 @@ pub(crate) fn filter_proc_stat(real: &str, num_cpus: u32) -> Vec<u8> {
             out.push('\n');
         }
     }
-    out.into_bytes()
+    out
 }
 
 fn uts_line(value: &Option<String>) -> Vec<u8> {
@@ -373,12 +395,12 @@ pub(crate) fn generate_cpuinfo(num_cpus: u32) -> Vec<u8> {
 // ============================================================
 // /proc/uptime generator
 
-/// Generate /proc/uptime showing virtual uptime since sandbox start.
-/// Format: "<uptime_secs> <idle_secs>\n"
-/// When time_start is set, uptime starts at 0 and ticks forward from sandbox creation.
-pub(crate) fn generate_uptime(elapsed_secs: f64) -> Vec<u8> {
-    // idle time is reported as 0 — the sandbox has no meaningful idle metric.
-    format!("{:.2} 0.00\n", elapsed_secs.max(0.0)).into_bytes()
+/// Keep the boot origin used by /proc/<pid>/stat, but hide host idle time.
+pub(crate) fn generate_uptime(real: &str) -> Vec<u8> {
+    match real.split_whitespace().next() {
+        Some(uptime) => format!("{} 0.00\n", uptime).into_bytes(),
+        None => Vec::new(),
+    }
 }
 
 // ============================================================
@@ -1071,6 +1093,84 @@ pub(crate) fn handle_uname(
     match write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, bytes) {
         Ok(()) => NotifAction::ReturnValue(0),
         Err(_) => NotifAction::Continue,
+    }
+}
+
+// ============================================================
+// sysinfo virtualization
+// ============================================================
+
+/// The fields sysinfo(2) reports from the sandbox's view instead of the host's.
+#[derive(Debug, Clone, Default)]
+struct SysinfoView {
+    loads: [f64; 3],
+    procs: usize,
+    /// `(total, used)` bytes when a memory limit is set.
+    memory: Option<(u64, u64)>,
+}
+
+const SI_LOAD_SHIFT: u32 = 16;
+
+// musl's struct sysinfo pads 256 reserved bytes the kernel's lacks; writing
+// all of it would overrun the caller's kernel-sized buffer.
+const KERNEL_SYSINFO_LEN: usize = (std::mem::offset_of!(libc::sysinfo, mem_unit)
+    + std::mem::size_of::<libc::c_uint>())
+.next_multiple_of(std::mem::align_of::<libc::c_ulong>());
+
+// Keep uptime boot-relative while /proc/<pid>/stat timestamps remain unmodified.
+fn patch_sysinfo(info: &mut libc::sysinfo, view: &SysinfoView) {
+    for (slot, avg) in info.loads.iter_mut().zip(view.loads) {
+        *slot = (avg.max(0.0) * f64::from(1u32 << SI_LOAD_SHIFT)) as libc::c_ulong;
+    }
+    info.procs = view.procs.min(usize::from(u16::MAX)) as libc::c_ushort;
+    if let Some((total, used)) = view.memory {
+        info.mem_unit = 1;
+        info.totalram = total as libc::c_ulong;
+        info.freeram = total.saturating_sub(used) as libc::c_ulong;
+        info.sharedram = 0;
+        info.bufferram = 0;
+        info.totalswap = 0;
+        info.freeswap = 0;
+        info.totalhigh = 0;
+        info.freehigh = 0;
+    }
+}
+
+/// Handle sysinfo(): agree with the virtual /proc/loadavg and /proc/meminfo.
+pub(crate) async fn handle_sysinfo(
+    notif: &SeccompNotif,
+    processes: &ProcessIndex,
+    resource: &Mutex<crate::seccomp::state::ResourceState>,
+    policy: &NotifPolicy,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let buf_addr = notif.data.args[0];
+    if buf_addr == 0 {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } != 0 {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+
+    let procs = processes.len().max(1);
+    let view = {
+        let rs = resource.lock().await;
+        SysinfoView {
+            loads: [rs.load_avg.avg_1, rs.load_avg.avg_5, rs.load_avg.avg_15],
+            procs,
+            memory: (policy.max_memory_bytes > 0).then(|| (policy.max_memory_bytes, rs.mem_used)),
+        }
+    };
+    patch_sysinfo(&mut info, &view);
+
+    let bytes =
+        unsafe { std::slice::from_raw_parts(&info as *const _ as *const u8, KERNEL_SYSINFO_LEN) };
+    // Continue on a failed write would let the kernel hand over the host's values.
+    match write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, bytes) {
+        Ok(()) => NotifAction::ReturnValue(0),
+        Err(_) => NotifAction::Errno(libc::EFAULT),
     }
 }
 
@@ -1795,8 +1895,17 @@ mod tests {
     fn test_filter_proc_stat() {
         let real = "cpu  6 0 9\ncpu0 1 0 2\ncpu1 2 0 3\ncpu2 3 0 4\nintr 7\nctxt 8\n";
         assert_eq!(
-            String::from_utf8(filter_proc_stat(real, 2)).unwrap(),
+            String::from_utf8(filter_proc_stat(real, Some(2), 0)).unwrap(),
             "cpu  3 0 5\ncpu0 1 0 2\ncpu1 2 0 3\nintr 7\nctxt 8\n"
+        );
+    }
+
+    #[test]
+    fn test_filter_proc_stat_shifts_btime() {
+        let real = "cpu  6 0 9\ncpu0 6 0 9\nbtime 1700000000\nprocesses 5\n";
+        assert_eq!(
+            String::from_utf8(filter_proc_stat(real, None, -1000)).unwrap(),
+            "cpu  6 0 9\ncpu0 6 0 9\nbtime 1699999000\nprocesses 5\n"
         );
     }
 
@@ -1892,24 +2001,87 @@ mod tests {
 
     #[test]
     fn test_generate_uptime() {
-        let info = generate_uptime(123.456);
-        let text = String::from_utf8(info).unwrap();
-        assert!(text.starts_with("123.46"));
-        assert!(text.contains("0.00"));
+        let info = generate_uptime("123.45 987.65\n");
+        assert_eq!(info, b"123.45 0.00\n");
     }
 
     #[test]
     fn test_generate_uptime_zero() {
-        let info = generate_uptime(0.0);
-        let text = String::from_utf8(info).unwrap();
-        assert!(text.starts_with("0.00"));
+        let info = generate_uptime("0.00 0.00\n");
+        assert_eq!(info, b"0.00 0.00\n");
     }
 
     #[test]
-    fn test_generate_uptime_negative_clamped() {
-        let info = generate_uptime(-5.0);
-        let text = String::from_utf8(info).unwrap();
-        assert!(text.starts_with("0.00"));
+    fn test_generate_uptime_unavailable() {
+        assert!(generate_uptime("").is_empty());
+    }
+
+    #[test]
+    fn test_kernel_sysinfo_len_matches_kernel_struct() {
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(KERNEL_SYSINFO_LEN, 112);
+        assert!(KERNEL_SYSINFO_LEN <= std::mem::size_of::<libc::sysinfo>());
+    }
+
+    #[test]
+    fn test_patch_sysinfo_replaces_host_values() {
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        info.uptime = 999_999;
+        info.loads = [7 << SI_LOAD_SHIFT; 3];
+        info.procs = 4000;
+        info.totalram = 64;
+        info.freeram = 32;
+        info.totalswap = 8;
+        info.freeswap = 8;
+        info.mem_unit = 4096;
+
+        patch_sysinfo(
+            &mut info,
+            &SysinfoView {
+                loads: [1.5, 0.25, 0.0],
+                procs: 3,
+                memory: Some((256 << 20, 56 << 20)),
+            },
+        );
+
+        assert_eq!(info.loads[0], 3 << (SI_LOAD_SHIFT - 1));
+        assert_eq!(info.loads[1], 1 << (SI_LOAD_SHIFT - 2));
+        assert_eq!(info.loads[2], 0);
+        assert_eq!(info.procs, 3);
+        assert_eq!(info.mem_unit, 1);
+        assert_eq!(info.totalram, 256 << 20);
+        assert_eq!(info.freeram, 200 << 20);
+        assert_eq!((info.totalswap, info.freeswap), (0, 0));
+        assert_eq!(info.uptime, 999_999);
+    }
+
+    #[test]
+    fn test_patch_sysinfo_keeps_unvirtualized_fields() {
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        info.totalram = 64;
+        info.mem_unit = 4096;
+        patch_sysinfo(
+            &mut info,
+            &SysinfoView {
+                procs: 100_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!((info.totalram, info.mem_unit), (64, 4096));
+        assert_eq!(info.procs, u16::MAX);
+    }
+
+    #[test]
+    fn test_patch_sysinfo_clamps_used_above_limit() {
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        patch_sysinfo(
+            &mut info,
+            &SysinfoView {
+                memory: Some((100, 150)),
+                ..Default::default()
+            },
+        );
+        assert_eq!((info.totalram, info.freeram), (100, 0));
     }
 
     #[test]

@@ -612,6 +612,26 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // sysinfo virtualization (always on, like /proc/loadavg)
+    // ------------------------------------------------------------------
+    {
+        let policy = Arc::clone(policy);
+        let resource = Arc::clone(resource);
+        let sup = Arc::clone(ctx);
+        table.register(libc::SYS_sysinfo, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            let policy = Arc::clone(&policy);
+            let resource = Arc::clone(&resource);
+            let processes = Arc::clone(&sup.processes);
+            async move {
+                crate::procfs::handle_sysinfo(&notif, &processes, &resource, &policy, notif_fd)
+                    .await
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
     // Hostname virtualization. The `/etc/hostname` shim is registered
     // for every open-family syscall so dirfd-relative and legacy `open`
     // spellings can't leak the host's real hostname.

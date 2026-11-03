@@ -2754,10 +2754,8 @@ impl Sandbox {
         };
 
         if let Some(notif_fd) = notif_fd {
+            let time_offset = self.time_start.map(crate::time::calculate_time_offset);
             if self.time_start.is_some() || self.random_seed.is_some() {
-                let time_offset = self
-                    .time_start
-                    .map(|t| crate::time::calculate_time_offset(t));
                 if let Err(e) = crate::vdso::patch(pid, time_offset, self.random_seed.is_some()) {
                     log::debug!(
                         "pre-exec vDSO patching failed (will retry after exec): {}",
@@ -2765,11 +2763,6 @@ impl Sandbox {
                     );
                 }
             }
-
-            let time_offset_val = self
-                .time_start
-                .map(|t| crate::time::calculate_time_offset(t))
-                .unwrap_or(0);
 
             let rt_name = self.rt().name.clone();
             let notif_policy = NotifPolicy {
@@ -2784,7 +2777,7 @@ impl Sandbox {
                 has_time_start: resolved.features.time_start,
                 argv_safety_required: resolved.features.argv_safety_required,
                 notif_wait_killable,
-                time_offset: time_offset_val,
+                time_offset: time_offset.unwrap_or(0),
                 num_cpus: self.num_cpus,
                 port_remap: resolved.features.port_remap,
                 cow_enabled: resolved.features.cow,
@@ -2807,10 +2800,6 @@ impl Sandbox {
             use rand_chacha::ChaCha8Rng;
 
             let random_state = self.random_seed.map(|seed| ChaCha8Rng::seed_from_u64(seed));
-            let time_offset = self
-                .time_start
-                .map(|t| crate::time::calculate_time_offset(t));
-
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
             let mut net_state = NetworkState::new();

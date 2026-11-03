@@ -30,8 +30,6 @@ pub struct ResourceState {
     pub held_notif_ids: Vec<u64>,
     /// Exponentially-weighted load average.
     pub load_avg: crate::procfs::LoadAvg,
-    /// Instant when the supervisor started (for uptime reporting).
-    pub start_instant: std::time::Instant,
 }
 
 impl ResourceState {
@@ -47,7 +45,6 @@ impl ResourceState {
             hold_forks: false,
             held_notif_ids: Vec::new(),
             load_avg: crate::procfs::LoadAvg::new(),
-            start_instant: std::time::Instant::now(),
         }
     }
 }

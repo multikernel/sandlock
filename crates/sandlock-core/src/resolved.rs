@@ -40,6 +40,8 @@ pub(crate) struct SandboxFeatures {
     pub(crate) time_start: bool,
     pub(crate) virtual_cpu_count: bool,
     pub(crate) virtual_hostname: bool,
+    /// Off when the policy denies sysinfo: a notified syscall would bypass the deny.
+    pub(crate) virtual_sysinfo: bool,
     pub(crate) cow: bool,
     pub(crate) chroot: bool,
     pub(crate) fs_denies: bool,
@@ -89,6 +91,8 @@ impl SandboxFeatures {
             time_start: sandbox.time_start.is_some(),
             virtual_cpu_count: sandbox.num_cpus.is_some(),
             virtual_hostname: sandbox_name.is_some(),
+            virtual_sysinfo: !crate::seccomp_plan::blocklist_syscall_numbers(sandbox)
+                .contains(&(libc::SYS_sysinfo as u32)),
             cow: sandbox.workdir.is_some(),
             chroot: sandbox.chroot.is_some(),
             fs_denies: !sandbox.fs_denied.is_empty(),

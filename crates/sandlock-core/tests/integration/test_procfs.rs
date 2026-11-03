@@ -1,5 +1,6 @@
 use sandlock_core::sandbox::ByteSize;
 use sandlock_core::Sandbox;
+use std::time::Duration;
 
 /// Test that num_cpus virtualizes both /proc/cpuinfo and sched_getaffinity.
 #[tokio::test]
@@ -169,6 +170,99 @@ async fn test_meminfo_virtualization() {
         stdout.contains("MemTotal:       262144 kB"),
         "Expected MemTotal of 262144 kB (256 MiB), got: {:?}",
         stdout
+    );
+}
+
+/// sysinfo(2) and sysconf(_SC_PHYS_PAGES) must agree with the virtual
+/// /proc files instead of reporting the host's RAM, swap and tasks.
+#[tokio::test]
+async fn test_sysinfo_virtualization() {
+    check_sysinfo_virtualization(false).await;
+}
+
+#[tokio::test]
+async fn test_sysinfo_uptime_with_time_start() {
+    check_sysinfo_virtualization(true).await;
+}
+
+async fn check_sysinfo_virtualization(shift_time: bool) {
+    let mut builder = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .max_memory(ByteSize::mib(256));
+    if shift_time {
+        builder = builder.time_start(std::time::UNIX_EPOCH + Duration::from_secs(946_684_800));
+    }
+    let policy = builder.build().unwrap();
+
+    let script = concat!(
+        "import ctypes, os, time\n",
+        "UL = ctypes.c_ulong\n",
+        "class Sysinfo(ctypes.Structure):\n",
+        "  _fields_ = [('uptime', ctypes.c_long), ('loads', UL * 3),\n",
+        "    ('totalram', UL), ('freeram', UL), ('sharedram', UL), ('bufferram', UL),\n",
+        "    ('totalswap', UL), ('freeswap', UL), ('procs', ctypes.c_ushort),\n",
+        "    ('pad', ctypes.c_ushort), ('totalhigh', UL), ('freehigh', UL),\n",
+        "    ('mem_unit', ctypes.c_uint)]\n",
+        "si = Sysinfo()\n",
+        "assert ctypes.CDLL(None, use_errno=True).sysinfo(ctypes.byref(si)) == 0\n",
+        "print('total', si.totalram * si.mem_unit)\n",
+        "print('swap', si.totalswap)\n",
+        "print('uptime', si.uptime)\n",
+        "print('procuptime', int(float(open('/proc/uptime').read().split()[0])))\n",
+        "stat = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()\n",
+        "print('start', int(stat[19]) // os.sysconf('SC_CLK_TCK'))\n",
+        "print('procs', si.procs)\n",
+        "btime = next(int(l.split()[1]) for l in open('/proc/stat') if l.startswith('btime '))\n",
+        "up = float(open('/proc/uptime').read().split()[0])\n",
+        "print('bootskew', abs(round(time.time() - up) - btime))\n",
+        "print('phys', os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))\n",
+    );
+    let host_uptime = || {
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::sysinfo(&mut info) }, 0);
+        info.uptime as u64
+    };
+    let before = host_uptime().saturating_sub(1);
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
+    let after = host_uptime();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert!(result.success(), "sysinfo script failed: {stdout}");
+    let field = |name: &str| -> u64 {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or_else(|| panic!("missing {name} in {stdout:?}"))
+    };
+    assert_eq!(field("total"), 256 << 20);
+    assert_eq!(field("phys"), 256 << 20);
+    assert_eq!(field("swap"), 0);
+    for name in ["uptime", "procuptime"] {
+        assert!(
+            (before..=after).contains(&field(name)),
+            "{name} must retain the kernel boot origin: {stdout}"
+        );
+        assert!(
+            field(name) >= field("start"),
+            "{name} gives a negative process age: {stdout}"
+        );
+    }
+    assert!(
+        field("bootskew") <= 2,
+        "/proc/stat btime disagrees with the clock minus /proc/uptime: {stdout}"
+    );
+    let procs = field("procs");
+    assert!(
+        (1..100).contains(&procs),
+        "host task count leaked: {stdout}"
     );
 }
 
