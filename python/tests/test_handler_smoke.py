@@ -728,25 +728,8 @@ def test_run_with_handlers_rejects_non_handler():
 
 
 # ----------------------------------------------------------------
-# Deferred (off-loop) handler dispatch.
+# Async handler dispatch.
 # ----------------------------------------------------------------
-
-
-def test_is_deferred_handler_detects_async():
-    """Registration treats a handler as deferred iff its `handle` is an
-    `async def`. A synchronous handler runs inline. This pins the helper."""
-    from sandlock.sandbox import _is_deferred_handler
-
-    class Sync(Handler):
-        def handle(self, ctx):
-            return NotifAction.continue_()
-
-    class Async(Handler):
-        async def handle(self, ctx):
-            return NotifAction.continue_()
-
-    assert _is_deferred_handler(Sync()) is False
-    assert _is_deferred_handler(Async()) is True
 
 
 def test_async_handle_delivers_errno_e2e(tmp_dir):
@@ -793,13 +776,11 @@ def test_async_handle_delivers_errno_e2e(tmp_dir):
     assert result.exit_code == 7, (result.exit_code, result.stderr)
 
 
-def test_async_handle_short_circuits_chain_e2e(tmp_dir):
-    """An `async def handle` is auto-deferred, hence terminal: when it
-    continues, a later handler on the same syscall must NOT run. First
-    handler is async and always continues; second denies the probe. The
-    child opening successfully proves the async handler auto-deferred (a
-    non-deferred async handler driven inline would Continue, letting the
-    second handler deny -> child fails)."""
+def test_async_handle_continue_resumes_chain_e2e(tmp_dir):
+    """An `async def handle` that continues hands the syscall to the next
+    handler on the same syscall, like a synchronous one. First handler is
+    async and always continues; second denies the probe, so the child's
+    open must fail with EACCES."""
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
@@ -829,17 +810,18 @@ def test_async_handle_short_circuits_chain_e2e(tmp_dir):
     sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
     script = (
         "import os, sys\n"
-        "fd = os.open(%r, os.O_RDONLY)\n"
-        "os.close(fd)\n" % probe_path
+        "try:\n"
+        "    os.close(os.open(%r, os.O_RDONLY))\n"
+        "except OSError as e:\n"
+        "    sys.stderr.write('errno=%%d' %% e.errno)\n"
+        "    sys.exit(3)\n" % probe_path
     )
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c", script],
         handlers=[("openat", _AsyncContinue()), ("openat", _DenyProbe())],
     )
-    assert result.success, (
-        "async handler must auto-defer (terminal), so the deny handler never "
-        f"runs; got {result}"
-    )
+    assert result.exit_code == 3, (result.exit_code, result.stderr)
+    assert b"errno=%d" % _errno.EACCES in result.stderr, result.stderr
 
 
 # ----------------------------------------------------------------

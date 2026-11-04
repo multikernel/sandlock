@@ -1836,6 +1836,11 @@ void sandlock_action_set_kill(sandlock_action_out_t *out, int32_t sig, int32_t p
  * Allocate a handler container. `handler_fn` must be non-null; passing
  * `ud_drop = None` is legal when `ud` does not require cleanup.
  *
+ * Callbacks run on worker threads, concurrently and off the notification
+ * loop. A syscall waits for its callback however long it takes, and the
+ * run waits for every callback before returning, so one that never
+ * returns prevents the run from completing.
+ *
  * # Safety
  * `ud` is opaque to Rust — the caller guarantees that the pointer
  * remains valid until either (a) `sandlock_handler_free` is called or
@@ -1851,24 +1856,6 @@ sandlock_handler_t *sandlock_handler_new(int32_t (*handler_fn)(void *ud,
                                          void *ud,
                                          void (*ud_drop)(void *ud),
                                          uint32_t on_exception);
-
-/**
- * Mark a handler as deferred: the supervisor will run its callback off the
- * notification loop so a slow callback does not block other trapped
- * syscalls. Must be called before the handler is registered with a run.
- *
- * A deferred handler makes a *terminal* decision: deferral short-circuits
- * the handler chain, so if a deferred handler would `Continue` and other
- * user handlers are registered on the same syscall, those later handlers do
- * not run. Builtins always run first regardless. Deferral is refused at
- * dispatch time for syscalls whose Continue path needs the execve
- * argv-safety freeze (`execve`/`execveat`) or fork creation-tracking.
- *
- * # Safety
- * `h` must be a non-null pointer returned by `sandlock_handler_new` that has
- * not yet been registered with a run or freed.
- */
-void sandlock_handler_set_deferred(sandlock_handler_t *h, bool deferred);
 
 /**
  * Free a handler container that has *not* been registered with a

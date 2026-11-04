@@ -129,11 +129,9 @@ def _trampoline_impl(ud, notif_ptr, mem_ptr, out_ptr) -> int:
             action = handler.handle(ctx)
             if inspect.iscoroutine(action):
                 # `async def handle`: drive the coroutine to completion on
-                # this worker thread. Async handlers are always deferred (see
-                # sandbox._is_deferred_handler), so this runs off the
-                # supervisor loop and `await` does not stall other syscalls.
-                # The mem handle stays valid until the finally below, so
-                # child-memory access inside the coroutine works; awaits
+                # this worker thread, which is already off the supervisor
+                # loop. The mem handle stays valid until the finally below,
+                # so child-memory access inside the coroutine works; awaits
                 # release the GIL, so concurrent async handlers overlap.
                 action = asyncio.run(action)
         except BaseException:

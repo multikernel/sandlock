@@ -22,9 +22,8 @@ sb.run_with_handlers(
 ## Core types
 
 - `Handler` — base class. Subclass and override `handle(ctx) -> NotifAction`.
-  Define `handle` as `async def` to run it off the supervisor loop so it can
-  `await` slow work without stalling other trapped syscalls; see
-  [Deferred handlers](#deferred-handlers). Set the class attribute
+  `handle` runs on a worker thread off the supervisor loop and may be
+  `async def`; see [Deferred handlers](#deferred-handlers). Set the class attribute
   `on_exception` (default `ExceptionPolicy.KILL`) to choose what the
   supervisor does when the handler errors.
 - `HandlerCtx` — frozen dataclass with the notification fields (`id`, `pid`,
@@ -265,13 +264,10 @@ syscall list rather than against an empty dispatch table.
 
 - **GIL contention.** Each handler dispatch holds the GIL for the
   duration of `handle()`. The supervisor may dispatch handler
-  callbacks concurrently across different notifications, so design
-  `handle()` to be fast (sub-millisecond) and to protect any mutable
-  handler state with your own synchronization. High-frequency
+  callbacks concurrently across different notifications, so protect any
+  mutable handler state with your own synchronization. High-frequency
   interception (e.g. per-`SYS_openat` audit on a busy workload) will
-  serialize on the GIL and can stall the supervisor. For a `handle()`
-  that must do slow work (a network call, a blocking read), define it as
-  `async def` so it runs off the loop instead; see
+  serialize on the GIL and slow down the sandbox's trapped syscalls. See
   [Deferred handlers](#deferred-handlers).
 
 - **Interpreter finalization.** If `Py_FinalizeEx` runs while the
@@ -294,12 +290,10 @@ syscall list rather than against an empty dispatch table.
 
 ## Deferred handlers
 
-By default `handle()` runs synchronously inside the supervisor's
-notification loop, so a slow callback stalls every other trapped syscall
-until it returns. Define `handle` as `async def` to run it off that loop
-instead: the coroutine is driven to completion on a worker thread, so it
-can `await` slow work without blocking the supervisor. That is the only
-change; you do not set any flag.
+Every `handle()` runs on a worker thread, off the supervisor's notification
+loop, so a slow callback delays only its own syscall. Define `handle` as
+`async def` to `await` slow work; the coroutine is driven to completion on
+that worker thread. You do not set any flag.
 
 ```python
 class FetchHandler(Handler):
@@ -310,39 +304,30 @@ class FetchHandler(Handler):
         key = ctx.read_path()              # read the path before the slow work
         if key is None:
             return NotifAction.continue_()
-        data = await self.backend.get(key)  # slow network GET, awaited off-loop
+        data = await self.backend.get(key)  # slow network GET
         # inject_bytes builds the sealed memfd and transfers fd ownership to
         # the supervisor (see "Inject synthetic content" above).
         return NotifAction.inject_bytes(data)
 ```
 
-Why it helps Python specifically: the coroutine runs on a worker thread,
-and CPython releases the GIL while it `await`s I/O, so multiple async
-handlers doing network work genuinely overlap while the supervisor loop
-stays free. It does not parallelize CPU-bound Python work (the GIL still
-serializes that); for that, push the hot path into a C extension that
-releases the GIL.
+CPython releases the GIL while a coroutine `await`s I/O, so multiple async
+handlers doing network work overlap. It does not parallelize CPU-bound
+Python work (the GIL still serializes that); for that, push the hot path
+into a C extension that releases the GIL.
 
 `ctx` and its child-memory accessors (`read_cstr`, `read`, `write`) stay
-valid for the whole coroutine, so you can read paths and write results
-across `await` points.
+valid for the whole call, so you can read paths and write results across
+`await` points.
 
 Contract (enforced by the supervisor):
 
-- **Terminal decision.** Deferral short-circuits the handler chain, so if
-  an async handler returns `continue_()` and other handlers are registered
-  on the same syscall, those later handlers do not run. Built-ins always
-  run first regardless.
-- **Refused on `execve`/`execveat` and fork-creating syscalls.** The
-  response cannot be moved off-loop there without skipping argv-safety
-  work, so such a call is denied with `EPERM`.
-- **Bounded.** Beyond an internal in-flight cap, further deferrals fail
-  fast with `EAGAIN` rather than queuing.
+- **Same chain as any handler.** Returning `continue_()` hands the syscall
+  to the next handler registered on it, and the result still passes the
+  execve argv-safety checks and fork accounting.
+- **No deadline.** A syscall waits for its handler to return, however
+  long that takes, and the run waits for every handler before completing.
 
-Make `handle` async only when it must do slow work. For fast handlers
-(audit counters, path checks) a synchronous `handle` runs inline at lower
-latency. See
-[`extension-handlers.md`](extension-handlers.md#deferred-handlers) for the
+See [`extension-handlers.md`](extension-handlers.md#deferred-handlers) for the
 underlying Rust/C contract.
 
 ## Ownership rules
