@@ -133,19 +133,22 @@ pub(super) fn connect_named_unix_on_behalf(
     };
     let addr = sockaddr_un_bytes(&sun, len);
     NotifAction::prepare(&addr.clone(), dup_fd.as_raw_fd(), move || {
-        let _pinned = pinned;
-        let ret = unsafe {
-            libc::connect(
-                dup_fd.as_raw_fd(),
-                addr.as_ptr() as *const libc::sockaddr,
-                addr.len() as libc::socklen_t,
-            )
-        };
-        if ret == 0 {
-            NotifAction::ReturnValue(0)
-        } else {
-            NotifAction::Errno(unsafe { *libc::__errno_location() })
-        }
+        // A listener with a full backlog blocks the connect.
+        NotifAction::native(move || {
+            let _pinned = pinned;
+            let ret = unsafe {
+                libc::connect(
+                    dup_fd.as_raw_fd(),
+                    addr.as_ptr() as *const libc::sockaddr,
+                    addr.len() as libc::socklen_t,
+                )
+            };
+            if ret == 0 {
+                NotifAction::ReturnValue(0)
+            } else {
+                NotifAction::Errno(unsafe { *libc::__errno_location() })
+            }
+        })
     })
 }
 

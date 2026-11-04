@@ -56,26 +56,43 @@ impl OnInjectSuccess {
 /// value. It need only be `Send`: the supervisor moves it onto a task and
 /// never shares it.
 pub struct Deferred {
-    future: Pin<Box<dyn Future<Output = NotifAction> + Send + 'static>>,
+    work: Work,
     patient: bool,
 }
 
+enum Work {
+    Future(Pin<Box<dyn Future<Output = NotifAction> + Send + 'static>>),
+    Native(Box<dyn FnOnce() -> NotifAction + Send + 'static>),
+}
+
 // Safety: `NotifAction` must stay `Sync` because handlers keep it in `Sync`
-// state. The boxed future is private and only reachable through `run(self)`,
-// so a shared `&Deferred` can never poll it.
+// state. The work is private and only reachable by consuming the `Deferred`, so
+// a shared `&Deferred` can never touch it.
 unsafe impl Sync for Deferred {}
 
 impl std::fmt::Debug for Deferred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Deferred(<future>)")
+        match &self.work {
+            Work::Future(_) => f.write_str("Deferred(<future>)"),
+            Work::Native(_) => f.write_str("Deferred(<native>)"),
+        }
     }
 }
 
 impl Deferred {
     pub fn new<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
         Self {
-            future: Box::pin(f),
+            work: Work::Future(Box::pin(f)),
             patient: false,
+        }
+    }
+
+    /// Synchronous work run on a native thread. It cannot be cancelled, so
+    /// it is patient: failing the syscall would not stop its side effects.
+    pub fn native(work: impl FnOnce() -> NotifAction + Send + 'static) -> Self {
+        Self {
+            work: Work::Native(Box::new(work)),
+            patient: true,
         }
     }
 
@@ -83,13 +100,16 @@ impl Deferred {
     /// as it takes. The future has to end by itself once the child is gone.
     pub(crate) fn patient<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
         Self {
-            future: Box::pin(f),
+            work: Work::Future(Box::pin(f)),
             patient: true,
         }
     }
 
     pub async fn run(self) -> NotifAction {
-        self.future.await
+        match self.work {
+            Work::Future(future) => future.await,
+            Work::Native(work) => super::native::run(work).await,
+        }
     }
 
     /// Run within `deadline` unless patient; a deferral never resolves to
@@ -213,6 +233,10 @@ impl NotifAction {
 
     pub fn defer<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
         NotifAction::Defer(Deferred::new(fut))
+    }
+
+    pub fn native(work: impl FnOnce() -> NotifAction + Send + 'static) -> Self {
+        NotifAction::Defer(Deferred::native(work))
     }
 
     /// Inject `content` into the child as the syscall's returned fd, backed by
@@ -3846,6 +3870,19 @@ mod tests {
             NotifAction::ReturnValue(7)
         });
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(matches!(
+            slow.run_until(deadline).await,
+            NotifAction::ReturnValue(7)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_deferral_ignores_deadline() {
+        let slow = Deferred::native(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            NotifAction::ReturnValue(7)
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
         assert!(matches!(
             slow.run_until(deadline).await,
             NotifAction::ReturnValue(7)

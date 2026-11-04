@@ -502,14 +502,20 @@ fn handle<'a>(
 The deferred future must be `Send + 'static`; it does **not** need to be `Sync` (the supervisor
 moves it, never shares it by reference).
 
+For synchronous work (a blocking syscall, a C library call), return
+`NotifAction::native(move || ...)` instead of wrapping it in a future. The closure runs on a
+native thread and cannot be cancelled, so it has no deadline: the syscall waits for it as it would
+for the kernel. It may still outlive its syscall if the child dies, so capture owned resources
+rather than raw fd numbers or pointers.
+
 Contract:
 
 - **Resumes the chain.** A `Continue` result runs the next handler on the same syscall; any
   other result ends the chain. Either way the outcome then passes every check a handler's inline
   result would: pinned opens, fork accounting, the policy callback and the execve argv-safety
   freeze (see [issue #27][i27]). Deferring on `execve` or `fork` is therefore safe.
-- **Deadline.** All deferred futures of one notification share a 30 second deadline; past it the syscall
-  fails with `EIO`.
+- **Deadline.** All deferred futures of one notification share a 30 second deadline; past it the
+  syscall fails with `EIO`. Native closures have none.
 - **No admission limit.** Each trapped task has at most one outstanding notification, so deferred
   work is already bounded by the number of tasks in the sandbox.
 - **No nesting.** A deferred future that resolves to another `Defer` is a bug; the supervisor turns it

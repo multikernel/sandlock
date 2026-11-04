@@ -102,14 +102,22 @@ pub(super) async fn connect_on_behalf(
 
         let metadata_addr = addr_bytes.clone();
         NotifAction::prepare(&metadata_addr, dup_fd.as_raw_fd(), move || {
-            // Record the original destination before connect so the proxy
-            // cannot receive the connection before its mapping is available.
-            if plan.record_orig_dest {
-                if let Some(ref map) = orig_dest_map {
-                    record_orig_dest(map, dup_fd.as_raw_fd(), sockaddr_is_ipv6(&addr_bytes), ip);
+            // A blocking connect waits on the peer, which must not stall the loop.
+            NotifAction::native(move || {
+                // Record the original destination before connect so the proxy
+                // cannot receive the connection before its mapping is available.
+                if plan.record_orig_dest {
+                    if let Some(ref map) = orig_dest_map {
+                        record_orig_dest(
+                            map,
+                            dup_fd.as_raw_fd(),
+                            sockaddr_is_ipv6(&addr_bytes),
+                            ip,
+                        );
+                    }
                 }
-            }
-            connect_dup(dup_fd.as_raw_fd(), &plan.addr)
+                connect_dup(dup_fd.as_raw_fd(), &plan.addr)
+            })
         })
         .held_if(held)
     } else {
