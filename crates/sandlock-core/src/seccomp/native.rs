@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 
 use tokio::runtime::Runtime;
 
+use super::gate::MemGate;
 use super::notif::NotifAction;
 
 const MAX_THREADS: usize = 512;
@@ -25,9 +26,15 @@ fn runtime() -> &'static Runtime {
     })
 }
 
-/// Run `work` on a native thread.
-pub(crate) async fn run(work: Box<dyn FnOnce() -> NotifAction + Send>) -> NotifAction {
-    let job = runtime().spawn_blocking(work);
+/// Run `work` on a native thread under `gate`, or ungated outside a supervisor.
+pub(crate) async fn run(
+    gate: Option<MemGate>,
+    work: Box<dyn FnOnce() -> NotifAction + Send>,
+) -> NotifAction {
+    let job = runtime().spawn_blocking(move || match gate {
+        Some(gate) => gate.enter(work),
+        None => work(),
+    });
     job.await.unwrap_or(NotifAction::Errno(libc::EIO))
 }
 
@@ -40,12 +47,15 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn(run(Box::new(move || {
-            let _ = started_tx.send(());
-            let _ = release_rx.recv();
-            let _ = done_tx.send(());
-            NotifAction::Continue
-        })));
+        let waiter = tokio::spawn(run(
+            None,
+            Box::new(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                let _ = done_tx.send(());
+                NotifAction::Continue
+            }),
+        ));
         started_rx.await.unwrap();
         waiter.abort();
         let _ = waiter.await;
@@ -55,7 +65,7 @@ mod tests {
 
     #[tokio::test]
     async fn panicking_work_fails_closed() {
-        let action = run(Box::new(|| panic!("native panic"))).await;
+        let action = run(None, Box::new(|| panic!("native panic"))).await;
         assert!(matches!(action, NotifAction::Errno(libc::EIO)));
     }
 }

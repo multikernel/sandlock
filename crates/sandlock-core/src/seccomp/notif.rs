@@ -105,20 +105,29 @@ impl Deferred {
         }
     }
 
+    /// Run outside a supervisor, where native work is not ordered against exec.
     pub async fn run(self) -> NotifAction {
         match self.work {
             Work::Future(future) => future.await,
-            Work::Native(work) => super::native::run(work).await,
+            Work::Native(work) => super::native::run(None, work).await,
+        }
+    }
+
+    async fn run_in(self, offload: &Offload) -> NotifAction {
+        let gate = offload.gate.clone();
+        match self.work {
+            Work::Future(future) => gate.scope(future).await,
+            Work::Native(work) => super::native::run(Some(gate), work).await,
         }
     }
 
     /// Run within `deadline` unless patient; a deferral never resolves to
     /// another unexecuted action.
-    async fn run_until(self, deadline: tokio::time::Instant) -> NotifAction {
+    async fn run_until(self, offload: &Offload, deadline: tokio::time::Instant) -> NotifAction {
         let action = if self.patient {
-            self.run().await
+            self.run_in(offload).await
         } else {
-            match tokio::time::timeout_at(deadline, self.run()).await {
+            match tokio::time::timeout_at(deadline, self.run_in(offload)).await {
                 Ok(action) => action,
                 Err(_) => {
                     log::warn!("parked notification exceeded its deadline; failing with EIO");
@@ -131,6 +140,13 @@ impl Deferred {
             other => other,
         }
     }
+}
+
+/// What one sandbox's parked work shares: the gate ordering its child-memory
+/// writes against exec.
+#[derive(Clone)]
+struct Offload {
+    gate: super::gate::MemGate,
 }
 
 /// An owned operation whose side effects require callback approval.
@@ -1777,8 +1793,12 @@ pub fn write_child_mem(
     addr: u64,
     data: &[u8],
 ) -> Result<(), NotifError> {
-    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
-    write_child_mem_vm(pid, addr, data)?;
+    // Checked under the gate: a write that waited out an exec freeze must not
+    // follow the leader's pid into the image that exec installed.
+    super::gate::write(|| {
+        id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+        write_child_mem_vm(pid, addr, data)
+    })?;
     id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
     Ok(())
 }
@@ -1816,8 +1836,10 @@ pub fn write_child_mem_force(
     addr: u64,
     data: &[u8],
 ) -> Result<(), NotifError> {
-    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
-    write_child_mem_proc(pid, addr, data)?;
+    super::gate::write(|| {
+        id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+        write_child_mem_proc(pid, addr, data)
+    })?;
     id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
     Ok(())
 }
@@ -2898,6 +2920,7 @@ struct ParkedChain {
 struct ParkedSet {
     tasks: tokio::task::JoinSet<Parked>,
     callers: HashMap<tokio::task::Id, (i32, u64)>,
+    offload: Offload,
 }
 
 impl ParkedSet {
@@ -2905,6 +2928,9 @@ impl ParkedSet {
         Self {
             tasks: tokio::task::JoinSet::new(),
             callers: HashMap::new(),
+            offload: Offload {
+                gate: super::gate::MemGate::default(),
+            },
         }
     }
 
@@ -3023,8 +3049,9 @@ async fn settle_chain(
     match action {
         NotifAction::Defer(deferred) => {
             let notif = state.notif;
+            let offload = parked.offload.clone();
             parked.spawn(&notif, async move {
-                let action = deferred.run_until(state.deadline).await;
+                let action = deferred.run_until(&offload, state.deadline).await;
                 Parked::Chain(Box::new(state), action)
             });
         }
@@ -3222,36 +3249,45 @@ async fn finish_notification(
         }
         let id = notif.id;
         let deadline = tokio::time::Instant::now() + PARK_TIMEOUT;
+        let offload = parked.offload.clone();
         parked.spawn(&notif, async move {
-            Parked::Response(id, deferred.run_until(deadline).await)
+            Parked::Response(id, deferred.run_until(&offload, deadline).await)
         });
         return;
     }
 
     // From the freeze to its release nothing may await: the tracer is this
     // thread, and the loop must not release any parked task meanwhile.
-    let mut exec_freeze = None;
-    if let (NotifAction::Continue, Some(judged)) = (&action, &exec_image) {
-        let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd, parked);
-        action = frozen_action;
-        exec_freeze = Some(freeze);
-    }
-
-    // Ignore error — child may have exited between recv and response.
-    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
-    let send_result = send_response(fd, notif.id, action);
-
-    if let Some(freeze) = exec_freeze {
-        if exec_continued && send_result.is_ok() {
-            crate::freeze::release_after_exec(&freeze);
-        } else {
-            crate::freeze::detach_all(&freeze);
+    // Parked work keeps running, so its child-memory writes wait on the gate
+    // until the kernel has copied argv.
+    let gate = parked.offload.gate.clone();
+    let send_result = {
+        let mut exec_freeze = None;
+        let mut _writes_held = None;
+        if let (NotifAction::Continue, Some(judged)) = (&action, &exec_image) {
+            _writes_held = Some(gate.exclusive());
+            let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd, parked);
+            action = frozen_action;
+            exec_freeze = Some(freeze);
         }
-        // Now that the response is out, the kernel wait holding any pending
-        // task (the vfork parent waiting on this very execve) can clear;
-        // reap the queued interrupts and detach.
-        crate::freeze::reap_pending(&freeze.pending_tids);
-    }
+
+        // Ignore error — child may have exited between recv and response.
+        let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
+        let send_result = send_response(fd, notif.id, action);
+
+        if let Some(freeze) = exec_freeze {
+            if exec_continued && send_result.is_ok() {
+                crate::freeze::release_after_exec(&freeze);
+            } else {
+                crate::freeze::detach_all(&freeze);
+            }
+            // Now that the response is out, the kernel wait holding any pending
+            // task (the vfork parent waiting on this very execve) can clear;
+            // reap the queued interrupts and detach.
+            crate::freeze::reap_pending(&freeze.pending_tids);
+        }
+        send_result
+    };
 
     if fork_counted && creation_trace.is_none() && send_result.is_err() {
         crate::resource::rollback_fork_count(&ctx.resource).await;
@@ -3495,6 +3531,12 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_offload() -> Offload {
+        Offload {
+            gate: super::super::gate::MemGate::default(),
+        }
+    }
 
     #[test]
     fn openat_how_matches_what_openat2_accepts() {
@@ -3858,7 +3900,7 @@ mod tests {
         });
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         assert!(matches!(
-            slow.run_until(deadline).await,
+            slow.run_until(&test_offload(), deadline).await,
             NotifAction::Errno(libc::EIO)
         ));
     }
@@ -3871,7 +3913,7 @@ mod tests {
         });
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         assert!(matches!(
-            slow.run_until(deadline).await,
+            slow.run_until(&test_offload(), deadline).await,
             NotifAction::ReturnValue(7)
         ));
     }
@@ -3884,7 +3926,7 @@ mod tests {
         });
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
         assert!(matches!(
-            slow.run_until(deadline).await,
+            slow.run_until(&test_offload(), deadline).await,
             NotifAction::ReturnValue(7)
         ));
     }
@@ -3894,7 +3936,7 @@ mod tests {
         let nested = Deferred::new(async { NotifAction::defer(async { NotifAction::Continue }) });
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         assert!(matches!(
-            nested.run_until(deadline).await,
+            nested.run_until(&test_offload(), deadline).await,
             NotifAction::Errno(libc::EIO)
         ));
     }

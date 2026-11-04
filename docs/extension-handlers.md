@@ -514,6 +514,9 @@ Contract:
   other result ends the chain. Either way the outcome then passes every check a handler's inline
   result would: pinned opens, fork accounting, the policy callback and the execve argv-safety
   freeze (see [issue #27][i27]). Deferring on `execve` or `fork` is therefore safe.
+- **Writes wait for exec.** Child-memory writes from a deferred future or native closure are ordered
+  against the execve argv-safety freeze: an exec holds them off until the kernel has copied its
+  argv. Write from the deferred future or closure itself; a task you spawn from it is not ordered.
 - **Deadline.** All deferred futures of one notification share a 30 second deadline; past it the
   syscall fails with `EIO`. Native closures have none.
 - **No admission limit.** Each trapped task has at most one outstanding notification, so deferred
