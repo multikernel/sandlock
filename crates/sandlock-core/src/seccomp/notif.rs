@@ -117,7 +117,16 @@ impl Deferred {
         let gate = offload.gate.clone();
         match self.work {
             Work::Future(future) => gate.scope(future).await,
-            Work::Native(work) => super::native::run(Some(gate), work).await,
+            Work::Native(work) => {
+                // The closure may outlive the supervisor and still use the
+                // listener's fd number, which must not be reused meanwhile.
+                let listener = Arc::clone(&offload.listener);
+                let work = Box::new(move || {
+                    let _listener = listener;
+                    work()
+                });
+                super::native::run(Some(gate), work).await
+            }
         }
     }
 
@@ -143,10 +152,11 @@ impl Deferred {
 }
 
 /// What one sandbox's parked work shares: the gate ordering its child-memory
-/// writes against exec.
+/// writes against exec, and the listener its native closures may outlive.
 #[derive(Clone)]
 struct Offload {
     gate: super::gate::MemGate,
+    listener: Arc<OwnedFd>,
 }
 
 /// An owned operation whose side effects require callback approval.
@@ -2924,12 +2934,13 @@ struct ParkedSet {
 }
 
 impl ParkedSet {
-    fn new() -> Self {
+    fn new(listener: Arc<OwnedFd>) -> Self {
         Self {
             tasks: tokio::task::JoinSet::new(),
             callers: HashMap::new(),
             offload: Offload {
                 gate: super::gate::MemGate::default(),
+                listener,
             },
         }
     }
@@ -3360,14 +3371,16 @@ pub async fn supervisor(
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
-    let async_fd =
-        match tokio::io::unix::AsyncFd::with_interest(notif_fd, tokio::io::Interest::READABLE) {
-            Ok(fd) => fd,
-            Err(err) => {
-                let _ = startup.send(Err(err));
-                return;
-            }
-        };
+    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+        Arc::new(notif_fd),
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = startup.send(Err(err));
+            return;
+        }
+    };
     let fd = async_fd.get_ref().as_raw_fd();
 
     // Build the dispatch table once at startup.
@@ -3393,7 +3406,7 @@ pub async fn supervisor(
     // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
-    let mut parked = ParkedSet::new();
+    let mut parked = ParkedSet::new(Arc::clone(async_fd.get_ref()));
 
     // Edge-triggered drain: each `readable().await` returns once per
     // epoll edge, then we drain the kernel queue via `probe_notif_fd`
@@ -3535,6 +3548,7 @@ mod tests {
     fn test_offload() -> Offload {
         Offload {
             gate: super::super::gate::MemGate::default(),
+            listener: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
         }
     }
 
