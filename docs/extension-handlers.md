@@ -377,7 +377,7 @@ The contract is exercised at two layers:
 | `InjectFd { srcfd, targetfd }` | Inject `srcfd` into the guest at slot `targetfd`, then continue. |
 | `InjectFdSendTracked { srcfd, newfd_flags, on_success }` | Inject `srcfd`; `on_success` callback runs synchronously when the kernel returns the slot, so downstream tracking cannot race with the guest seeing the new fd. |
 | `Kill { sig, pgid }` | Send `sig` to the guest's process group. |
-| `Defer(Deferred)` | Run the carried future off the supervisor loop; its terminal action is sent later, keyed by `notif.id`. Non-`Continue`, so it ends the chain. See [Deferred handlers](#deferred-handlers). |
+| `Defer(Deferred)` | Run the carried future off the supervisor loop. A `Continue` result resumes the chain at the next handler; any other result is the decision. See [Deferred handlers](#deferred-handlers). |
 
 `InjectFd`/`InjectFdSend`/`InjectFdSendTracked` carry a file descriptor. To synthesise *content*
 (rather than inject an fd you already hold), construct the action with
@@ -464,13 +464,13 @@ user handlers.
 
 ### Deferred handlers
 
-Continue-site safety exists because the supervisor processes notifications sequentially: a handler
-that blocks (a network round-trip, a blocking syscall, a slow lock) stalls every other trapped
-syscall until it returns. `NotifAction::Defer` is the escape hatch. A handler that returns `Defer`
-hands the supervisor an owned, `'static` future; the supervisor moves it onto a worker task, lets
-the notification loop proceed immediately, and sends the response (keyed by `notif.id`) when the
-future resolves. The trapped child stays parked in the syscall until then, so `notif.id` stays
-valid and the child-memory helpers keep working inside the deferred future.
+The supervisor processes notifications sequentially: a handler that blocks (a network round-trip,
+a blocking syscall, a slow lock) stalls every other trapped syscall until it returns.
+`NotifAction::Defer` is the escape hatch. A handler that returns `Defer` hands the supervisor an
+owned, `'static` future; the supervisor runs it on a task, lets the notification loop proceed, and
+picks the notification up again when the future resolves. The trapped child stays blocked in the
+syscall until then, so `notif.id` stays valid and the child-memory helpers keep working inside the
+deferred future.
 
 ```rust
 use std::future::Future;
@@ -482,17 +482,14 @@ fn handle<'a>(
     &'a self,
     cx: &'a HandlerCtx,
 ) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
-    // Copy out what the deferred future needs: `notif` is `Copy`, `notif_fd`
-    // is a `RawFd`, and `Arc` state is cloned. Never borrow `&self`/`cx`:
-    // the deferred future is `'static` and outlives this call.
+    // The deferred future is `'static` and outlives this call: copy `notif`,
+    // clone `Arc` state, never borrow `&self`/`cx`.
     let (fd, id, pid) = (cx.notif_fd, cx.notif.id, cx.notif.pid);
     let key = read_child_cstr(fd, id, pid, cx.notif.data.args[1], 4096);
     let backend = self.backend.clone();
     Box::pin(async move {
         let Some(key) = key else { return NotifAction::Continue };
         NotifAction::defer(async move {
-            // Runs on a worker, off the supervisor loop. The child is still
-            // parked, so child-memory helpers and `id` are valid here.
             match backend.get(&key).await {
                 Ok(_data) => NotifAction::ReturnValue(0), // e.g. inject a memfd of `_data`
                 Err(_) => NotifAction::Errno(libc::EIO),
@@ -502,30 +499,25 @@ fn handle<'a>(
 }
 ```
 
-The deferred future must be `Send + 'static`: `Send` so the supervisor can move it onto a worker,
-and `'static` so it can outlive the borrowed `HandlerCtx`. It does **not** need to be `Sync` (the
-supervisor moves it, never shares it by reference). Capture owned data only: copy `notif` (it is
-`Copy`), clone an `Arc` for shared state, and never borrow `&self`/`cx`.
+The deferred future must be `Send + 'static`; it does **not** need to be `Sync` (the supervisor
+moves it, never shares it by reference).
 
 Contract:
 
-- **Terminal decision.** `Defer` is non-`Continue`, so it short-circuits the handler chain exactly
-  like `Errno`/`ReturnValue`: later handlers on the same syscall do not run. A deferring handler
-  decides the outcome.
-- **No deferral on freeze/fork syscalls.** Deferral is refused (with `EPERM`) on
-  `execve`/`execveat` and fork-creating syscalls, because moving the response off-loop would skip
-  the argv-safety freeze (see [issue #27][i27]) and process creation-tracking that those paths
-  require before `Continue`.
-- **Bounded fan-out.** At most `DEFER_MAX_INFLIGHT` deferred futures run concurrently; beyond that,
-  further deferrals fail fast with `EAGAIN` rather than queuing. The cap also bounds the resources
-  workers hold (memfds, sockets).
-- **No nesting.** A deferred future that itself resolves to `Defer` is a bug; the supervisor
-  collapses it to `EIO` so the child is never left wedged.
-- **Stale id.** If the child exits mid-defer, the eventual `send_response` is a no-op and the
-  child-memory helpers fail safe (they are `id_valid`-bracketed), matching the inline path's
-  "child may have exited" tolerance.
+- **Resumes the chain.** A `Continue` result runs the next handler on the same syscall; any
+  other result ends the chain. Either way the outcome then passes every check a handler's inline
+  result would: pinned opens, fork accounting, the policy callback and the execve argv-safety
+  freeze (see [issue #27][i27]). Deferring on `execve` or `fork` is therefore safe.
+- **Deadline.** All deferred futures of one notification share a 30 second deadline; past it the syscall
+  fails with `EIO`.
+- **No admission limit.** Each trapped task has at most one outstanding notification, so deferred
+  work is already bounded by the number of tasks in the sandbox.
+- **No nesting.** A deferred future that resolves to another `Defer` is a bug; the supervisor turns it
+  into `EIO` so the child is never left wedged.
+- **Stale id.** If the child exits mid-defer, the chain is dropped and the child-memory helpers
+  fail safe (they are `id_valid`-bracketed).
 
-Do not defer trivial fast handlers: the worker hop adds latency. Defer only when the work would
+Do not defer trivial fast handlers: the task hop adds latency. Defer only when the work would
 otherwise block the loop.
 
 ## Security boundary
