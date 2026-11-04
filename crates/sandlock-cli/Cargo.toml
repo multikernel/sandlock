@@ -21,7 +21,7 @@ default = ["http", "checkpoint", "image", "profiles", "cow"]
 http = ["sandlock-core/http"]
 
 [dependencies]
-sandlock-core = { version = "0.9.0", path = "../sandlock-core", default-features = false, features = ["cli"] }
+sandlock-core = { version = "0.9.1", path = "../sandlock-core", default-features = false, features = ["cli"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
