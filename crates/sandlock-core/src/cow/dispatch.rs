@@ -1122,7 +1122,7 @@ pub(crate) async fn handle_cow_stat(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
             return NotifAction::Continue;
         }
         let real = match cow.handle_stat(&path) {
@@ -1226,7 +1226,7 @@ pub(crate) async fn handle_cow_statx(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
             return NotifAction::Continue;
         }
         let real = match cow.handle_stat(&path) {
@@ -1311,7 +1311,7 @@ pub(crate) async fn handle_cow_exec(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &resolved);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
             return NotifAction::Continue;
         }
         let real = match cow.handle_stat(&path) {
@@ -1404,7 +1404,7 @@ pub(crate) async fn handle_cow_readlink(
     };
 
     let path = map_cow_upper_path(cow, &path);
-    if !cow.has_changes() || !cow.matches(&path) {
+    if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
         return NotifAction::Continue;
     }
 

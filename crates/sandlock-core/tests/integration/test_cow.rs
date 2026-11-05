@@ -2106,6 +2106,74 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// A read is intercepted only for a path the branch actually owns; anything
+/// else must reach the kernel, not the supervisor. /proc/self and a pipe
+/// made in the child (not inherited, so the supervisor has no fd of the
+/// same number pointing at it) make the unowned case observable, since
+/// intercepted they'd answer for the supervisor instead of the caller.
+#[tokio::test]
+async fn test_seccomp_cow_read_intercept_follows_ownership() {
+    let staged = std::env::temp_dir().join(format!("sandlock-proc-self-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staged);
+
+    let script = format!(
+        concat!(
+            "import os, sys\n",
+            "os.mkdir('{staged}')\n", // staged in upper, this one must be intercepted
+            "dfd = os.open('/etc', os.O_RDONLY | os.O_DIRECTORY)\n",
+            "exe = os.readlink('/proc/self/exe', dir_fd=dfd)\n",
+            "r, w = os.pipe()\n",
+            "own_pipe = os.stat('/proc/self/fd/%d' % r).st_ino == os.fstat(r).st_ino\n",
+            "staged_ok = os.path.isdir('{staged}')\n",
+            "sys.stdout.write(exe + '\\n' + str(own_pipe) + '\\n' + str(staged_ok))\n",
+        ),
+        staged = staged.display()
+    );
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .workdir("/")
+        .cwd("/tmp")
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+
+    let out = result.stdout_str().unwrap_or("").to_string();
+    let mut lines = out.lines();
+    let exe = lines.next().unwrap_or("");
+    let own_pipe = lines.next().unwrap_or("");
+    let staged_ok = lines.next().unwrap_or("");
+    assert!(
+        exe.contains("python"),
+        "not intercepted: /proc/self/exe must name the child's interpreter, not the supervisor: {exe}"
+    );
+    assert_eq!(
+        own_pipe, "True",
+        "not intercepted: /proc/self/fd/N must resolve to the child's own fd, not the supervisor's"
+    );
+    assert_eq!(
+        staged_ok, "True",
+        "intercepted: the staged directory is owned by the branch and must still be visible"
+    );
+
+    let _ = fs::remove_dir_all(&staged);
+}
+
 /// readlink(path, buf, size) and readlinkat(dirfd, path, buf, size) do not
 /// share an argument layout. Read as readlinkat, a legacy readlink has its
 /// output buffer taken as the path, so the branch never recognises the call
