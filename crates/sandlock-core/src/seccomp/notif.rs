@@ -3369,13 +3369,16 @@ pub async fn supervisor(
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
-    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-        Arc::new(notif_fd),
-        tokio::io::Interest::READABLE,
-    ) {
+    // SAFETY: the AsyncFd holds a strong reference, so the fd outlives it.
+    let async_fd = match unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(
+            Arc::new(notif_fd),
+            tokio::io::Interest::READABLE,
+        )
+    } {
         Ok(fd) => fd,
         Err(err) => {
-            let _ = startup.send(Err(err));
+            let _ = startup.send(Err(err.into()));
             return;
         }
     };
@@ -3499,18 +3502,20 @@ pub(crate) fn spawn_pid_watcher(
     pidfd: Arc<std::os::unix::io::OwnedFd>,
 ) {
     tokio::spawn(async move {
-        let async_fd =
-            match tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE) {
-                Ok(f) => f,
-                Err(_) => {
-                    // AsyncFd registration failed (extremely unusual);
-                    // fall back to immediate cleanup so we don't leak the
-                    // index entry. The process is still alive, so its slot
-                    // stays held until `release_exited_slots` sees it die.
-                    cleanup_pid(&ctx, key).await;
-                    return;
-                }
-            };
+        // SAFETY: the AsyncFd holds a strong reference, so the fd outlives it.
+        let async_fd = match unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE)
+        } {
+            Ok(f) => f,
+            Err(_) => {
+                // AsyncFd registration failed (extremely unusual);
+                // fall back to immediate cleanup so we don't leak the
+                // index entry. The process is still alive, so its slot
+                // stays held until `release_exited_slots` sees it die.
+                cleanup_pid(&ctx, key).await;
+                return;
+            }
+        };
         // pidfd becomes readable when the process exits; we don't
         // read any data, so `readable()` is just an await point.
         let _ = async_fd.readable().await;

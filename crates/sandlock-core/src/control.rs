@@ -224,7 +224,8 @@ fn peer_cred(fd: RawFd) -> Option<libc::ucred> {
 
 fn into_async(fd: ControlFd) -> Option<AsyncFd<ControlFd>> {
     fd.set_nonblocking().ok()?;
-    AsyncFd::new(fd).ok()
+    // SAFETY: the AsyncFd owns the ControlFd, which closes only on drop.
+    unsafe { AsyncFd::register(fd) }.ok()
 }
 
 async fn accept(listener: &AsyncFd<ControlFd>) -> std::io::Result<ControlFd> {
@@ -311,7 +312,8 @@ async fn control_loop(
         if peer_cred(stream.as_raw_fd()).map(|c| c.uid) != Some(my_uid) {
             continue;
         }
-        let Ok(stream) = AsyncFd::new(stream).map(ControlStream) else {
+        // SAFETY: the AsyncFd owns the ControlFd, which closes only on drop.
+        let Ok(stream) = unsafe { AsyncFd::register(stream) }.map(ControlStream) else {
             continue;
         };
         let _ = tokio::time::timeout(

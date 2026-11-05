@@ -813,7 +813,9 @@ fn exit_watcher(pid: i32) -> Option<tokio::io::unix::AsyncFd<std::os::unix::io::
         return None;
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-    tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).ok()
+    // SAFETY: the AsyncFd owns the pidfd.
+    unsafe { tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }
+        .ok()
 }
 
 /// Outcome of handling one running-container control command.
