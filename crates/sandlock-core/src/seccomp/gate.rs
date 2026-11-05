@@ -1,9 +1,10 @@
-//! Orders off-loop writes to child memory against execve argv validation.
+//! Orders writes to child memory against the freezes that read it.
 //!
-//! Parked work runs with its sandbox's gate installed, and every write to
-//! child memory holds the shared side for that one write. The exec freeze
-//! holds the exclusive side, so no parked write can land on a peer's argv
-//! between its validation and the kernel copying it.
+//! Every handler, inline or parked, runs with its sandbox's gate installed,
+//! and each write to child memory holds the shared side for that one write.
+//! The exec freeze and a checkpoint capture hold the exclusive side, so no
+//! write lands on memory they are reading. The exec freeze writes nothing
+//! while it holds the gate, so the loop never waits on itself.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -39,8 +40,7 @@ impl MemGate {
     }
 }
 
-/// Run one write to child memory under the installed gate, if any. The
-/// notification loop installs none: nothing else runs on it during a freeze.
+/// Run one write to child memory under the installed gate, if any.
 pub(crate) fn write<T>(work: impl FnOnce() -> T) -> T {
     let gate = TASK_GATE
         .try_with(MemGate::clone)

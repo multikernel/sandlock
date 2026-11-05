@@ -1034,6 +1034,7 @@ mod tests {
             policy: Arc::new(fake_policy(argv_safety_required)),
             child_pidfd: None,
             notif_fd: -1,
+            mem_gate: Default::default(),
         })
     }
 

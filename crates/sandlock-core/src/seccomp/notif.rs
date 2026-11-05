@@ -152,7 +152,8 @@ impl Deferred {
 }
 
 /// What one sandbox's parked work shares: the gate ordering its child-memory
-/// writes against exec, and the listener its native closures may outlive.
+/// writes against exec and checkpoint, and the listener its native closures
+/// may outlive.
 #[derive(Clone)]
 struct Offload {
     gate: super::gate::MemGate,
@@ -2934,14 +2935,11 @@ struct ParkedSet {
 }
 
 impl ParkedSet {
-    fn new(listener: Arc<OwnedFd>) -> Self {
+    fn new(listener: Arc<OwnedFd>, gate: super::gate::MemGate) -> Self {
         Self {
             tasks: tokio::task::JoinSet::new(),
             callers: HashMap::new(),
-            offload: Offload {
-                gate: super::gate::MemGate::default(),
-                listener,
-            },
+            offload: Offload { gate, listener },
         }
     }
 
@@ -3406,7 +3404,7 @@ pub async fn supervisor(
     // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
-    let mut parked = ParkedSet::new(Arc::clone(async_fd.get_ref()));
+    let mut parked = ParkedSet::new(Arc::clone(async_fd.get_ref()), ctx.mem_gate.clone());
 
     // Edge-triggered drain: each `readable().await` returns once per
     // epoll edge, then we drain the kernel queue via `probe_notif_fd`
@@ -3453,7 +3451,15 @@ pub async fn supervisor(
                         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
                     };
-                    handle_notification(notif, &ctx, &dispatch_table, fd, &mut parked).await;
+                    let gate = parked.offload.gate.clone();
+                    gate.scope(handle_notification(
+                        notif,
+                        &ctx,
+                        &dispatch_table,
+                        fd,
+                        &mut parked,
+                    ))
+                    .await;
                 }
                 NotifFdState::Empty => break,
                 NotifFdState::Terminal => break 'outer,

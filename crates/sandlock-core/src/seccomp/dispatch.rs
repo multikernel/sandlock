@@ -1330,6 +1330,7 @@ mod handler_tests {
             }),
             child_pidfd: None,
             notif_fd: -1,
+            mem_gate: Default::default(),
         })
     }
 

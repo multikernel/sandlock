@@ -41,4 +41,7 @@ pub struct SupervisorCtx {
     pub child_pidfd: Option<RawFd>,
     /// Seccomp notification fd (for on-behalf operations).
     pub notif_fd: RawFd,
+    /// Orders deferred work's writes to child memory against the freezes
+    /// that read it: exec and checkpoint.
+    pub(crate) mem_gate: super::gate::MemGate,
 }
