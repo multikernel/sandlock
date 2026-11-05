@@ -5,12 +5,13 @@
 //! Works on any Linux 5.9+ kernel with seccomp user notification.
 
 use crate::result::{Entry, EntryKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::error::BranchError;
@@ -32,7 +33,7 @@ fn parent_rel(rel: &str) -> Option<&str> {
 
 /// Errno for a branch failure, for handlers that answer the child directly
 /// (the `handle_unlink` convention) rather than returning a `BranchError`.
-pub(super) fn branch_errno(e: BranchError) -> i32 {
+pub(crate) fn branch_errno(e: BranchError) -> i32 {
     match e {
         BranchError::QuotaExceeded => libc::ENOSPC,
         BranchError::Denied => libc::EPERM,
@@ -57,7 +58,83 @@ pub enum CowCopyPlan {
         upper: PathBuf,
         lower: PathBuf,
         file_size: u64,
+        ticket: CopyTicket,
     },
+    /// Another caller is copying this file; plan again once it is done.
+    InFlight(CopyDone),
+}
+
+#[derive(Debug, Default)]
+struct CopySignal {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// Held by whoever runs a copy-up `prepare_copy` handed out. Dropping it
+/// wakes the waiters, so a copier that fails cannot strand them.
+#[derive(Debug)]
+pub struct CopyTicket(Arc<CopySignal>);
+
+impl Drop for CopyTicket {
+    fn drop(&mut self) {
+        *self.0.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.cv.notify_all();
+    }
+}
+
+/// Released when the copy-up it watches has been installed or given up.
+#[derive(Debug, Clone)]
+pub struct CopyDone(Arc<CopySignal>);
+
+impl CopyDone {
+    /// Blocks, so only work off the notification loop may wait.
+    pub fn wait(&self) {
+        let mut done = self.0.done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = self.0.cv.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        *self.0.done.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// What `plan_copy` found at a path.
+enum LowerCopy {
+    Ready(PathBuf),
+    Needed { upper: PathBuf, file_size: u64 },
+}
+
+/// A copy-up streamed to a private file beside the upper, not yet visible in
+/// the merged view. Dropping it discards the file.
+pub struct StagedCopy {
+    tmp: PathBuf,
+    digest: Option<[u8; 32]>,
+}
+
+impl Drop for StagedCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
+}
+
+/// What became of a staged copy-up.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CopyInstall {
+    /// The upper holds the file, from this copy or one that got there first.
+    Ready,
+    /// The path was deleted meanwhile; the caller plans again.
+    Replan,
+}
+
+/// What a write must find in the upper before it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyUp {
+    Nothing,
+    Entry(String),
+    /// A directory with everything below it in the lower.
+    Tree(String),
 }
 
 /// Plan returned by `prepare_open` — describes what I/O to do after releasing the lock.
@@ -71,13 +148,9 @@ pub enum CowOpenPlan {
     Deleted,
     /// File already resolved (upper or lower) — open this path directly.
     Resolved(PathBuf),
-    /// Need to copy lower to upper, then open upper.
-    NeedsCopy {
-        upper: PathBuf,
-        lower: PathBuf,
-        file_size: u64,
-        rel_path: String,
-    },
+    /// The file must be copied into the upper first, by this caller or by
+    /// the one already copying it.
+    Copy { rel_path: String, plan: CowCopyPlan },
     /// Upper path ready (already exists in upper, or new file placeholder).
     UpperReady { upper: PathBuf },
 }
@@ -729,6 +802,8 @@ pub struct SeccompCowBranch {
     keep_if_abandoned: bool,
     max_disk_bytes: u64,
     disk_used: u64,
+    /// Copy-ups staged but not yet installed, with the bytes each reserved.
+    copying: HashMap<String, (u64, CopyDone)>,
 }
 
 /// The entry at `rel` under `root`, confined and without following
@@ -982,7 +1057,14 @@ impl SeccompCowBranch {
             keep_if_abandoned: false,
             max_disk_bytes,
             disk_used: 0,
+            copying: HashMap::new(),
         })
+    }
+
+    /// Where copy-ups are staged: on the upper's filesystem, but outside the
+    /// merged view and anything a commit publishes.
+    pub fn staging_dir(&self) -> &Path {
+        &self.storage_dir
     }
 
     /// The upper directory where writes are stored.
@@ -1135,27 +1217,56 @@ impl SeccompCowBranch {
         Ok(())
     }
 
-    /// Recalculate `disk_used` by walking the upper directory.
+    /// Recalculate `disk_used` by walking the upper directory. Staged copies
+    /// are not in it yet, so their reservations are added back.
     fn recalc_disk_used(&mut self) {
-        self.disk_used = dir_size(&self.upper);
+        self.copying.retain(|_, (_, done)| !done.is_done());
+        let staged: u64 = self.copying.values().map(|(bytes, _)| bytes).sum();
+        self.disk_used = dir_size(&self.upper) + staged;
     }
 
-    /// Prepare a COW copy: update metadata (deleted set, quota reservation)
-    /// and handle small items (symlinks, dirs) immediately, but defer large
-    /// file copies to the caller. This is the shared core used by both
-    /// `ensure_cow_copy` (synchronous) and the async two-phase dispatch.
+    /// `plan_copy` for a caller that copies outside the branch lock. A file
+    /// someone is already copying is not copied twice: the caller waits and
+    /// plans again. The ticket goes back to `finish_copy`.
     pub fn prepare_copy(&mut self, rel_path: &str) -> Result<CowCopyPlan, BranchError> {
+        if let Some((_, done)) = self.copying.get(rel_path) {
+            if !done.is_done() {
+                return Ok(CowCopyPlan::InFlight(done.clone()));
+            }
+            self.copying.remove(rel_path);
+        }
+        Ok(match self.plan_copy(rel_path)? {
+            LowerCopy::Ready(upper) => CowCopyPlan::Ready(upper),
+            LowerCopy::Needed { upper, file_size } => {
+                let signal = Arc::new(CopySignal::default());
+                self.copying.insert(
+                    rel_path.to_string(),
+                    (file_size, CopyDone(Arc::clone(&signal))),
+                );
+                CowCopyPlan::NeedsCopy {
+                    upper,
+                    lower: self.workdir.join(rel_path),
+                    file_size,
+                    ticket: CopyTicket(signal),
+                }
+            }
+        })
+    }
+
+    /// Plan a COW copy: update metadata (deleted set, quota reservation)
+    /// and handle small items (symlinks, dirs) immediately, but leave the
+    /// potentially large file copy to the caller.
+    fn plan_copy(&mut self, rel_path: &str) -> Result<LowerCopy, BranchError> {
         self.has_changes = true;
         self.touch_parents(rel_path);
         self.touch(rel_path);
 
         let upper_file = self.upper.join(rel_path);
-        let lower_file = self.workdir.join(rel_path);
 
         // Already materialized in upper? Confined lstat succeeds for any
         // existing entry (including a dangling symlink).
         if crate::sys::fs::statat_in_root(&self.upper, rel_path, false).is_ok() {
-            return Ok(CowCopyPlan::Ready(upper_file));
+            return Ok(LowerCopy::Ready(upper_file));
         }
 
         if let Some(p) = parent_rel(rel_path) {
@@ -1168,7 +1279,7 @@ impl SeccompCowBranch {
         // in the merged view (and what makes a re-created directory opaque).
         if self.deleted.covers(rel_path) {
             self.check_quota(0)?;
-            return Ok(CowCopyPlan::Ready(upper_file));
+            return Ok(LowerCopy::Ready(upper_file));
         }
 
         // Classify the lower entry confined to the workdir root, so a symlinked
@@ -1177,14 +1288,14 @@ impl SeccompCowBranch {
         let st = match crate::sys::fs::statat_in_root(&self.workdir, rel_path, false) {
             Ok(st) => st,
             // Absent or confined-out: treat as a new file created in upper.
-            // EACCES gets the same disposition as execute_copy's source-open
+            // EACCES gets the same disposition as stage_copy's source-open
             // gives it: the supervisor cannot see inside the lower directory
             // (e.g. /root under a workdir of "/"), so the write proceeds on
             // an empty upper file rather than falling through to a real
             // permission error the virtualized child was promised not to hit.
             Err(libc::ENOENT) | Err(libc::EACCES) => {
                 self.check_quota(0)?;
-                return Ok(CowCopyPlan::Ready(upper_file));
+                return Ok(LowerCopy::Ready(upper_file));
             }
             Err(e) => {
                 return Err(BranchError::Io {
@@ -1212,7 +1323,7 @@ impl SeccompCowBranch {
                     source: std::io::Error::from_raw_os_error(e),
                 })?;
             self.disk_used += 256;
-            return Ok(CowCopyPlan::Ready(upper_file));
+            return Ok(LowerCopy::Ready(upper_file));
         }
 
         // Directory — create immediately (no data copy)
@@ -1226,7 +1337,7 @@ impl SeccompCowBranch {
             )?;
             let _ = crate::sys::fs::chmod_in_root(&self.upper, rel_path, st.st_mode & 0o7777);
             self.disk_used += 4096;
-            return Ok(CowCopyPlan::Ready(upper_file));
+            return Ok(LowerCopy::Ready(upper_file));
         }
 
         if Self::is_kernel_object_kind(kind) {
@@ -1235,34 +1346,33 @@ impl SeccompCowBranch {
 
         // Regular file — defer the potentially expensive copy. Size comes from
         // the confined lstat, so the quota reservation matches the file
-        // execute_copy will actually read.
+        // stage_copy will actually read.
         let file_size = st.st_size as u64;
         self.check_quota(file_size)?;
         self.disk_used += file_size;
-        Ok(CowCopyPlan::NeedsCopy {
+        Ok(LowerCopy::Needed {
             upper: upper_file,
-            lower: lower_file,
             file_size,
         })
     }
 
-    /// Execute a file copy synchronously. Used by `ensure_cow_copy` and the
-    /// async dispatch (via `spawn_blocking`).
-    pub fn execute_copy(
+    /// Stream the lower file at `rel` into a private file in `staging_dir`.
+    /// Nothing appears in the upper until `install_staged`, so a copy running
+    /// beside other handlers never shows them a half-written file.
+    pub fn stage_copy(
         workdir_root: &Path,
-        upper_root: &Path,
+        staging_dir: &Path,
         rel: &str,
-    ) -> Result<Option<[u8; 32]>, std::io::Error> {
-        let create_dest = || -> Result<fs::File, std::io::Error> {
-            let fd = crate::sys::fs::openat2_in_root(
-                upper_root,
-                rel,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-            .map_err(std::io::Error::from_raw_os_error)?;
-            Ok(unsafe { fs::File::from_raw_fd(fd) })
-        };
+    ) -> Result<StagedCopy, std::io::Error> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = staging_dir.join(format!(".copy-{}-{}", std::process::id(), n));
+        let dest = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let mut staged = StagedCopy { tmp, digest: None };
 
         // Read the lower source confined to the workdir root: a symlink or
         // `..` in `rel` cannot escape the tree (issue #112).
@@ -1276,10 +1386,7 @@ impl SeccompCowBranch {
             // Unreadable (EACCES) or confined-out / absent (ENOENT): give the
             // child an empty COW file so writes proceed, never leaking the
             // escape target.
-            Err(libc::EACCES) | Err(libc::ENOENT) => {
-                create_dest()?;
-                return Ok(None);
-            }
+            Err(libc::EACCES) | Err(libc::ENOENT) => return Ok(staged),
             // On a kernel without openat2 (ENOSYS) the copy fails and the caller
             // rolls back / returns Continue; the child then hits Landlock, which
             // is the backstop. Do not "fix" this with an unconfined fs::copy.
@@ -1293,105 +1400,183 @@ impl SeccompCowBranch {
         // #158). O_NONBLOCK above makes the FIFO open itself return instead
         // of waiting for a writer; on a regular file it is a no-op for reads.
         if !src.metadata()?.file_type().is_file() {
-            create_dest()?;
-            return Ok(None);
+            return Ok(staged);
         }
-        let mut dst = Sha256Writer::new(create_dest()?);
+        let mut dst = Sha256Writer::new(dest);
         std::io::copy(&mut src, &mut dst)?;
         if let Ok(meta) = src.metadata() {
             let _ = dst.inner.set_permissions(meta.permissions());
         }
-        Ok(Some(dst.finish()))
+        staged.digest = Some(dst.finish());
+        Ok(staged)
     }
 
-    /// Ensure a COW copy exists in upper (synchronous). Returns the upper path.
-    /// For callers that don't need async two-phase behavior.
-    pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<PathBuf, BranchError> {
-        match self.prepare_copy(rel_path)? {
-            CowCopyPlan::Ready(upper) => Ok(upper),
-            CowCopyPlan::NeedsCopy {
-                upper,
-                lower: _lower,
-                file_size,
-            } => match Self::execute_copy(&self.workdir, &self.upper, rel_path) {
-                Ok(digest) => {
-                    if let Some(d) = digest {
-                        self.record_digest(rel_path, d);
-                    }
-                    Ok(upper)
-                }
-                Err(e) => {
-                    self.rollback_copy(file_size);
-                    Err(BranchError::Operation(format!("copy: {}", e)))
-                }
-            },
-        }
-    }
-
-    /// Copy a lower tree into the upper, entry by entry, so a directory
-    /// rename can be staged in the branch without losing the contents
-    /// (issue #160). Each entry goes through the same confined,
-    /// quota-accounted single-entry copy-up, so symlinks are copied verbatim
-    /// and never followed (issue #112).
-    ///
-    /// Staging is all-or-nothing: a mid-tree failure (EACCES, EIO, quota)
-    /// must propagate rather than truncate the copy, because the caller
-    /// whiteouts the source afterwards and untraversed children would be
-    /// silently lost at commit. On failure every upper entry this staging
-    /// created is removed again and the quota re-derived.
-    fn copy_up_tree(&mut self, rel: &str) -> Result<(), i32> {
-        let mut created: Vec<String> = Vec::new();
-        let result = self.stage_tree(rel, &mut created);
-        if result.is_err() {
-            for c in created.iter().rev() {
-                let is_dir = crate::sys::fs::statat_in_root(&self.upper, c, false)
-                    .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
-                    .unwrap_or(false);
-                if is_dir {
-                    let _ = crate::sys::fs::remove_dir_all_in_root(&self.upper, c);
-                } else {
-                    let _ = crate::sys::fs::unlinkat_in_root(&self.upper, c, false);
-                }
+    /// Move a staged copy into the upper. Never replaces: a copy that got
+    /// there first may already carry a writer's data.
+    fn install_staged(
+        &mut self,
+        rel_path: &str,
+        file_size: u64,
+        staged: Result<StagedCopy, std::io::Error>,
+    ) -> Result<CopyInstall, std::io::Error> {
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.rollback_copy(file_size);
+                return Err(e);
             }
-            self.recalc_disk_used();
-        }
+        };
+        // Installing a path deleted while the copy ran would bring it back.
+        let result = if self.deleted.covers(rel_path) {
+            Ok(CopyInstall::Replan)
+        } else {
+            match crate::sys::fs::install_in_root(&staged.tmp, &self.upper, rel_path) {
+                Ok(()) => {
+                    if let Some(digest) = staged.digest {
+                        self.record_digest(rel_path, digest);
+                    }
+                    return Ok(CopyInstall::Ready);
+                }
+                Err(libc::EEXIST) => Ok(CopyInstall::Ready),
+                Err(e) => Err(std::io::Error::from_raw_os_error(e)),
+            }
+        };
+        self.rollback_copy(file_size);
         result
     }
 
-    /// The traversal half of `copy_up_tree`: an explicit worklist (child
-    /// directory depth must not become supervisor stack depth) that records
-    /// every upper entry it creates into `created` for rollback.
-    fn stage_tree(&mut self, root: &str, created: &mut Vec<String>) -> Result<(), i32> {
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(root.to_string());
-        while let Some(rel) = queue.pop_front() {
-            let was_in_upper = self.upper_has(&rel);
-            self.ensure_cow_copy(&rel).map_err(branch_errno)?;
-            if !was_in_upper && self.upper_has(&rel) {
-                created.push(rel.clone());
+    /// Settle a copy `prepare_copy` handed out. The ticket drops last, so the
+    /// waiters it wakes find the outcome in place.
+    pub fn finish_copy(
+        &mut self,
+        rel_path: &str,
+        file_size: u64,
+        _ticket: CopyTicket,
+        staged: Result<StagedCopy, std::io::Error>,
+    ) -> Result<CopyInstall, std::io::Error> {
+        self.copying.remove(rel_path);
+        self.install_staged(rel_path, file_size, staged)
+    }
+
+    /// `prepare_copy` for every entry in `rels`, all or nothing: on a refusal
+    /// the entries planned so far are given up and removed again, so a write
+    /// the branch refuses leaves no trace. Only the copies still to run come
+    /// back.
+    pub fn prepare_copies(
+        &mut self,
+        rels: &[String],
+    ) -> Result<Vec<(String, CowCopyPlan)>, BranchError> {
+        let mut created = Vec::new();
+        let mut plans = Vec::new();
+        for rel in rels {
+            // A whiteouted child of a staged tree stays deleted.
+            if self.deleted.covers(rel) && !self.upper_has(rel) && rel != &rels[0] {
+                continue;
             }
-            let st = match crate::sys::fs::statat_in_root(&self.workdir, &rel, false) {
+            let had = self.upper_has(rel);
+            match self.prepare_copy(rel) {
+                Ok(CowCopyPlan::Ready(_)) => {
+                    if !had && self.upper_has(rel) {
+                        created.push(rel.clone());
+                    }
+                }
+                Ok(plan) => plans.push((rel.clone(), plan)),
+                Err(e) => {
+                    self.abandon_copies(plans);
+                    self.remove_created(&created);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(plans)
+    }
+
+    /// Give back copies planned but never run.
+    pub fn abandon_copies(&mut self, plans: impl IntoIterator<Item = (String, CowCopyPlan)>) {
+        for (rel, plan) in plans {
+            if let CowCopyPlan::NeedsCopy {
+                file_size, ticket, ..
+            } = plan
+            {
+                let cancelled = Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                let _ = self.finish_copy(&rel, file_size, ticket, cancelled);
+            }
+        }
+    }
+
+    fn remove_created(&mut self, created: &[String]) {
+        if created.is_empty() {
+            return;
+        }
+        for c in created.iter().rev() {
+            let is_dir = crate::sys::fs::statat_in_root(&self.upper, c, false)
+                .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                .unwrap_or(false);
+            if is_dir {
+                let _ = crate::sys::fs::remove_dir_all_in_root(&self.upper, c);
+            } else {
+                let _ = crate::sys::fs::unlinkat_in_root(&self.upper, c, false);
+            }
+        }
+        self.recalc_disk_used();
+    }
+
+    /// The upper copy of `rel`, which the dispatcher made before the write.
+    fn copied(&mut self, rel: &str) -> Result<PathBuf, BranchError> {
+        match self.plan_copy(rel)? {
+            LowerCopy::Ready(upper) => Ok(upper),
+            LowerCopy::Needed { file_size, .. } => {
+                self.rollback_copy(file_size);
+                Err(BranchError::Operation(format!("{rel} was not copied up")))
+            }
+        }
+    }
+
+    /// `root` and everything below it in the lower, parents first. It reads
+    /// only the lower, which the branch never writes, so it needs no lock.
+    /// An explicit worklist: child directory depth must not become supervisor
+    /// stack depth.
+    pub fn lower_tree(workdir: &Path, root: &str) -> Result<Vec<String>, i32> {
+        let mut tree = Vec::new();
+        let mut queue = std::collections::VecDeque::from([root.to_string()]);
+        while let Some(rel) = queue.pop_front() {
+            let st = crate::sys::fs::statat_in_root(workdir, &rel, false);
+            tree.push(rel.clone());
+            let st = match st {
                 Ok(st) => st,
-                // Upper-only entry: nothing below it in the lower to stage.
+                // Upper-only entry: nothing below it in the lower.
                 Err(libc::ENOENT) => continue,
                 Err(e) => return Err(e),
             };
             if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
                 continue;
             }
-            let rd = fs::read_dir(self.workdir.join(&rel))
-                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            for entry in rd {
-                let entry = entry.map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let child = format!("{}/{}", rel, name);
-                if self.deleted.covers(&child) && !self.upper_has(&child) {
-                    continue;
-                }
-                queue.push_back(child);
+            let io = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+            for entry in fs::read_dir(workdir.join(&rel)).map_err(io)? {
+                let name = entry.map_err(io)?.file_name();
+                queue.push_back(format!("{}/{}", rel, name.to_string_lossy()));
             }
         }
-        Ok(())
+        Ok(tree)
+    }
+
+    /// What a rename of `rel` must copy up: a directory takes its lower tree
+    /// along, so the rename can be staged without losing the contents
+    /// (issue #160).
+    pub fn rename_copy_up(&self, rel: String) -> CopyUp {
+        match self.merged_entry_is_dir(&rel) {
+            Some(true) => CopyUp::Tree(rel),
+            _ => CopyUp::Entry(rel),
+        }
+    }
+
+    /// What a hard link from `rel` must copy up. linkat on a directory is the
+    /// kernel's EPERM to give; staging it would leave a meaningless empty dir.
+    pub fn link_copy_up(&self, rel: String) -> CopyUp {
+        match self.merged_entry_is_dir(&rel) {
+            Some(true) => CopyUp::Nothing,
+            _ => CopyUp::Entry(rel),
+        }
     }
 
     /// Resolve a read path: upper if modified, else lower.
@@ -1405,82 +1590,6 @@ impl SeccompCowBranch {
     }
 
     // ---- Syscall handlers (called by cow::dispatch) ----
-
-    /// Handle openat: resolve to upper or lower path.
-    ///
-    /// Returns `Err(QuotaExceeded)` when the write would exceed `max_disk`.
-    ///
-    /// When a quota is active and the open is a write, resync `disk_used`
-    /// from the real upper directory first.  This catches growth from
-    /// `write()` syscalls on previously injected fds (which bypass the
-    /// seccomp supervisor) and prevents new opens once the quota is
-    /// exhausted.
-    pub fn handle_open(&mut self, path: &str, flags: u64) -> Result<Option<PathBuf>, BranchError> {
-        let rel = match self.safe_rel(path) {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-        if flags & O_DIRECTORY != 0 {
-            // A whiteouted directory must not fall through to the kernel:
-            // the lower directory still exists, so opendir would hand the
-            // child a live fd (and fstat its inode) where the merged answer
-            // is ENOENT.
-            if self.is_deleted(&rel) {
-                return Err(BranchError::Deleted);
-            }
-            return Ok(None);
-        }
-
-        let is_write = flags & WRITE_FLAGS != 0;
-
-        // Resync quota accounting before any write open so that bytes
-        // written through previously injected fds are counted.
-        if is_write && self.max_disk_bytes > 0 {
-            self.recalc_disk_used();
-            self.check_quota(0)?;
-        }
-
-        if self.is_deleted(&rel) {
-            if flags & O_CREAT != 0 {
-                return self.ensure_cow_copy(&rel).map(Some);
-            }
-            // Whiteout: the lower file still physically exists with its
-            // pre-delete bytes. Surface the deletion so the caller returns
-            // ENOENT rather than falling through to the lower file — matching
-            // the async prepare_open (CowOpenPlan::Deleted) and the stat/access
-            // handlers.
-            return Err(BranchError::Deleted);
-        }
-
-        if self.is_kernel_object(&rel) {
-            return Ok(None);
-        }
-
-        // O_EXCL: fail if file already exists (in upper or lower)
-        if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
-            // Confined existence check: a symlinked parent component must not
-            // let this probe follow out of the tree, which would turn O_EXCL
-            // into a host-file existence oracle (issue #112).
-            if crate::sys::fs::statat_in_root(&self.upper, &rel, false).is_ok()
-                || crate::sys::fs::statat_in_root(&self.workdir, &rel, false).is_ok()
-            {
-                return Err(BranchError::Exists);
-            }
-            // File truly doesn't exist — create in upper
-            return self.ensure_cow_copy(&rel).map(Some);
-        }
-
-        if is_write {
-            self.ensure_cow_copy(&rel).map(Some)
-        } else {
-            let resolved = self.resolve_read(&rel);
-            if resolved.exists() || resolved.is_symlink() {
-                Ok(Some(resolved))
-            } else {
-                Ok(None)
-            }
-        }
-    }
 
     /// Prepare an open without doing the file copy.
     ///
@@ -1562,19 +1671,13 @@ impl SeccompCowBranch {
 
     /// Prepare a COW copy for openat — wraps `prepare_copy` into `CowOpenPlan`.
     fn prepare_cow_copy(&mut self, rel_path: &str) -> Result<CowOpenPlan, BranchError> {
-        match self.prepare_copy(rel_path)? {
-            CowCopyPlan::Ready(upper) => Ok(CowOpenPlan::UpperReady { upper }),
-            CowCopyPlan::NeedsCopy {
-                upper,
-                lower,
-                file_size,
-            } => Ok(CowOpenPlan::NeedsCopy {
-                upper,
-                lower,
-                file_size,
+        Ok(match self.prepare_copy(rel_path)? {
+            CowCopyPlan::Ready(upper) => CowOpenPlan::UpperReady { upper },
+            plan => CowOpenPlan::Copy {
                 rel_path: rel_path.to_string(),
-            }),
-        }
+                plan,
+            },
+        })
     }
 
     /// Roll back quota reservation if the copy failed.
@@ -1730,6 +1833,37 @@ impl SeccompCowBranch {
             .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
     }
 
+    /// The merged view's refusal of a rename, if any.
+    pub fn check_rename(&self, old_path: &str, new_path: &str) -> Result<(), i32> {
+        match (self.safe_rel(old_path), self.safe_rel(new_path)) {
+            (Some(old_rel), Some(new_rel)) => self.check_rename_rel(&old_rel, &new_rel),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_rename_rel(&self, old_rel: &str, new_rel: &str) -> Result<(), i32> {
+        let src_is_dir = match self.merged_entry_is_dir(old_rel) {
+            Some(d) => d,
+            None => return Err(libc::ENOENT),
+        };
+        // Destination semantics come from the merged view: renaming onto an
+        // existing directory must replace it or refuse, never publish the
+        // union of the renamed tree and the pre-existing one (issue #160
+        // review). The kernel cannot give these answers because it sees only
+        // one layer at a time.
+        if let Some(dest_is_dir) = self.merged_entry_is_dir(new_rel) {
+            match (src_is_dir, dest_is_dir) {
+                (false, true) => return Err(libc::EISDIR),
+                (true, false) => return Err(libc::ENOTDIR),
+                (true, true) if !self.list_merged_dir(new_rel).is_empty() => {
+                    return Err(libc::ENOTEMPTY)
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Handle rename.
     ///
     /// Returns `Ok(true)` on success, `Ok(false)` when the branch does not
@@ -1748,26 +1882,12 @@ impl SeccompCowBranch {
         };
         self.touch_parents(&new_rel);
         self.touch(&new_rel);
-        let src_is_dir = match self.merged_entry_is_dir(&old_rel) {
-            Some(d) => d,
-            None => return Err(libc::ENOENT),
-        };
-        // Destination semantics come from the merged view: renaming onto an
-        // existing directory must replace it or refuse, never publish the
-        // union of the renamed tree and the pre-existing one (issue #160
-        // review). The kernel cannot give these answers because it sees only
-        // one layer at a time.
-        if let Some(dest_is_dir) = self.merged_entry_is_dir(&new_rel) {
-            match (src_is_dir, dest_is_dir) {
-                (false, true) => return Err(libc::EISDIR),
-                (true, false) => return Err(libc::ENOTDIR),
-                (true, true) if !self.list_merged_dir(&new_rel).is_empty() => {
-                    return Err(libc::ENOTEMPTY)
-                }
-                _ => {}
-            }
+        self.check_rename_rel(&old_rel, &new_rel)?;
+        // The dispatcher copied the tree; a missing source would let the
+        // rename lose it.
+        if !self.upper_has(&old_rel) {
+            return Err(libc::EIO);
         }
-        self.copy_up_tree(&old_rel)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
@@ -1852,7 +1972,7 @@ impl SeccompCowBranch {
         if src_is_dir {
             return Ok(false);
         }
-        let _ = self.ensure_cow_copy(&old_rel)?;
+        self.copied(&old_rel)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
@@ -1867,7 +1987,7 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _ = self.ensure_cow_copy(&rel)?;
+        self.copied(&rel)?;
         Ok(crate::sys::fs::chmod_in_root(&self.upper, &rel, mode).is_ok())
     }
 
@@ -1879,7 +1999,7 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _ = self.ensure_cow_copy(&rel)?;
+        self.copied(&rel)?;
         // Best-effort: try the real chown but succeed either way — the
         // supervisor typically lacks CAP_CHOWN so this will fail, but
         // in COW/dry-run mode the ownership doesn't matter.
@@ -1896,7 +2016,7 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         let new_len = length as u64;
-        let _ = self.ensure_cow_copy(&rel)?;
+        self.copied(&rel)?;
         let old_len = crate::sys::fs::statat_in_root(&self.upper, &rel, true)
             .map(|st| st.st_size as u64)
             .unwrap_or(0);
@@ -1922,17 +2042,6 @@ impl SeccompCowBranch {
             }
         }
         Ok(ok)
-    }
-
-    /// Handle utimensat — resolve to upper, return the upper path for the
-    /// caller to call utimensat on.
-    pub fn handle_utimensat(&mut self, path: &str) -> Result<Option<PathBuf>, BranchError> {
-        let rel = match self.safe_rel(path) {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-        let upper = self.ensure_cow_copy(&rel)?;
-        Ok(Some(upper))
     }
 
     /// Handle readlink.
@@ -2668,7 +2777,7 @@ impl SeccompCowBranch {
     /// leaves the page cache intact and the old unsynced write was already
     /// enough. These fsyncs change behaviour only on power loss or a kernel
     /// panic — and there they make the RECORD durable while the upper it names
-    /// is written by `ensure_cow_copy` and by the child with no sync at all,
+    /// is written by the copy-up and by the child with no sync at all,
     /// and the default storage base is `$XDG_RUNTIME_DIR` or `$TMPDIR`, i.e.
     /// tmpfs, where the whole tree is gone anyway. They are meaningful with an
     /// explicit disk-backed `fs_storage`, and inert without one.
@@ -2796,9 +2905,103 @@ impl Drop for SeccompCowBranch {
     }
 }
 
+/// Shorthands that run on the caller's thread what the dispatcher runs off
+/// the loop.
+#[cfg(test)]
+impl SeccompCowBranch {
+    pub fn copy_up_now(&mut self, need: CopyUp) -> Result<(), BranchError> {
+        let rels = match need {
+            CopyUp::Nothing => return Ok(()),
+            CopyUp::Entry(rel) => vec![rel],
+            CopyUp::Tree(root) => {
+                Self::lower_tree(&self.workdir, &root).map_err(|e| BranchError::Io {
+                    operation: "walk lower",
+                    source: std::io::Error::from_raw_os_error(e),
+                })?
+            }
+        };
+        for (rel, plan) in self.prepare_copies(&rels)? {
+            if let CowCopyPlan::NeedsCopy {
+                file_size, ticket, ..
+            } = plan
+            {
+                let staged = Self::stage_copy(&self.workdir, &self.storage_dir, &rel);
+                self.finish_copy(&rel, file_size, ticket, staged)
+                    .map_err(|source| BranchError::Io {
+                        operation: "copy",
+                        source,
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ensure_cow_copy(&mut self, rel: &str) -> Result<PathBuf, BranchError> {
+        self.copy_up_now(CopyUp::Entry(rel.to_string()))?;
+        Ok(self.upper.join(rel))
+    }
+
+    pub fn handle_open(&mut self, path: &str, flags: u64) -> Result<Option<PathBuf>, BranchError> {
+        match self.prepare_open(path, flags)? {
+            CowOpenPlan::Skip => Ok(None),
+            CowOpenPlan::Deleted => Err(BranchError::Deleted),
+            CowOpenPlan::Resolved(p) | CowOpenPlan::UpperReady { upper: p } => Ok(Some(p)),
+            CowOpenPlan::Copy { rel_path, plan } => {
+                self.abandon_copies([(rel_path.clone(), plan)]);
+                self.ensure_cow_copy(&rel_path).map(Some)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write handlers run the way the dispatcher runs them: copy-ups first.
+    fn chmod(b: &mut SeccompCowBranch, path: &str, mode: u32) -> Result<bool, BranchError> {
+        copy_entry(b, path)?;
+        b.handle_chmod(path, mode)
+    }
+
+    fn chown(
+        b: &mut SeccompCowBranch,
+        path: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<bool, BranchError> {
+        copy_entry(b, path)?;
+        b.handle_chown(path, uid, gid)
+    }
+
+    fn truncate(b: &mut SeccompCowBranch, path: &str, length: i64) -> Result<bool, BranchError> {
+        copy_entry(b, path)?;
+        b.handle_truncate(path, length)
+    }
+
+    fn link(b: &mut SeccompCowBranch, old: &str, new: &str) -> Result<bool, BranchError> {
+        if let Some(rel) = b.safe_rel(old) {
+            let need = b.link_copy_up(rel);
+            b.copy_up_now(need)?;
+        }
+        b.handle_link(old, new)
+    }
+
+    fn rename(b: &mut SeccompCowBranch, old: &str, new: &str) -> Result<bool, i32> {
+        b.check_rename(old, new)?;
+        if let Some(rel) = b.safe_rel(old) {
+            let need = b.rename_copy_up(rel);
+            b.copy_up_now(need).map_err(branch_errno)?;
+        }
+        b.handle_rename(old, new)
+    }
+
+    fn copy_entry(b: &mut SeccompCowBranch, path: &str) -> Result<(), BranchError> {
+        match b.safe_rel(path) {
+            Some(rel) => b.copy_up_now(CopyUp::Entry(rel)),
+            None => Ok(()),
+        }
+    }
     use std::fs;
 
     #[test]
@@ -4268,7 +4471,7 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
         let old = abs(&branch, "existing.txt");
         let new = abs(&branch, "renamed.txt");
-        let err = branch.handle_rename(&old, &new).unwrap_err();
+        let err = rename(&mut branch, &old, &new).unwrap_err();
         assert_eq!(err, libc::ENOSPC);
     }
 
@@ -4278,7 +4481,7 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
         let old = abs(&branch, "existing.txt");
         let new = abs(&branch, "hardlink.txt");
-        let err = branch.handle_link(&old, &new).unwrap_err();
+        let err = link(&mut branch, &old, &new).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
 
@@ -4288,7 +4491,7 @@ mod tests {
         // chmod triggers ensure_cow_copy.
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
         let path = abs(&branch, "existing.txt");
-        let err = branch.handle_chmod(&path, 0o644).unwrap_err();
+        let err = chmod(&mut branch, &path, 0o644).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
 
@@ -4297,7 +4500,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
         let path = abs(&branch, "existing.txt");
-        let err = branch.handle_chown(&path, 1000, 1000).unwrap_err();
+        let err = chown(&mut branch, &path, 1000, 1000).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
 
@@ -4310,7 +4513,7 @@ mod tests {
         let path = abs(&branch, "existing.txt");
         // cow copy uses 5 bytes (5 of 10 used).
         // Truncating to 20 bytes needs 15 more — exceeds remaining 5.
-        let err = branch.handle_truncate(&path, 20).unwrap_err();
+        let err = truncate(&mut branch, &path, 20).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
 
@@ -4321,7 +4524,7 @@ mod tests {
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
         let path = abs(&branch, "existing.txt");
         // Truncate to 2 bytes — cow copy (5) + shrink is fine.
-        assert!(matches!(branch.handle_truncate(&path, 2), Ok(true)));
+        assert!(matches!(truncate(&mut branch, &path, 2), Ok(true)));
         // disk_used should now be 2, not 5.
         assert_eq!(branch.disk_used, 2);
     }
@@ -4544,7 +4747,13 @@ mod tests {
         let path = abs(&branch, "existing.txt");
         // O_WRONLY
         let plan = branch.prepare_open(&path, 0o1).unwrap();
-        assert!(matches!(plan, CowOpenPlan::NeedsCopy { .. }));
+        assert!(matches!(
+            plan,
+            CowOpenPlan::Copy {
+                plan: CowCopyPlan::NeedsCopy { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4584,7 +4793,137 @@ mod tests {
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         let path = abs(&branch, "existing.txt");
         let plan = branch.prepare_open(&path, 0o1).unwrap();
-        assert!(matches!(plan, CowOpenPlan::NeedsCopy { file_size: 5, .. }));
+        assert!(matches!(
+            plan,
+            CowOpenPlan::Copy {
+                plan: CowCopyPlan::NeedsCopy { file_size: 5, .. },
+                ..
+            }
+        ));
+        assert_eq!(branch.disk_used, 5);
+    }
+
+    /// Run a copy-up of `rel` the way the off-loop dispatch does.
+    fn staged_copy(
+        branch: &mut SeccompCowBranch,
+        rel: &str,
+    ) -> (u64, CopyTicket, Result<StagedCopy, std::io::Error>) {
+        let CowCopyPlan::NeedsCopy {
+            file_size, ticket, ..
+        } = branch.prepare_copy(rel).unwrap()
+        else {
+            panic!("expected a copy to be needed");
+        };
+        let staged = SeccompCowBranch::stage_copy(branch.workdir(), branch.staging_dir(), rel);
+        (file_size, ticket, staged)
+    }
+
+    fn staged_files(branch: &SeccompCowBranch) -> usize {
+        fs::read_dir(branch.staging_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".copy-"))
+            .count()
+    }
+
+    #[test]
+    fn a_staged_copy_is_invisible_until_installed() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let (size, ticket, staged) = staged_copy(&mut branch, "existing.txt");
+        assert!(!branch.upper_dir().join("existing.txt").exists());
+        assert_eq!(
+            branch
+                .finish_copy("existing.txt", size, ticket, staged)
+                .unwrap(),
+            CopyInstall::Ready
+        );
+        assert_eq!(
+            fs::read(branch.upper_dir().join("existing.txt")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(staged_files(&branch), 0);
+    }
+
+    #[test]
+    fn a_second_copier_waits_until_the_first_finishes_or_gives_up() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let (size, ticket, staged) = staged_copy(&mut branch, "existing.txt");
+        let CowCopyPlan::InFlight(done) = branch.prepare_copy("existing.txt").unwrap() else {
+            panic!("the second copier must wait");
+        };
+        assert!(!done.is_done());
+        branch
+            .finish_copy("existing.txt", size, ticket, staged)
+            .unwrap();
+        done.wait();
+        assert!(matches!(
+            branch.prepare_copy("existing.txt").unwrap(),
+            CowCopyPlan::Ready(_)
+        ));
+
+        let (_, ticket, _) = staged_copy(&mut branch, "subdir/nested.txt");
+        drop(ticket);
+        assert!(matches!(
+            branch.prepare_copy("subdir/nested.txt").unwrap(),
+            CowCopyPlan::NeedsCopy { .. }
+        ));
+    }
+
+    #[test]
+    fn a_copy_finished_after_the_path_was_deleted_is_not_installed() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let (size, ticket, staged) = staged_copy(&mut branch, "existing.txt");
+        let path = abs(&branch, "existing.txt");
+        assert_eq!(branch.handle_unlink(&path, false), Ok(true));
+        assert_eq!(
+            branch
+                .finish_copy("existing.txt", size, ticket, staged)
+                .unwrap(),
+            CopyInstall::Replan
+        );
+        assert!(branch.is_deleted("existing.txt"));
+        assert_eq!(branch.disk_used, 0, "the reservation must be rolled back");
+        assert_eq!(staged_files(&branch), 0);
+    }
+
+    #[test]
+    fn a_copy_that_lost_the_race_keeps_the_winners_file() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let (size, ticket, staged) = staged_copy(&mut branch, "existing.txt");
+        let upper = branch.upper_dir().join("existing.txt");
+        fs::write(&upper, "written").unwrap();
+        assert_eq!(
+            branch
+                .finish_copy("existing.txt", size, ticket, staged)
+                .unwrap(),
+            CopyInstall::Ready
+        );
+        assert_eq!(fs::read(&upper).unwrap(), b"written");
+        assert_eq!(
+            branch.disk_used, 0,
+            "the losing copy gives its reservation back"
+        );
+        assert_eq!(staged_files(&branch), 0);
+    }
+
+    #[test]
+    fn a_quota_resync_keeps_the_reservation_of_a_staged_copy() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let (size, ticket, staged) = staged_copy(&mut branch, "existing.txt");
+        branch.recalc_disk_used();
+        assert_eq!(branch.disk_used, size);
+        branch
+            .finish_copy("existing.txt", size, ticket, staged)
+            .unwrap();
+        branch.recalc_disk_used();
         assert_eq!(branch.disk_used, 5);
     }
 
@@ -5054,12 +5393,12 @@ mod tests {
         fs::write(wd.join("d/sub/deep.txt"), "DEEP").unwrap();
 
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
-        assert!(branch
-            .handle_rename(
-                &format!("{}/d", wd.display()),
-                &format!("{}/d2", wd.display())
-            )
-            .unwrap());
+        assert!(rename(
+            &mut branch,
+            &format!("{}/d", wd.display()),
+            &format!("{}/d2", wd.display())
+        )
+        .unwrap());
 
         // Merged view before commit: d hidden, d2 holds the tree.
         assert!(branch.is_deleted("d"));
@@ -5094,12 +5433,12 @@ mod tests {
             branch.handle_unlink(&format!("{}/d/gone.txt", wd.display()), false),
             Ok(true)
         );
-        assert!(branch
-            .handle_rename(
-                &format!("{}/d", wd.display()),
-                &format!("{}/d2", wd.display())
-            )
-            .unwrap());
+        assert!(rename(
+            &mut branch,
+            &format!("{}/d", wd.display()),
+            &format!("{}/d2", wd.display())
+        )
+        .unwrap());
         branch.commit().unwrap();
         assert!(wd.join("d2/keep.txt").exists());
         assert!(!wd.join("d2/gone.txt").exists());
@@ -5112,7 +5451,8 @@ mod tests {
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         branch.mark_deleted("existing.txt");
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/existing.txt", wd.display()),
                 &format!("{}/moved.txt", wd.display())
             ),
@@ -5133,7 +5473,8 @@ mod tests {
         fs::write(wd.join("b/b1"), "B").unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/a", wd.display()),
                 &format!("{}/b", wd.display())
             ),
@@ -5157,7 +5498,8 @@ mod tests {
         fs::create_dir(wd.join("b")).unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/a", wd.display()),
                 &format!("{}/b", wd.display())
             ),
@@ -5179,7 +5521,8 @@ mod tests {
         fs::write(wd.join("target.txt"), "OLD").unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/existing.txt", wd.display()),
                 &format!("{}/target.txt", wd.display())
             ),
@@ -5205,7 +5548,8 @@ mod tests {
 
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/existing.txt", wd.display()),
                 &format!("{}/dest", wd.display())
             ),
@@ -5233,14 +5577,16 @@ mod tests {
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         // File onto directory: EISDIR. Directory onto file: ENOTDIR.
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/existing.txt", wd.display()),
                 &format!("{}/d", wd.display())
             ),
             Err(libc::EISDIR)
         );
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/d", wd.display()),
                 &format!("{}/existing.txt", wd.display())
             ),
@@ -5266,7 +5612,8 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/existing.txt", wd.display()),
                 &format!("{}/b", wd.display())
             ),
@@ -5285,7 +5632,8 @@ mod tests {
         let wd = workdir.path().canonicalize().unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/nope", wd.display()),
                 &format!("{}/dest", wd.display())
             ),
@@ -5309,7 +5657,8 @@ mod tests {
         fs::set_permissions(wd.join("d/inner"), fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
-        let result = branch.handle_rename(
+        let result = rename(
+            &mut branch,
             &format!("{}/d", wd.display()),
             &format!("{}/moved", wd.display()),
         );
@@ -5343,7 +5692,8 @@ mod tests {
         // Quota fits the staged directory (4096) but not the file after it.
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 4100).unwrap();
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/d", wd.display()),
                 &format!("{}/m", wd.display())
             ),
@@ -5375,7 +5725,8 @@ mod tests {
 
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(
+            rename(
+                &mut branch,
                 &format!("{}/d", wd.display()),
                 &format!("{}/m", wd.display())
             ),
@@ -5395,12 +5746,12 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let wd = workdir.path().canonicalize().unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
-        assert!(branch
-            .handle_rename(
-                &format!("{}/existing.txt", wd.display()),
-                &format!("{}/renamed.txt", wd.display())
-            )
-            .unwrap());
+        assert!(rename(
+            &mut branch,
+            &format!("{}/existing.txt", wd.display()),
+            &format!("{}/renamed.txt", wd.display())
+        )
+        .unwrap());
         branch.commit().unwrap();
         assert!(!wd.join("existing.txt").exists());
         assert_eq!(fs::read_to_string(wd.join("renamed.txt")).unwrap(), "hello");
@@ -5415,12 +5766,12 @@ mod tests {
         fs::create_dir(wd.join("d")).unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch
-                .handle_link(
-                    &format!("{}/d", wd.display()),
-                    &format!("{}/d2", wd.display())
-                )
-                .unwrap(),
+            link(
+                &mut branch,
+                &format!("{}/d", wd.display()),
+                &format!("{}/d2", wd.display())
+            )
+            .unwrap(),
             false
         );
         assert!(!branch.upper_dir().join("d").exists());
@@ -5512,7 +5863,7 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let path = format!("{}/pipe", branch.workdir_str());
         assert!(matches!(
-            branch.handle_chmod(&path, 0o600),
+            chmod(&mut branch, &path, 0o600),
             Err(BranchError::NotOwned)
         ));
         assert!(
@@ -5536,7 +5887,7 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wd = branch.workdir_str().to_string();
         assert_eq!(
-            branch.handle_rename(&format!("{wd}/pipe"), &format!("{wd}/pipe2")),
+            rename(&mut branch, &format!("{wd}/pipe"), &format!("{wd}/pipe2")),
             Err(libc::EXDEV),
         );
         assert!(
@@ -5621,11 +5972,11 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let mut branch = SeccompCowBranch::create(Path::new("/"), Some(storage.path()), 0).unwrap();
         assert!(matches!(
-            branch.handle_chmod("/dev/null", 0o666),
+            chmod(&mut branch, "/dev/null", 0o666),
             Err(BranchError::NotOwned)
         ));
         assert!(matches!(
-            branch.handle_utimensat("/dev/null"),
+            branch.prepare_copy("dev/null"),
             Err(BranchError::NotOwned)
         ));
         assert_eq!(
@@ -5638,19 +5989,21 @@ mod tests {
     }
 
     #[test]
-    fn execute_copy_guards_against_type_race() {
+    fn stage_copy_guards_against_type_race() {
         // Defense in depth: if the entry changes type between prepare_copy's
-        // lstat and execute_copy's open, the O_NONBLOCK+fstat guard must
+        // lstat and stage_copy's open, the O_NONBLOCK+fstat guard must
         // catch it and produce an empty destination instead of streaming.
         let (workdir, storage) = setup_workdir();
         let fifo = workdir.path().join("race");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let workdir_root = branch.workdir().to_path_buf();
-        let upper_root = branch.upper_dir().to_path_buf();
-        SeccompCowBranch::execute_copy(&workdir_root, &upper_root, "race").unwrap();
-        assert_eq!(fs::read(upper_root.join("race")).unwrap(), b"");
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let staged = SeccompCowBranch::stage_copy(branch.workdir(), branch.staging_dir(), "race");
+        assert_eq!(
+            branch.install_staged("race", 0, staged).unwrap(),
+            CopyInstall::Ready
+        );
+        assert_eq!(fs::read(branch.upper_dir().join("race")).unwrap(), b"");
     }
 
     /// Recursively snapshot the merged view as (rel path -> Option<bytes>),
@@ -5731,7 +6084,7 @@ mod tests {
             .unwrap();
         fs::write(&up, "MODIFIED").unwrap();
         assert_eq!(branch.handle_unlink(&w("d/a.txt"), false), Ok(true));
-        assert!(branch.handle_rename(&w("d"), &w("moved")).unwrap());
+        assert!(rename(&mut branch, &w("d"), &w("moved")).unwrap());
         assert_eq!(
             branch.handle_unlink(&w("subdir/nested.txt"), false),
             Ok(true)
@@ -6256,9 +6609,7 @@ mod tests {
 
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wd = workdir.path().canonicalize().unwrap();
-        assert!(branch
-            .handle_chmod(&format!("{}/f.txt", wd.display()), 0o600)
-            .unwrap());
+        assert!(chmod(&mut branch, &format!("{}/f.txt", wd.display()), 0o600).unwrap());
         assert_eq!(
             branch
                 .changes()
@@ -6288,7 +6639,7 @@ mod tests {
     ///
     /// The merge used to hardcode the destination mode, so a script or binary
     /// the run produced arrived in the workdir un-executable — a committed
-    /// result that cannot be run. `execute_copy` already carries the mode on
+    /// result that cannot be run. `stage_copy` already carries the mode on
     /// the way down into the upper; this is the same property on the way back.
     #[test]
     fn the_mode_of_a_file_created_in_the_upper_survives_the_merge() {
@@ -6610,9 +6961,7 @@ mod tests {
 
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wd = branch.workdir_str().to_string();
-        assert!(branch
-            .handle_rename(&format!("{wd}/d"), &format!("{wd}/e"))
-            .unwrap());
+        assert!(rename(&mut branch, &format!("{wd}/d"), &format!("{wd}/e")).unwrap());
 
         let all = by_path(&branch);
         assert_eq!(all["d"].kind(), ChangeKind::Deleted);
@@ -6650,9 +6999,8 @@ mod tests {
         fs::write(workdir.path().join("f.txt"), "abc").unwrap();
 
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        assert!(branch
-            .handle_chmod(&format!("{}/f.txt", branch.workdir_str()), 0o755)
-            .unwrap());
+        let path = format!("{}/f.txt", branch.workdir_str());
+        assert!(chmod(&mut branch, &path, 0o755).unwrap());
 
         let c = &by_path(&branch)["f.txt"];
         assert_eq!(c.kind(), ChangeKind::Modified);
@@ -6682,14 +7030,12 @@ mod tests {
     }
 
     #[test]
-    fn execute_copy_returns_the_digest_of_what_it_streamed() {
+    fn stage_copy_returns_the_digest_of_what_it_streamed() {
         let workdir = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
         fs::write(workdir.path().join("f"), "abc").unwrap();
-        let digest = SeccompCowBranch::execute_copy(workdir.path(), upper.path(), "f")
-            .unwrap()
-            .unwrap();
-        assert_eq!(hex(&digest), SHA256_ABC);
+        let staged = SeccompCowBranch::stage_copy(workdir.path(), staging.path(), "f").unwrap();
+        assert_eq!(hex(&staged.digest.unwrap()), SHA256_ABC);
     }
 
     fn sorted_changes(changes: Vec<crate::result::Change>) -> Vec<crate::result::Change> {
