@@ -168,8 +168,11 @@ async fn push_until_done(
     flags: i32,
     mut offset: usize,
 ) -> Result<usize, i32> {
-    let afd = tokio::io::unix::AsyncFd::with_interest(dup_fd, tokio::io::Interest::WRITABLE)
-        .map_err(|_| libc::EIO)?;
+    // SAFETY: the AsyncFd owns the fd.
+    let afd = unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(dup_fd, tokio::io::Interest::WRITABLE)
+    }
+    .map_err(|_| libc::EIO)?;
     loop {
         let mut guard = afd.writable().await.map_err(|_| libc::EIO)?;
         let ret = send_materialized_at(

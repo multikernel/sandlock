@@ -46,7 +46,8 @@ pub fn spawn_responder(
 }
 
 async fn responder_loop(fd: OwnedFd, reply_pid: u32) -> std::io::Result<()> {
-    let async_fd = AsyncFd::with_interest(fd, Interest::READABLE)?;
+    // SAFETY: the AsyncFd owns the fd.
+    let async_fd = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }?;
     let mut buf = vec![0u8; RECV_BUF];
 
     loop {

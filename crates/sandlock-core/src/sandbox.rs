@@ -3587,11 +3587,13 @@ async fn wait_child_exit_via_pidfd(
 ) -> crate::result::ExitStatus {
     use crate::result::ExitStatus;
 
-    let async_fd =
-        match tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE) {
-            Ok(fd) => fd,
-            Err(_) => return wait_child_exit_blocking(pid).await,
-        };
+    // SAFETY: the AsyncFd owns the pidfd.
+    let async_fd = match unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE)
+    } {
+        Ok(fd) => fd,
+        Err(_) => return wait_child_exit_blocking(pid).await,
+    };
 
     loop {
         // pidfd becomes readable when the process exits; no data is read.
