@@ -1381,15 +1381,21 @@ pub(crate) async fn handle_cow_readlink(
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    // readlinkat(dirfd, pathname, buf, bufsiz)
-    let dirfd = notif.data.args[0] as i64;
+    // readlinkat(dirfd, pathname, buf, bufsiz), and legacy
+    // readlink(pathname, buf, bufsiz), which shifts every argument by one.
+    let a = notif.data.args;
+    let (dirfd, path_ptr, buf_addr, bufsiz) = if arch::sys_readlink() == Some(notif.data.nr as i64)
+    {
+        (libc::AT_FDCWD as i64, a[0], a[1], a[2])
+    } else {
+        (a[0] as i64, a[1], a[2], a[3])
+    };
+    let bufsiz = (bufsiz & 0xFFFFFFFF) as usize;
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, notif.data.args[1], notif_fd) {
+    let path = match read_path(notif, path_ptr, notif_fd) {
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
-    let buf_addr = notif.data.args[2];
-    let bufsiz = (notif.data.args[3] & 0xFFFFFFFF) as usize;
 
     let st = cow_state.lock().await;
     let cow = match st.branch.as_ref() {

@@ -2105,3 +2105,52 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
     assert!(!workdir.join("made").exists());
     let _ = fs::remove_dir_all(&workdir);
 }
+
+/// readlink(path, buf, size) and readlinkat(dirfd, path, buf, size) do not
+/// share an argument layout. Read as readlinkat, a legacy readlink has its
+/// output buffer taken as the path, so the branch never recognises the call
+/// and a symlink created during the run cannot be read back.
+#[tokio::test]
+async fn test_seccomp_cow_legacy_readlink_reads_its_own_arguments() {
+    let workdir = temp_dir("seccomp-cow-legacy-readlink");
+
+    let script = concat!(
+        "import os, sys\n",
+        "os.symlink('target', 'lnk')\n", // exists only in the upper layer
+        "try:\n",
+        "    sys.stdout.write(os.readlink('lnk'))\n",
+        "except OSError as e:\n",
+        "    sys.stdout.write('errno=%d' % e.errno)\n",
+    );
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        result.stdout_str().unwrap_or("").trim(),
+        "target",
+        "a symlink created during the run must read back through legacy readlink"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
