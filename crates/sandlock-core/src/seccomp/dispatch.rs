@@ -246,25 +246,54 @@ impl DispatchTable {
             .push(handler);
     }
 
+    /// The handler chain for a notification, not yet started.
+    pub(crate) fn chain(
+        &self,
+        notif: SeccompNotif,
+        notif_fd: RawFd,
+        open: Option<Arc<OpenRequest>>,
+    ) -> Chain {
+        let handlers = self
+            .chains
+            .get(&(notif.data.nr as i64))
+            .map(|chain| chain.handlers.clone())
+            .unwrap_or_default();
+        Chain {
+            handlers: handlers.into_iter(),
+            cx: HandlerCtx {
+                notif,
+                notif_fd,
+                open,
+            },
+        }
+    }
+
     /// Dispatch a notification through the handler chain for its syscall number.
+    #[cfg(test)]
     pub(crate) async fn dispatch(
         &self,
         notif: SeccompNotif,
         notif_fd: RawFd,
         open: Option<Arc<OpenRequest>>,
     ) -> NotifAction {
-        let nr = notif.data.nr as i64;
-        if let Some(chain) = self.chains.get(&nr) {
-            let handler_ctx = HandlerCtx {
-                notif,
-                notif_fd,
-                open,
-            };
-            for handler in &chain.handlers {
-                let action = handler.handle(&handler_ctx).await;
-                if !matches!(action, NotifAction::Continue) {
-                    return action;
-                }
+        self.chain(notif, notif_fd, open).next().await
+    }
+}
+
+/// A handler chain that can stop at a deferral and pick up after it.
+pub(crate) struct Chain {
+    handlers: std::vec::IntoIter<Arc<dyn Handler>>,
+    cx: HandlerCtx,
+}
+
+impl Chain {
+    /// Run the remaining handlers until one decides or defers; `Continue`
+    /// means none intervened.
+    pub(crate) async fn next(&mut self) -> NotifAction {
+        for handler in self.handlers.by_ref() {
+            let action = handler.handle(&self.cx).await;
+            if !matches!(action, NotifAction::Continue) {
+                return action;
             }
         }
         NotifAction::Continue
@@ -290,20 +319,6 @@ pub(crate) fn build_dispatch_table(
     pending_handlers: Vec<(i64, std::sync::Arc<dyn Handler>)>,
 ) -> DispatchTable {
     let mut table = DispatchTable::new();
-
-    // ------------------------------------------------------------------
-    // Fork/clone family (always on)
-    // ------------------------------------------------------------------
-    for nr in arch::fork_like_syscalls() {
-        let policy_for_fork = Arc::clone(policy);
-        let ctx_for_fork = Arc::clone(ctx);
-        table.register(nr, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let policy = Arc::clone(&policy_for_fork);
-            let ctx = Arc::clone(&ctx_for_fork);
-            async move { crate::resource::handle_fork(&notif, &ctx, &policy).await }
-        });
-    }
 
     // ------------------------------------------------------------------
     // Process groups (always on)
@@ -1315,6 +1330,7 @@ mod handler_tests {
             }),
             child_pidfd: None,
             notif_fd: -1,
+            mem_gate: Default::default(),
         })
     }
 
@@ -1495,41 +1511,48 @@ mod handler_tests {
         );
     }
 
-    /// A handler returning `Defer` is non-`Continue`, so it must short-circuit
-    /// the chain exactly like `Errno`/`ReturnValue`: later handlers on the same
-    /// syscall do not run.  Deferral is therefore a terminal decision.
+    /// A deferral stops the chain; a `Continue` result picks it up at the next
+    /// handler, and any other result ends it.
     #[tokio::test]
-    async fn dispatch_short_circuits_on_defer() {
+    async fn chain_resumes_after_a_deferral_that_continues() {
         let mut table = DispatchTable::new();
         let later_ran = Arc::new(AtomicUsize::new(0));
-
         table.register(libc::SYS_openat, |_cx: &HandlerCtx| async {
-            NotifAction::defer(async { NotifAction::ReturnValue(1) })
+            NotifAction::defer(async { NotifAction::Continue })
         });
-
         let later = Arc::clone(&later_ran);
         table.register(libc::SYS_openat, move |_cx: &HandlerCtx| {
-            let later = Arc::clone(&later);
-            async move {
-                later.fetch_add(1, Ordering::SeqCst);
-                NotifAction::Continue
-            }
+            later.fetch_add(1, Ordering::SeqCst);
+            async { NotifAction::ReturnValue(42) }
         });
 
-        let _ctx = fake_supervisor_ctx();
-        let action = table
-            .dispatch(fake_notif(libc::SYS_openat as i32), -1, None)
-            .await;
+        let mut chain = table.chain(fake_notif(libc::SYS_openat as i32), -1, None);
+        let NotifAction::Defer(deferred) = chain.next().await else {
+            panic!("the first handler defers")
+        };
+        assert_eq!(later_ran.load(Ordering::SeqCst), 0);
+        assert!(matches!(deferred.run().await, NotifAction::Continue));
+        assert!(matches!(chain.next().await, NotifAction::ReturnValue(42)));
+        assert_eq!(later_ran.load(Ordering::SeqCst), 1);
+    }
 
-        assert!(
-            matches!(action, NotifAction::Defer(_)),
-            "dispatch must return the Defer produced by the first handler"
-        );
-        assert_eq!(
-            later_ran.load(Ordering::SeqCst),
-            0,
-            "Defer must short-circuit the chain like any non-Continue action"
-        );
+    #[tokio::test]
+    async fn chain_ends_at_a_deferral_that_decides() {
+        let mut table = DispatchTable::new();
+        table.register(libc::SYS_openat, |_cx: &HandlerCtx| async {
+            NotifAction::defer(async { NotifAction::Errno(libc::EACCES) })
+        });
+        table.register(libc::SYS_openat, |_cx: &HandlerCtx| async {
+            panic!("a decided deferral must end the chain")
+        });
+        let mut chain = table.chain(fake_notif(libc::SYS_openat as i32), -1, None);
+        let NotifAction::Defer(deferred) = chain.next().await else {
+            panic!("the first handler defers")
+        };
+        assert!(matches!(
+            deferred.run().await,
+            NotifAction::Errno(libc::EACCES)
+        ));
     }
 
     /// `validate_handler_syscalls_against_policy` must reject handlers whose

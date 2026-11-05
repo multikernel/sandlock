@@ -33,10 +33,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::arch;
 use crate::cow::result::link_result;
-use crate::cow::seccomp::{branch_errno, SeccompCowBranch};
+use crate::cow::seccomp::{branch_errno, CopyUp, CowCopyPlan, CowOpenPlan, SeccompCowBranch};
+use crate::error::BranchError;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{
-    decode_open_args, read_child_mem, write_child_mem, write_child_mem_force, NotifAction,
+    decode_open_args, id_valid, read_child_mem, write_child_mem, write_child_mem_force, NotifAction,
 };
 use crate::seccomp::state::{CowState, PerProcessState, ProcessIndex};
 use crate::sys::structs::SeccompNotif;
@@ -197,6 +198,254 @@ pub(crate) fn open_confined(
     crate::sys::fs::openat2_in_root(root, &rel, flags, mode)
 }
 
+/// The branch's directories, taken under the lock for work done without it.
+#[derive(Clone)]
+pub(crate) struct Layers {
+    upper: PathBuf,
+    workdir: PathBuf,
+    staging: PathBuf,
+}
+
+impl Layers {
+    pub(crate) fn of(cow: &SeccompCowBranch) -> Self {
+        Self {
+            upper: cow.upper_dir().to_path_buf(),
+            workdir: cow.workdir().to_path_buf(),
+            staging: cow.staging_dir().to_path_buf(),
+        }
+    }
+}
+
+/// The trapped syscall a copy-up is made for.
+#[derive(Clone, Copy)]
+pub(crate) struct Caller {
+    fd: RawFd,
+    id: u64,
+}
+
+impl Caller {
+    pub(crate) fn of(notif: &SeccompNotif, fd: RawFd) -> Self {
+        Self { fd, id: notif.id }
+    }
+
+    fn waiting(self) -> bool {
+        id_valid(self.fd, self.id).is_ok()
+    }
+}
+
+/// Run `apply` under the branch lock once `need` is in the upper. Only the
+/// copy is slow, so only it leaves the loop, and `apply` runs under the lock
+/// that found every copy in place.
+pub(crate) fn after_copy_up(
+    cow_state: &Arc<Mutex<CowState>>,
+    caller: Caller,
+    cow: &mut SeccompCowBranch,
+    need: CopyUp,
+    refuse: impl Fn(BranchError) -> NotifAction + Send + 'static,
+    apply: impl FnOnce(&mut SeccompCowBranch) -> NotifAction + Send + 'static,
+) -> NotifAction {
+    let plans = match &need {
+        CopyUp::Nothing => return apply(cow),
+        CopyUp::Entry(rel) => match cow.prepare_copies(std::slice::from_ref(rel)) {
+            Ok(plans) if plans.is_empty() => return apply(cow),
+            Ok(plans) => plans,
+            Err(e) => return refuse(e),
+        },
+        // Walking the lower tree is I/O too.
+        CopyUp::Tree(_) => Vec::new(),
+    };
+    copy_up_off_loop(
+        cow_state,
+        caller,
+        Layers::of(cow),
+        need,
+        plans,
+        refuse,
+        apply,
+    )
+}
+
+/// `after_copy_up` for a caller holding `plans` it already made for `need`.
+pub(crate) fn copy_up_off_loop(
+    cow_state: &Arc<Mutex<CowState>>,
+    caller: Caller,
+    layers: Layers,
+    need: CopyUp,
+    mut plans: Vec<(String, CowCopyPlan)>,
+    refuse: impl Fn(BranchError) -> NotifAction + Send + 'static,
+    apply: impl FnOnce(&mut SeccompCowBranch) -> NotifAction + Send + 'static,
+) -> NotifAction {
+    let cow_state = Arc::clone(cow_state);
+    NotifAction::native(move || {
+        let rels = match need {
+            CopyUp::Nothing => Vec::new(),
+            CopyUp::Entry(rel) => vec![rel],
+            CopyUp::Tree(root) => match SeccompCowBranch::lower_tree(&layers.workdir, &root) {
+                Ok(tree) => tree,
+                Err(errno) => return NotifAction::Errno(errno),
+            },
+        };
+        loop {
+            if let Err(errno) = run_copies(&cow_state, &layers, plans) {
+                return NotifAction::Errno(errno);
+            }
+            let mut st = cow_state.blocking_lock();
+            let Some(cow) = st.branch.as_mut() else {
+                return NotifAction::Errno(libc::EIO);
+            };
+            plans = match cow.prepare_copies(&rels) {
+                Ok(plans) => plans,
+                Err(e) => return refuse(e),
+            };
+            // A caller interrupted meanwhile (a signal, or an exec freeze
+            // without a killable wait) restarts its syscall, which must not
+            // find the write already done.
+            if plans.is_empty() {
+                return match caller.waiting() {
+                    true => apply(cow),
+                    false => NotifAction::Errno(libc::EINTR),
+                };
+            }
+        }
+    })
+}
+
+/// Blocks. Copies first, waits after: a caller that waits holds no ticket,
+/// so two of them never wait on each other. A failed copy fails the syscall,
+/// since continuing would reach the lower file.
+fn run_copies(
+    cow_state: &Mutex<CowState>,
+    layers: &Layers,
+    plans: Vec<(String, CowCopyPlan)>,
+) -> Result<(), i32> {
+    let (copies, waits): (Vec<_>, Vec<_>) = plans
+        .into_iter()
+        .partition(|(_, plan)| matches!(plan, CowCopyPlan::NeedsCopy { .. }));
+    let mut copies = copies.into_iter();
+    while let Some((rel, plan)) = copies.next() {
+        let CowCopyPlan::NeedsCopy {
+            file_size, ticket, ..
+        } = plan
+        else {
+            continue;
+        };
+        let staged = SeccompCowBranch::stage_copy(&layers.workdir, &layers.staging, &rel);
+        let mut st = cow_state.blocking_lock();
+        let cow = st.branch.as_mut().ok_or(libc::EIO)?;
+        if let Err(e) = cow.finish_copy(&rel, file_size, ticket, staged) {
+            cow.abandon_copies(copies);
+            return Err(e.raw_os_error().unwrap_or(libc::EIO));
+        }
+    }
+    for (_, plan) in waits {
+        if let CowCopyPlan::InFlight(done) = plan {
+            done.wait();
+        }
+    }
+    Ok(())
+}
+
+/// Where an open plan leads.
+pub(crate) enum OpenStep {
+    /// Outside the branch's say: the caller opens it the way it would anyway.
+    Skip,
+    Open(PathBuf),
+    Copy(String, CowCopyPlan),
+    Answer(NotifAction),
+}
+
+impl OpenStep {
+    pub(crate) fn of(plan: Result<CowOpenPlan, BranchError>) -> Self {
+        match plan {
+            Ok(CowOpenPlan::Skip) | Err(BranchError::NotOwned) => OpenStep::Skip,
+            // Deleted in this branch (whiteout): the lower file still exists, so
+            // opening it would read its pre-delete content. Return ENOENT,
+            // matching the stat/access handlers.
+            Ok(CowOpenPlan::Deleted) => OpenStep::Answer(NotifAction::Errno(libc::ENOENT)),
+            Ok(CowOpenPlan::Resolved(p)) | Ok(CowOpenPlan::UpperReady { upper: p }) => {
+                OpenStep::Open(p)
+            }
+            Ok(CowOpenPlan::Copy { rel_path, plan }) => OpenStep::Copy(rel_path, plan),
+            Err(e) => OpenStep::Answer(NotifAction::Errno(branch_errno(e))),
+        }
+    }
+}
+
+/// An open the branch may redirect.
+pub(crate) struct CowOpen {
+    pub(crate) caller: Caller,
+    pub(crate) layers: Layers,
+    pub(crate) path: String,
+    pub(crate) flags: u64,
+    pub(crate) open_flags: i32,
+    pub(crate) mode: u32,
+    /// Chroot mode has no kernel open to fall back to after a copy.
+    pub(crate) may_continue: bool,
+}
+
+impl CowOpen {
+    /// The answer for this open, or `None` when the branch leaves it alone.
+    pub(crate) fn run(
+        self,
+        cow_state: &Arc<Mutex<CowState>>,
+        cow: &mut SeccompCowBranch,
+    ) -> Option<NotifAction> {
+        Some(
+            match OpenStep::of(cow.prepare_open(&self.path, self.flags)) {
+                OpenStep::Skip => return None,
+                OpenStep::Answer(action) => action,
+                OpenStep::Open(p) => self.inject(&p),
+                OpenStep::Copy(rel, plan) => copy_up_off_loop(
+                    cow_state,
+                    self.caller,
+                    self.layers.clone(),
+                    CopyUp::Entry(rel.clone()),
+                    vec![(rel, plan)],
+                    |e| NotifAction::Errno(branch_errno(e)),
+                    move |cow| self.reopen(cow),
+                ),
+            },
+        )
+    }
+
+    fn reopen(self, cow: &mut SeccompCowBranch) -> NotifAction {
+        match OpenStep::of(cow.prepare_open(&self.path, self.flags)) {
+            OpenStep::Open(p) => self.inject(&p),
+            OpenStep::Answer(action) => action,
+            OpenStep::Skip if self.may_continue => NotifAction::Continue,
+            OpenStep::Skip => NotifAction::Errno(libc::EIO),
+            OpenStep::Copy(rel, plan) => {
+                cow.abandon_copies([(rel, plan)]);
+                NotifAction::Errno(libc::EIO)
+            }
+        }
+    }
+
+    fn inject(&self, real_path: &Path) -> NotifAction {
+        let fd = match open_confined(
+            &self.layers.upper,
+            &self.layers.workdir,
+            real_path,
+            self.open_flags,
+            self.mode,
+        ) {
+            Ok(fd) => fd,
+            // The kernel cannot see the upper layer, so its answer would be wrong.
+            Err(errno) => return NotifAction::Errno(errno),
+        };
+        // Preserve O_CLOEXEC from the original openat flags.
+        let newfd_flags = if self.flags & libc::O_CLOEXEC as u64 != 0 {
+            libc::O_CLOEXEC as u32
+        } else {
+            0
+        };
+        NotifAction::InjectFdSend {
+            srcfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            newfd_flags,
+        }
+    }
+}
+
 /// Handle open/openat/openat2 under workdir: redirect to COW upper/lower.
 pub(crate) async fn handle_cow_open(
     notif: &SeccompNotif,
@@ -204,8 +453,6 @@ pub(crate) async fn handle_cow_open(
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    use crate::cow::seccomp::CowOpenPlan;
-
     let (dirfd, path_ptr, flags, mode) = match decode_open_args(notif, notif_fd) {
         Some(a) => (a.dirfd, a.path_ptr, a.flags, a.mode),
         None => return NotifAction::Continue,
@@ -222,121 +469,42 @@ pub(crate) async fn handle_cow_open(
     };
     let mut path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
-    // Phase 1: determine plan under lock (no heavy I/O)
-    let (plan, upper_root, workdir_root) = {
-        let mut st = cow_state.lock().await;
-        let cow = match st.branch.as_mut() {
-            Some(c) => c,
-            None => return NotifAction::Continue,
-        };
-        let upper_root = cow.upper_dir().to_path_buf();
-        let workdir_root = cow.workdir().to_path_buf();
-
-        path = map_cow_upper_path(cow, &path);
-        if !cow.matches(&path) {
-            return NotifAction::Continue;
-        }
-
-        // Read-only opens don't need interception unless the file was
-        // modified or deleted in the COW layer.
-        const WRITE_FLAGS: u64 =
-            (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u64;
-        let is_write = flags & WRITE_FLAGS != 0;
-        if !is_write && !cow.needs_read_intercept(&path) {
-            return NotifAction::Continue;
-        }
-
-        let plan = match cow.prepare_open(&path, flags) {
-            Ok(plan) => plan,
-            Err(crate::error::BranchError::NotOwned) => return NotifAction::Continue,
-            Err(e) => return NotifAction::Errno(branch_errno(e)),
-        };
-        (plan, upper_root, workdir_root)
-    };
-    // Lock is released here
-
-    // Phase 2: execute I/O plan without holding the lock
-    let real_path = match plan {
-        CowOpenPlan::Skip => return NotifAction::Continue,
-        // Deleted in this branch (whiteout): the lower file still exists, so
-        // Continue would read its pre-delete content. Return ENOENT, matching
-        // the stat/access handlers.
-        CowOpenPlan::Deleted => return NotifAction::Errno(libc::ENOENT),
-        CowOpenPlan::Resolved(p) | CowOpenPlan::UpperReady { upper: p } => p,
-        CowOpenPlan::NeedsCopy {
-            upper,
-            lower: _lower,
-            file_size,
-            rel_path,
-        } => {
-            // Do the potentially-expensive copy on a blocking thread
-            let root = workdir_root.clone();
-            let uroot = upper_root.clone();
-            let rel = rel_path.clone();
-            let copy_result = tokio::task::spawn_blocking(move || {
-                crate::cow::seccomp::SeccompCowBranch::execute_copy(&root, &uroot, &rel)
-            })
-            .await;
-
-            match copy_result {
-                Ok(Ok(digest)) => {
-                    if let Some(d) = digest {
-                        let mut st = cow_state.lock().await;
-                        if let Some(cow) = st.branch.as_mut() {
-                            cow.record_digest(&rel_path, d);
-                        }
-                    }
-                    upper
-                }
-                Ok(Err(_)) | Err(_) => {
-                    // Continuing would let the kernel open the lower file
-                    // itself, so a write would land outside the branch.
-                    let mut st = cow_state.lock().await;
-                    if let Some(cow) = st.branch.as_mut() {
-                        cow.rollback_copy(file_size);
-                    }
-                    let errno = match copy_result {
-                        Ok(Err(e)) => e.raw_os_error().unwrap_or(libc::EIO),
-                        _ => libc::EIO,
-                    };
-                    return NotifAction::Errno(errno);
-                }
-            }
-        }
+    let mut st = cow_state.lock().await;
+    let cow = match st.branch.as_mut() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
     };
 
-    // Phase 3: open the resolved path and inject fd
-    // Strip O_EXCL — the COW layer already verified exclusivity. Keeping it
-    // would fail because we may have just copied the file into upper.
-    let open_flags = (flags & !(libc::O_EXCL as u64)) as i32;
-    // Honor the child's requested creation mode (masked to permission bits).
-    // Hardcoding 0o666 dropped the execute bits, so a binary copied into the
-    // workdir (e.g. `cp /bin/echo m`) landed in upper non-executable and
-    // `./m` failed with EACCES. The kernel ignores mode unless O_CREAT is set.
-    let create_mode = (mode & 0o7777) as libc::c_uint;
-    let fd = match open_confined(
-        &upper_root,
-        &workdir_root,
-        &real_path,
-        open_flags,
-        create_mode,
-    ) {
-        Ok(fd) => fd,
-        // The kernel cannot see the upper layer, so its answer would be wrong.
-        Err(errno) => return NotifAction::Errno(errno),
-    };
-
-    // Preserve O_CLOEXEC from the original openat flags.
-    let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
-        libc::O_CLOEXEC as u32
-    } else {
-        0
-    };
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    NotifAction::InjectFdSend {
-        srcfd: owned,
-        newfd_flags,
+    path = map_cow_upper_path(cow, &path);
+    if !cow.matches(&path) {
+        return NotifAction::Continue;
     }
+
+    // Read-only opens don't need interception unless the file was
+    // modified or deleted in the COW layer.
+    const WRITE_FLAGS: u64 =
+        (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u64;
+    let is_write = flags & WRITE_FLAGS != 0;
+    if !is_write && !cow.needs_read_intercept(&path) {
+        return NotifAction::Continue;
+    }
+
+    let open = CowOpen {
+        caller: Caller::of(notif, notif_fd),
+        layers: Layers::of(cow),
+        path,
+        flags,
+        // Strip O_EXCL — the COW layer already verified exclusivity. Keeping it
+        // would fail because we may have just copied the file into upper.
+        open_flags: (flags & !(libc::O_EXCL as u64)) as i32,
+        // Honor the child's requested creation mode (masked to permission bits).
+        // Hardcoding 0o666 dropped the execute bits, so a binary copied into the
+        // workdir (e.g. `cp /bin/echo m`) landed in upper non-executable and
+        // `./m` failed with EACCES. The kernel ignores mode unless O_CREAT is set.
+        mode: (mode & 0o7777) as u32,
+        may_continue: true,
+    };
+    open.run(cow_state, cow).unwrap_or(NotifAction::Continue)
 }
 
 // ============================================================
@@ -568,16 +736,13 @@ fn parse_cow_write(
 }
 
 /// Map a BranchError result to a NotifAction.
-fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
+fn cow_result(r: Result<bool, BranchError>) -> NotifAction {
     match r {
         Ok(true) => NotifAction::ReturnValue(0),
-        Err(crate::error::BranchError::QuotaExceeded) => NotifAction::Errno(libc::ENOSPC),
-        Err(crate::error::BranchError::Denied) => NotifAction::Errno(libc::EPERM),
-        // Whiteouted source: Continue would let the kernel act on the lower
-        // entry, which still exists with its pre-delete content.
-        Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
-        Err(crate::error::BranchError::NotOwned) => NotifAction::Continue,
-        _ => NotifAction::Continue,
+        Ok(false) | Err(BranchError::NotOwned) => NotifAction::Continue,
+        // Continue would let the kernel act on the lower entry, which the
+        // branch promised to leave alone.
+        Err(e) => NotifAction::Errno(branch_errno(e)),
     }
 }
 
@@ -590,76 +755,38 @@ fn unlink_result(r: Result<bool, i32>) -> NotifAction {
     }
 }
 
-/// Determine which relative path (if any) needs a COW copy for this operation.
-/// Returns `(match_path, copy_rel)` where match_path is checked against
-/// `cow.matches()` and copy_rel is the relative path to pre-copy.
-fn cow_copy_rel<'a>(
-    op: &'a CowWriteOp,
-    cow: &crate::cow::seccomp::SeccompCowBranch,
-) -> Option<(&'a str, String)> {
-    let (match_path, copy_path) = match op {
-        // These ops call ensure_cow_copy internally — pre-copy the target
-        CowWriteOp::Chmod { ref path, .. }
-        | CowWriteOp::Chown { ref path, .. }
-        | CowWriteOp::Truncate { ref path, .. } => (path.as_str(), path.as_str()),
-        CowWriteOp::Rename { ref old_path, .. } => (old_path.as_str(), old_path.as_str()),
-        CowWriteOp::Link {
-            ref old_path,
-            ref new_path,
-            ..
-        } => (new_path.as_str(), old_path.as_str()),
-        // These ops don't need a pre-copy
-        _ => return None,
-    };
-    if !cow.matches(match_path) {
-        return None;
+impl CowWriteOp {
+    /// What the branch must copy up before this write can run.
+    fn copy_up(&self, cow: &SeccompCowBranch) -> CopyUp {
+        let entry = |path: &str| cow.matches(path).then(|| cow.safe_rel(path)).flatten();
+        let need = match self {
+            CowWriteOp::Chmod { path, .. }
+            | CowWriteOp::Chown { path, .. }
+            | CowWriteOp::Truncate { path, .. } => entry(path).map(CopyUp::Entry),
+            CowWriteOp::Rename { old_path, .. } => entry(old_path).map(|r| cow.rename_copy_up(r)),
+            CowWriteOp::Link { old_path, new_path } if cow.matches(new_path) => {
+                entry(old_path).map(|r| cow.link_copy_up(r))
+            }
+            _ => None,
+        };
+        need.unwrap_or(CopyUp::Nothing)
     }
-    cow.safe_rel(copy_path).map(|rel| (match_path, rel))
 }
 
-/// Execute a deferred `CowCopyPlan::NeedsCopy` on a blocking thread.
-/// Returns the upper path on success, or rolls back quota on failure.
-async fn execute_deferred_copy(
-    cow_state: &Arc<Mutex<CowState>>,
-    workdir_root: std::path::PathBuf,
-    upper_root: std::path::PathBuf,
-    rel: String,
-    upper: std::path::PathBuf,
-    file_size: u64,
-) -> Option<std::path::PathBuf> {
-    let rel_path = rel.clone();
-    let copy_result = tokio::task::spawn_blocking(move || {
-        crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel)
-    })
-    .await;
-    match copy_result {
-        Ok(Ok(digest)) => {
-            if let Some(d) = digest {
-                let mut st = cow_state.lock().await;
-                if let Some(cow) = st.branch.as_mut() {
-                    cow.record_digest(&rel_path, d);
-                }
-            }
-            Some(upper)
-        }
-        _ => {
-            let mut st = cow_state.lock().await;
-            if let Some(cow) = st.branch.as_mut() {
-                cow.rollback_copy(file_size);
-            }
-            None
-        }
+/// How a write answers a copy-up the branch refused.
+fn refuse_write_copy(names_entry: bool, e: BranchError) -> NotifAction {
+    match e {
+        BranchError::QuotaExceeded => NotifAction::Errno(libc::ENOSPC),
+        // A kernel object: its metadata is the kernel's to change, but it
+        // cannot be staged under a new name.
+        BranchError::NotOwned if names_entry => NotifAction::Errno(libc::EXDEV),
+        BranchError::NotOwned => NotifAction::Continue,
+        e => NotifAction::Errno(branch_errno(e)),
     }
 }
 
 /// Handle all write-type syscalls: both *at variants (unlinkat, mkdirat, etc.)
 /// and legacy variants (unlink, rmdir, mkdir, etc.).
-///
-/// For operations that modify existing files (chmod, chown, rename, link,
-/// truncate), the handler uses a two-phase pattern: prepare the copy plan
-/// under the lock, execute the potentially expensive file copy outside the
-/// lock, then re-acquire the lock and run the actual operation (which finds
-/// the file already in upper).
 pub(crate) async fn handle_cow_write(
     notif: &SeccompNotif,
     cow_state: &Arc<Mutex<CowState>>,
@@ -672,79 +799,35 @@ pub(crate) async fn handle_cow_write(
         None => return NotifAction::Continue,
     };
 
-    // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O).
-    // Capture both layer roots here so Phase 2 needs no second lock.
-    let (copy_plan, copy_workdir, copy_upper, copy_rel) = {
-        let mut st = cow_state.lock().await;
-        let cow = match st.branch.as_mut() {
-            Some(c) => c,
-            None => return NotifAction::Continue,
-        };
-
-        op.remap_upper_paths(cow);
-        match cow_copy_rel(&op, cow) {
-            Some((_match_path, ref rel)) => {
-                let workdir = cow.workdir().to_path_buf();
-                let upper = cow.upper_dir().to_path_buf();
-                match cow.prepare_copy(rel) {
-                    Ok(plan) => (Some(plan), workdir, upper, rel.clone()),
-                    Err(crate::error::BranchError::QuotaExceeded) => {
-                        return NotifAction::Errno(libc::ENOSPC)
-                    }
-                    // A kernel object: its metadata is the kernel's to change,
-                    // but it cannot be staged under a new name.
-                    Err(crate::error::BranchError::NotOwned) => {
-                        return match op {
-                            CowWriteOp::Rename { .. } | CowWriteOp::Link { .. } => {
-                                NotifAction::Errno(libc::EXDEV)
-                            }
-                            _ => NotifAction::Continue,
-                        }
-                    }
-                    Err(_) => return NotifAction::Continue,
-                }
-            }
-            None => (
-                None,
-                std::path::PathBuf::new(),
-                std::path::PathBuf::new(),
-                String::new(),
-            ),
-        }
-    };
-    // Lock is released here
-
-    // Phase 2: execute the file copy outside the lock (if needed)
-    if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy {
-        upper,
-        lower: _lower,
-        file_size,
-    }) = copy_plan
-    {
-        if execute_deferred_copy(
-            cow_state,
-            copy_workdir,
-            copy_upper,
-            copy_rel,
-            upper,
-            file_size,
-        )
-        .await
-        .is_none()
-        {
-            return NotifAction::Continue;
-        }
-    }
-
-    // Phase 3: execute the operation under lock (ensure_cow_copy is now a no-op
-    // for the pre-copied file since it's already in upper)
     let mut st = cow_state.lock().await;
     let cow = match st.branch.as_mut() {
         Some(c) => c,
         None => return NotifAction::Continue,
     };
+    op.remap_upper_paths(cow);
+    if let CowWriteOp::Rename { old_path, new_path } = &op {
+        // Refused before the copy, so a refused rename stages nothing.
+        if cow.matches(old_path) {
+            if let Err(errno) = cow.check_rename(old_path, new_path) {
+                return NotifAction::Errno(errno);
+            }
+        }
+    }
+    let need = op.copy_up(cow);
+    let names_entry = matches!(op, CowWriteOp::Rename { .. } | CowWriteOp::Link { .. });
+    after_copy_up(
+        cow_state,
+        Caller::of(notif, notif_fd),
+        cow,
+        need,
+        move |e| refuse_write_copy(names_entry, e),
+        move |cow| apply_write(cow, &op),
+    )
+}
 
-    match op {
+/// Run a write operation once any file it changes is in the upper.
+fn apply_write(cow: &mut SeccompCowBranch, op: &CowWriteOp) -> NotifAction {
+    match *op {
         CowWriteOp::Unlink { ref path, is_dir } => {
             if !cow.matches(path) {
                 return NotifAction::Continue;
@@ -918,36 +1001,8 @@ pub(crate) async fn handle_cow_utimensat(
         return NotifAction::Continue;
     }
 
-    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, path_ptr, notif_fd) {
-        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
-        None => return NotifAction::Continue,
-    };
-
-    let (upper_path, upper_root, workdir_root) = {
-        let mut st = cow_state.lock().await;
-        let cow = match st.branch.as_mut() {
-            Some(c) => c,
-            None => return NotifAction::Continue,
-        };
-        let upper_root = cow.upper_dir().to_path_buf();
-        let workdir_root = cow.workdir().to_path_buf();
-        let path = map_cow_upper_path(cow, &path);
-        if !cow.matches(&path) {
-            return NotifAction::Continue;
-        }
-        let p = match cow.handle_utimensat(&path) {
-            Ok(Some(p)) => p,
-            Ok(None) => return NotifAction::Continue,
-            Err(crate::error::BranchError::QuotaExceeded) => {
-                return NotifAction::Errno(libc::ENOSPC)
-            }
-            Err(_) => return NotifAction::Continue,
-        };
-        (p, upper_root, workdir_root)
-    };
-
-    // Read times from child memory (2 x struct timespec = 32 bytes on x86_64)
+    // The kernel faults on the times before it looks at the path, and a plan
+    // given up afterwards would leave its copy reserved in the quota.
     let times = if times_ptr != 0 {
         match read_child_mem(notif_fd, notif.id, notif.pid, times_ptr, 32) {
             Ok(data) => {
@@ -962,8 +1017,49 @@ pub(crate) async fn handle_cow_utimensat(
     } else {
         None
     };
+    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
 
-    let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &upper_path) {
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
+        None => return NotifAction::Continue,
+    };
+
+    let mut st = cow_state.lock().await;
+    let cow = match st.branch.as_mut() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
+    let path = map_cow_upper_path(cow, &path);
+    if !cow.matches(&path) {
+        return NotifAction::Continue;
+    }
+    let Some(rel) = cow.safe_rel(&path) else {
+        return NotifAction::Continue;
+    };
+    let layers = Layers::of(cow);
+    let upper = layers.upper.join(&rel);
+    after_copy_up(
+        cow_state,
+        Caller::of(notif, notif_fd),
+        cow,
+        CopyUp::Entry(rel),
+        refuse_times_copy,
+        move |_| set_times(&layers, &upper, times, follow),
+    )
+}
+
+fn refuse_times_copy(e: BranchError) -> NotifAction {
+    refuse_write_copy(false, e)
+}
+
+fn set_times(
+    layers: &Layers,
+    upper_path: &Path,
+    times: Option<[libc::timespec; 2]>,
+    follow: bool,
+) -> NotifAction {
+    let (root, rel) = match pick_root_rel(&layers.upper, &layers.workdir, upper_path) {
         Ok(v) => v,
         Err(e) => return NotifAction::Errno(e),
     };
@@ -971,7 +1067,6 @@ pub(crate) async fn handle_cow_utimensat(
         .as_ref()
         .map(|t| t.as_ptr())
         .unwrap_or(std::ptr::null());
-    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
     if let Err(e) = crate::sys::fs::utimensat_in_root(root, &rel, times_raw, follow) {
         return NotifAction::Errno(e);
     }

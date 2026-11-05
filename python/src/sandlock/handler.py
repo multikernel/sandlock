@@ -179,23 +179,13 @@ class Handler:
     guard it with your own synchronization — the wrapper does not
     serialize handler dispatch.
 
-    Promptness: ``handle()`` must return quickly. It runs synchronously
-    inside the supervisor's dispatch path while holding the GIL; a
-    handler that blocks (a long sleep, a blocking I/O call, an infinite
-    loop) stalls the supervisor and can wedge the entire run.
-
-    Deferral: define ``handle`` as ``async def`` to run it off the
-    supervisor's notification loop, so a slow handler (a network round-trip,
-    a blocking call) does not stall every other trapped syscall. The
-    coroutine is driven to completion on a worker thread, and for I/O-bound
-    work multiple async handlers overlap (the GIL is released during
-    blocking I/O). Trade-offs: an async handler makes a *terminal*
-    decision: deferral short-circuits the handler chain, so if it returns
-    ``continue_()`` and other handlers are registered on the same syscall,
-    those later handlers do not run. Deferral is refused for
-    ``execve``/``execveat`` and fork-creating syscalls (the response cannot
-    be moved off-loop without skipping argv-safety work); such a call is
-    denied with EPERM.
+    Deferral: every ``handle()`` runs on a worker thread, off the
+    supervisor's notification loop, so a slow handler (a network
+    round-trip, a blocking call) delays only its own syscall. ``handle``
+    may also be ``async def``; the coroutine is driven to completion on
+    that worker thread. Returning ``continue_()`` hands the syscall to the
+    next handler registered on it. The syscall waits for the handler
+    however long it takes, and the run waits for it before completing.
     """
 
     on_exception: ExceptionPolicy = ExceptionPolicy.KILL

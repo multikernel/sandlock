@@ -393,11 +393,12 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
 
     if features.network_supervision {
         nrs.extend(NETWORK_POLICY_SYSCALLS);
-    } else if features.unix_fs_gate && !features.landlock_unix_gate {
+    } else if features.unix_fs_gate && (!features.landlock_unix_gate || features.chroot) {
         // Named-unix gate: trap connect() (stream) and sendto()/sendmsg()/
         // sendmmsg() (datagram) so reaching a unix socket outside the fs-write
         // grants is denied, even when no IP network rules are present. Landlock
-        // before ABI v9 cannot gate this. Handlers bail cheaply on addr-less
+        // before ABI v9 cannot gate this, and under chroot no Landlock can,
+        // since the kernel would resolve the address on the host. Handlers bail cheaply on addr-less
         // (connected) sends.
         nrs.push(libc::SYS_connect);
         nrs.push(libc::SYS_sendto);

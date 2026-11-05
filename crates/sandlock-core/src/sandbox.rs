@@ -605,6 +605,8 @@ struct Runtime {
     #[cfg(feature = "cow")]
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     supervisor_resource: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
+    #[cfg_attr(not(feature = "checkpoint"), allow(dead_code))]
+    supervisor_mem_gate: Option<crate::seccomp::gate::MemGate>,
     supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
     supervisor_network: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::NetworkState>>>,
     ctrl_fd: Option<std::os::fd::OwnedFd>,
@@ -1933,7 +1935,11 @@ impl Sandbox {
             return Err(SandlockError::Runtime(SandboxRuntimeError::NotRunning));
         }
         self.freeze().await?;
-        let cp = crate::checkpoint::capture(target_pid, self);
+        let gate = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.supervisor_mem_gate.as_ref());
+        let cp = crate::checkpoint::capture(target_pid, self, gate);
         self.thaw().await?;
         cp
     }
@@ -2166,6 +2172,7 @@ impl Sandbox {
                 #[cfg(feature = "cow")]
                 seccomp_cow: None,
                 supervisor_resource: None,
+                supervisor_mem_gate: None,
                 supervisor_cow: None,
                 supervisor_network: None,
                 ctrl_fd: None,
@@ -2274,6 +2281,7 @@ impl Sandbox {
             #[cfg(feature = "cow")]
             seccomp_cow: None,
             supervisor_resource: None,
+            supervisor_mem_gate: None,
             supervisor_cow: None,
             supervisor_network: None,
             ctrl_fd: None,
@@ -2949,6 +2957,8 @@ impl Sandbox {
             let chroot_state = Arc::new(tokio::sync::Mutex::new(chroot_state));
             let processes = Arc::new(crate::seccomp::state::ProcessIndex::new());
 
+            let mem_gate = crate::seccomp::gate::MemGate::default();
+            self.rt_mut().supervisor_mem_gate = Some(mem_gate.clone());
             let ctx = Arc::new(SupervisorCtx {
                 resource: Arc::clone(&res_state),
                 cow: Arc::clone(&cow_state),
@@ -2963,6 +2973,7 @@ impl Sandbox {
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,
+                mem_gate,
             });
 
             // Snapshot the sandbox config for the control-socket `config`

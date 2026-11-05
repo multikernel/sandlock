@@ -43,49 +43,56 @@ impl OnInjectSuccess {
     }
 }
 
-/// A deferred decision: an owned, `'static` future that produces the real
-/// [`NotifAction`] off the supervisor's notification loop.
+/// Work that decides a notification off the supervisor's notification loop.
 ///
 /// A handler returns [`NotifAction::Defer`] when computing the response is
 /// slow (a network round-trip, a blocking syscall) and must not stall the
-/// single supervisor task that gates every other trapped syscall.  The
-/// supervisor moves the future onto a worker, lets the loop proceed, and
-/// sends the response (via the still-valid `notif.id`) when the future
-/// resolves.  The future is `'static` because it outlives the borrowed
-/// `HandlerCtx` — capture what you need (`notif` is `Copy`, `notif_fd` is a
-/// `RawFd`) by value rather than borrowing `&self`.
+/// loop that gates every other trapped syscall. The child stays blocked in
+/// its syscall meanwhile. A deferral resumes where it was returned: when a handler
+/// defers, a `Continue` result runs the next handler in the chain and any other
+/// result ends it, so a deferred decision still passes every later check.
 ///
-/// The deferred future need only be `Send` (not `Sync`): the supervisor
-/// moves it onto a worker task and never shares it by reference.  Requiring
-/// `Sync` of user futures would be a leaky bound (it would reject a future
-/// capturing, say, a `Cell`), so it is not required.
+/// The future outlives the borrowed `HandlerCtx`; capture what it needs by
+/// value. It need only be `Send`: the supervisor moves it onto a task and
+/// never shares it.
 pub struct Deferred {
-    future: Pin<Box<dyn Future<Output = NotifAction> + Send + 'static>>,
+    work: Work,
     patient: bool,
 }
 
-// Safety: `NotifAction` must stay `Sync` so it can live in `Sync` contexts
-// (handler `&self` state, etc.; the `Handler` trait is `Send + Sync`), which
-// requires `Deferred: Sync`.  A `Send`-only future is not `Sync`, but the
-// boxed future is unreachable through a shared `&Deferred`: the field is
-// private, `Debug` touches only a static string, and `run(self)` consumes
-// the value (it is never callable through `&self`).  With no path to poll or
-// read the future via a shared reference, sharing `&Deferred` across threads
-// cannot race, so asserting `Sync` is sound while keeping user futures
-// `Send`-only.
+enum Work {
+    Future(Pin<Box<dyn Future<Output = NotifAction> + Send + 'static>>),
+    Native(Box<dyn FnOnce() -> NotifAction + Send + 'static>),
+}
+
+// Safety: `NotifAction` must stay `Sync` because handlers keep it in `Sync`
+// state. The work is private and only reachable by consuming the `Deferred`, so
+// a shared `&Deferred` can never touch it.
 unsafe impl Sync for Deferred {}
 
 impl std::fmt::Debug for Deferred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Deferred(<future>)")
+        match &self.work {
+            Work::Future(_) => f.write_str("Deferred(<future>)"),
+            Work::Native(_) => f.write_str("Deferred(<native>)"),
+        }
     }
 }
 
 impl Deferred {
     pub fn new<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
         Self {
-            future: Box::pin(f),
+            work: Work::Future(Box::pin(f)),
             patient: false,
+        }
+    }
+
+    /// Synchronous work run on a native thread. It cannot be cancelled, so
+    /// it is patient: failing the syscall would not stop its side effects.
+    pub fn native(work: impl FnOnce() -> NotifAction + Send + 'static) -> Self {
+        Self {
+            work: Work::Native(Box::new(work)),
+            patient: true,
         }
     }
 
@@ -93,16 +100,64 @@ impl Deferred {
     /// as it takes. The future has to end by itself once the child is gone.
     pub(crate) fn patient<F: Future<Output = NotifAction> + Send + 'static>(f: F) -> Self {
         Self {
-            future: Box::pin(f),
+            work: Work::Future(Box::pin(f)),
             patient: true,
         }
     }
 
-    /// Drive the deferred future to its terminal action.  Consumes `self`
-    /// because the future is run exactly once, on a worker task.
+    /// Run outside a supervisor, where native work is not ordered against exec.
     pub async fn run(self) -> NotifAction {
-        self.future.await
+        match self.work {
+            Work::Future(future) => future.await,
+            Work::Native(work) => super::native::run(None, work).await,
+        }
     }
+
+    async fn run_in(self, offload: &Offload) -> NotifAction {
+        let gate = offload.gate.clone();
+        match self.work {
+            Work::Future(future) => gate.scope(future).await,
+            Work::Native(work) => {
+                // The closure may outlive the supervisor and still use the
+                // listener's fd number, which must not be reused meanwhile.
+                let listener = Arc::clone(&offload.listener);
+                let work = Box::new(move || {
+                    let _listener = listener;
+                    work()
+                });
+                super::native::run(Some(gate), work).await
+            }
+        }
+    }
+
+    /// Run within `deadline` unless patient; a deferral never resolves to
+    /// another unexecuted action.
+    async fn run_until(self, offload: &Offload, deadline: tokio::time::Instant) -> NotifAction {
+        let action = if self.patient {
+            self.run_in(offload).await
+        } else {
+            match tokio::time::timeout_at(deadline, self.run_in(offload)).await {
+                Ok(action) => action,
+                Err(_) => {
+                    log::warn!("parked notification exceeded its deadline; failing with EIO");
+                    NotifAction::Errno(libc::EIO)
+                }
+            }
+        };
+        match action {
+            NotifAction::Defer(_) | NotifAction::Prepared(_) => NotifAction::Errno(libc::EIO),
+            other => other,
+        }
+    }
+}
+
+/// What one sandbox's parked work shares: the gate ordering its child-memory
+/// writes against exec and checkpoint, and the listener its native closures
+/// may outlive.
+#[derive(Clone)]
+struct Offload {
+    gate: super::gate::MemGate,
+    listener: Arc<OwnedFd>,
 }
 
 /// An owned operation whose side effects require callback approval.
@@ -165,10 +220,7 @@ pub enum NotifAction {
     /// Signal one process, named by any pid in it. `SIGKILL` here ends
     /// the whole thread group, as it does for any task.
     KillTask { sig: i32, pid: i32 },
-    /// Defer the response: run the carried future on a worker task and
-    /// send its terminal action later, keyed by `notif.id`.  Non-`Continue`,
-    /// so it short-circuits the handler chain — a deferring handler makes a
-    /// terminal decision.  See [`Deferred`].
+    /// Decide off the notification loop. See [`Deferred`].
     Defer(Deferred),
     /// Execute only after the policy callback permits the operation.
     Prepared(PreparedOperation),
@@ -206,10 +258,12 @@ impl NotifAction {
         self
     }
 
-    /// Construct a [`NotifAction::Defer`] from a `'static` future.  Ergonomic
-    /// shorthand for `NotifAction::Defer(Deferred::new(fut))`.
     pub fn defer<F: Future<Output = NotifAction> + Send + 'static>(fut: F) -> Self {
         NotifAction::Defer(Deferred::new(fut))
+    }
+
+    pub fn native(work: impl FnOnce() -> NotifAction + Send + 'static) -> Self {
+        NotifAction::Defer(Deferred::native(work))
     }
 
     /// Inject `content` into the child as the syscall's returned fd, backed by
@@ -290,17 +344,6 @@ pub(crate) fn named_content_memfd(content: &[u8], seal: bool, name: &str) -> io:
     }
 
     Ok(memfd)
-}
-
-/// Collapse a deferred future's resolved action into a sendable terminal
-/// action.  A deferred future that itself resolves to `Defer` is a bug
-/// (no nested deferral); collapse it to `EIO` so the trapped child gets a
-/// definite response instead of wedging forever waiting for one.
-fn finalize_deferred(action: NotifAction) -> NotifAction {
-    match action {
-        NotifAction::Defer(_) | NotifAction::Prepared(_) => NotifAction::Errno(libc::EIO),
-        other => other,
-    }
 }
 
 // ============================================================
@@ -1366,15 +1409,17 @@ pub struct NotifPolicy {
 impl NotifPolicy {
     /// Whether a named unix `connect()` is decided by the supervisor. It then
     /// connects on-behalf, so the peer's `SO_PEERCRED` names the supervisor.
+    /// Under chroot the kernel would resolve the address against the host's
+    /// root and the child's frozen cwd, so Landlock cannot take it over.
     pub(crate) fn supervises_unix_connect(&self) -> bool {
-        self.has_unix_fs_gate && !self.landlock_unix_gate
+        self.has_unix_fs_gate && (!self.landlock_unix_gate || self.chroot_root.is_some())
     }
 
     /// Whether a named unix send is decided by the supervisor. A destination
     /// policy keeps sends on-behalf even under Landlock: a `Continue` would let
     /// a racing `dup2` move the send onto an IP socket.
     pub(crate) fn supervises_unix_send(&self) -> bool {
-        self.has_unix_fs_gate && (!self.landlock_unix_gate || self.has_net_destination_policy)
+        self.supervises_unix_connect() || (self.has_unix_fs_gate && self.has_net_destination_policy)
     }
 
     /// Whether an open may land on something the supervisor answers for
@@ -1759,8 +1804,12 @@ pub fn write_child_mem(
     addr: u64,
     data: &[u8],
 ) -> Result<(), NotifError> {
-    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
-    write_child_mem_vm(pid, addr, data)?;
+    // Checked under the gate: a write that waited out an exec freeze must not
+    // follow the leader's pid into the image that exec installed.
+    super::gate::write(|| {
+        id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+        write_child_mem_vm(pid, addr, data)
+    })?;
     id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
     Ok(())
 }
@@ -1798,8 +1847,10 @@ pub fn write_child_mem_force(
     addr: u64,
     data: &[u8],
 ) -> Result<(), NotifError> {
-    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
-    write_child_mem_proc(pid, addr, data)?;
+    super::gate::write(|| {
+        id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+        write_child_mem_proc(pid, addr, data)
+    })?;
     id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
     Ok(())
 }
@@ -2852,43 +2903,27 @@ async fn emit_policy_event(
 // Per-notification handler (runs in a spawned task)
 // ============================================================
 
-/// Process a single seccomp notification: vDSO re-patch, path denial check,
-/// dispatch, policy event emission, and response.
-/// Maximum number of deferred handler futures running concurrently. Caps
-/// the worker fan-out (and any resources those workers hold, e.g. memfds or
-/// sockets) so a burst of deferrals cannot exhaust the supervisor process.
-const DEFER_MAX_INFLIGHT: usize = 64;
-
-/// Maximum time a deferred handler future may run before the supervisor gives
-/// up and fails the trapped syscall closed. Bounds the worst case so a hung
-/// future (e.g. a stalled network fetch in a token-injection handler) cannot
-/// park the child forever or permanently leak its `DEFER_MAX_INFLIGHT` slot.
-const DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Drive a deferred future to its terminal action, bounded by `limit`.
-///
-/// On timeout, fail closed with `EIO` so the trapped child gets a definite
-/// response instead of parking forever; `finalize_deferred` still guards a
-/// future that resolves to a nested `Defer`.
-async fn run_deferred_within(deferred: Deferred, limit: std::time::Duration) -> NotifAction {
-    match tokio::time::timeout(limit, deferred.run()).await {
-        Ok(action) => finalize_deferred(action),
-        Err(_) => {
-            log::warn!(
-                "deferred handler exceeded {:?}; failing syscall with EIO",
-                limit
-            );
-            NotifAction::Errno(libc::EIO)
-        }
-    }
-}
+/// How long a notification may stay parked before it fails closed with EIO,
+/// so a hung future cannot hold its caller forever.
+const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A notification whose response is decided off the loop. The loop sends
 /// it: a response sent while an exec freeze is held would release a task
 /// the freeze skipped because it was parked in seccomp.
 enum Parked {
+    /// A handler deferred; the chain picks up after it.
+    Chain(Box<ParkedChain>, NotifAction),
     Approval(Box<Prepared>, crate::policy_fn::Verdict),
-    Deferred(u64, NotifAction),
+    Response(u64, NotifAction),
+}
+
+struct ParkedChain {
+    notif: SeccompNotif,
+    chain: super::dispatch::Chain,
+    open: Option<Arc<OpenRequest>>,
+    has_denied: bool,
+    /// Shared by every deferral of this notification's chain.
+    deadline: tokio::time::Instant,
 }
 
 /// Parked notifications and the tids waiting on them, which the exec freeze
@@ -2896,13 +2931,15 @@ enum Parked {
 struct ParkedSet {
     tasks: tokio::task::JoinSet<Parked>,
     callers: HashMap<tokio::task::Id, (i32, u64)>,
+    offload: Offload,
 }
 
 impl ParkedSet {
-    fn new() -> Self {
+    fn new(listener: Arc<OwnedFd>, gate: super::gate::MemGate) -> Self {
         Self {
             tasks: tokio::task::JoinSet::new(),
             callers: HashMap::new(),
+            offload: Offload { gate, listener },
         }
     }
 
@@ -2913,17 +2950,29 @@ impl ParkedSet {
     }
 
     async fn join_next(&mut self) -> Option<Parked> {
-        loop {
-            match self.tasks.join_next_with_id().await? {
-                Ok((id, parked)) => {
-                    self.callers.remove(&id);
-                    return Some(parked);
-                }
-                Err(e) => {
-                    self.callers.remove(&e.id());
-                }
-            }
-        }
+        let joined = self.tasks.join_next_with_id().await?;
+        Some(self.settled(joined))
+    }
+
+    fn try_join_next(&mut self) -> Option<Parked> {
+        let joined = self.tasks.try_join_next_with_id()?;
+        Some(self.settled(joined))
+    }
+
+    fn settled(
+        &mut self,
+        joined: Result<(tokio::task::Id, Parked), tokio::task::JoinError>,
+    ) -> Parked {
+        let (id, outcome) = match joined {
+            Ok((id, parked)) => (id, Ok(parked)),
+            Err(e) => (e.id(), Err(())),
+        };
+        let caller = self.callers.remove(&id);
+        // A panicked task still owes its caller a response.
+        outcome.unwrap_or_else(|()| {
+            let notif_id = caller.map_or(0, |(_, notif_id)| notif_id);
+            Parked::Response(notif_id, NotifAction::Errno(libc::EIO))
+        })
     }
 
     /// The callers still parked: one that died since leaves its tid free for
@@ -2945,30 +2994,12 @@ struct Prepared {
     exec_image: Option<ExecImage>,
 }
 
-fn park_deferred(
-    parked: &mut ParkedSet,
-    notif: &SeccompNotif,
-    deferred: Deferred,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let id = notif.id;
-    parked.spawn(notif, async move {
-        let _permit = permit;
-        let action = match deferred.patient {
-            true => finalize_deferred(deferred.run().await),
-            false => run_deferred_within(deferred, DEFER_TIMEOUT).await,
-        };
-        Parked::Deferred(id, action)
-    });
-}
-
 async fn handle_notification(
     notif: SeccompNotif,
     ctx: &Arc<super::ctx::SupervisorCtx>,
     dispatch_table: &super::dispatch::DispatchTable,
     fd: RawFd,
     parked: &mut ParkedSet,
-    defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     let policy = &ctx.policy;
 
@@ -2997,38 +3028,92 @@ async fn handle_notification(
         .then(|| OpenRequest::decode(&notif, fd, policy, &ctx.processes))
         .flatten()
         .map(Arc::new);
-    let mut action = {
-        let denied = has_denied
-            && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr)
-            && is_path_denied_for_notif(&*ctx.policy_fn.lock().await, &notif, fd);
-        if denied {
-            NotifAction::Errno(libc::EACCES)
-        } else {
-            // Dispatch runs first so /proc virtualization and the other
-            // handlers still win for their paths.
-            let action = dispatch_table.dispatch(notif, fd, open.clone()).await;
-            // A bare Continue for an open is the racy window: the kernel
-            // re-resolves the path after it, and a racing thread can swap a
-            // link to reach a denied carve-out inside a granted tree (issue
-            // #111) or a procfs entry the handlers hide by name (issue
-            // #236). The open is done against the pinned inode instead.
-            let resolves = policy.chroot_root.is_none() && (has_denied || policy.resolves_opens());
-            match (&action, &open) {
-                (NotifAction::Continue, Some(open)) if resolves => {
-                    let pfs = ctx.policy_fn.lock().await;
-                    on_behalf_open(&notif, open, ctx, &pfs, fd, has_denied).await
-                }
-                _ => action,
-            }
-        }
+    let denied = has_denied
+        && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr)
+        && is_path_denied_for_notif(&*ctx.policy_fn.lock().await, &notif, fd);
+    // Dispatch runs first so /proc virtualization and the other handlers
+    // still win for their paths.
+    let mut chain = dispatch_table.chain(notif, fd, open.clone());
+    let action = match denied {
+        true => NotifAction::Errno(libc::EACCES),
+        false => chain.next().await,
     };
+    let state = ParkedChain {
+        notif,
+        chain,
+        open,
+        has_denied,
+        deadline: tokio::time::Instant::now() + PARK_TIMEOUT,
+    };
+    settle_chain(state, action, ctx, fd, parked).await;
+}
+
+async fn settle_chain(
+    state: ParkedChain,
+    action: NotifAction,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    fd: RawFd,
+    parked: &mut ParkedSet,
+) {
+    match action {
+        NotifAction::Defer(deferred) => {
+            let notif = state.notif;
+            let offload = parked.offload.clone();
+            parked.spawn(&notif, async move {
+                let action = deferred.run_until(&offload, state.deadline).await;
+                Parked::Chain(Box::new(state), action)
+            });
+        }
+        action => {
+            let ParkedChain {
+                notif,
+                open,
+                has_denied,
+                ..
+            } = state;
+            decide(notif, action, open, has_denied, ctx, fd, parked).await
+        }
+    }
+}
+
+/// Everything after the handler chain settles: pinned opens, fork
+/// accounting, the policy event and its verdict, and the response.
+async fn decide(
+    notif: SeccompNotif,
+    mut action: NotifAction,
+    open: Option<Arc<OpenRequest>>,
+    has_denied: bool,
+    ctx: &Arc<super::ctx::SupervisorCtx>,
+    fd: RawFd,
+    parked: &mut ParkedSet,
+) {
+    let policy = &ctx.policy;
+    let nr = notif.data.nr as i64;
+
+    // A bare Continue for an open is the racy window: the kernel re-resolves
+    // the path after it, and a racing thread can swap a link to reach a
+    // denied carve-out inside a granted tree (issue #111) or a procfs entry
+    // the handlers hide by name (issue #236). The open is done against the
+    // pinned inode instead.
+    let resolves = policy.chroot_root.is_none() && (has_denied || policy.resolves_opens());
+    if let (NotifAction::Continue, Some(open)) = (&action, &open) {
+        if resolves {
+            let pfs = ctx.policy_fn.lock().await;
+            action = on_behalf_open(&notif, open, ctx, &pfs, fd, has_denied).await;
+        }
+    }
 
     if let Some(open) = &open {
         action = crate::procfs::net_dispatch::guard_injection(action, &notif, open, ctx).await;
     }
 
-    let fork_counted = matches!(action, NotifAction::Continue)
-        && crate::resource::fork_counted_on_continue(&notif);
+    // Counted only once no handler can still refuse or defer the fork.
+    let mut fork_counted = false;
+    if matches!(action, NotifAction::Continue) && arch::fork_like_syscalls().contains(&nr) {
+        action = crate::resource::handle_fork(&notif, ctx, policy).await;
+        fork_counted = matches!(action, NotifAction::Continue)
+            && crate::resource::fork_counted_on_continue(&notif);
+    }
 
     // Read without freezing so the sandbox keeps running while policy_fn
     // decides; `freeze_exec` re-reads it under the freeze before Continue.
@@ -3052,7 +3137,7 @@ async fn handle_notification(
                 Parked::Approval(Box::new(prepared), verdict)
             });
         }
-        None => finish_notification(prepared, None, ctx, fd, parked, defer_sem).await,
+        None => finish_notification(prepared, None, ctx, fd, parked).await,
     }
 }
 
@@ -3104,7 +3189,6 @@ async fn finish_notification(
     ctx: &Arc<super::ctx::SupervisorCtx>,
     fd: RawFd,
     parked: &mut ParkedSet,
-    defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     let policy = &ctx.policy;
     let Prepared {
@@ -3162,13 +3246,9 @@ async fn finish_notification(
         }
     }
 
-    // Deferred response: run the handler's future off the loop so slow work
-    // (a network round-trip, a blocking syscall) does not stall it. The
-    // trapped child stays parked; the loop sends the result when it lands.
-    //
-    // Deferral is refused on syscalls whose Continue path requires the
-    // execve argv-safety freeze or fork creation-tracking: answering later
-    // would skip that TOCTOU-closing work.
+    // Supervisor work decided after the verdict, such as an approved connect
+    // or a FIFO open, answers with its result. Answering a fork or exec later
+    // would skip its TOCTOU-closing work; neither is ever parked here.
     if let NotifAction::Defer(deferred) = action {
         if crate::freeze::requires_freeze_on_continue(nr)
             || crate::resource::requires_process_creation_tracking(&notif, policy)
@@ -3176,42 +3256,51 @@ async fn finish_notification(
             let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
             return;
         }
-        match Arc::clone(defer_sem).try_acquire_owned() {
-            Ok(permit) => park_deferred(parked, &notif, deferred, permit),
-            // Too many deferrals in flight: fail fast with EAGAIN rather than
-            // blocking the loop or letting unbounded workers accrete.
-            Err(_) => {
-                let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EAGAIN));
-            }
-        }
+        let id = notif.id;
+        let deadline = tokio::time::Instant::now() + PARK_TIMEOUT;
+        let offload = parked.offload.clone();
+        parked.spawn(&notif, async move {
+            Parked::Response(id, deferred.run_until(&offload, deadline).await)
+        });
         return;
     }
 
     // From the freeze to its release nothing may await: the tracer is this
     // thread, and the loop must not release any parked task meanwhile.
-    let mut exec_freeze = None;
-    if let (NotifAction::Continue, Some(judged)) = (&action, &exec_image) {
-        let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd, parked);
-        action = frozen_action;
-        exec_freeze = Some(freeze);
-    }
-
-    // Ignore error — child may have exited between recv and response.
-    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
-    let send_result = send_response(fd, notif.id, action);
-
-    if let Some(freeze) = exec_freeze {
-        if exec_continued && send_result.is_ok() {
-            crate::freeze::release_after_exec(&freeze);
-        } else {
-            crate::freeze::detach_all(&freeze);
+    // Parked work keeps running, so its child-memory writes wait on the gate
+    // until the kernel has copied argv.
+    let gate = parked.offload.gate.clone();
+    let send_result = {
+        let mut exec_freeze = None;
+        let mut _writes_held = None;
+        if let (NotifAction::Continue, Some(judged)) = (&action, &exec_image) {
+            _writes_held = Some(gate.exclusive());
+            let (frozen_action, freeze) = freeze_exec(&notif, judged, ctx, fd, parked);
+            action = frozen_action;
+            exec_freeze = Some(freeze);
         }
-        // Now that the response is out, the kernel wait holding any pending
-        // task (the vfork parent waiting on this very execve) can clear;
-        // reap the queued interrupts and detach.
-        crate::freeze::reap_pending(&freeze.pending_tids);
-    }
 
+        // Ignore error — child may have exited between recv and response.
+        let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
+        let send_result = send_response(fd, notif.id, action);
+
+        if let Some(freeze) = exec_freeze {
+            if exec_continued && send_result.is_ok() {
+                crate::freeze::release_after_exec(&freeze);
+            } else {
+                crate::freeze::detach_all(&freeze);
+            }
+            // Now that the response is out, the kernel wait holding any pending
+            // task (the vfork parent waiting on this very execve) can clear;
+            // reap the queued interrupts and detach.
+            crate::freeze::reap_pending(&freeze.pending_tids);
+        }
+        send_result
+    };
+
+    if fork_counted && creation_trace.is_none() && send_result.is_err() {
+        crate::resource::rollback_fork_count(&ctx.resource).await;
+    }
     if let Some(trace) = creation_trace {
         if send_result.is_ok() {
             match crate::resource::finish_process_creation_tracking(trace).await {
@@ -3240,13 +3329,22 @@ async fn settle_parked(
     ctx: &Arc<super::ctx::SupervisorCtx>,
     fd: RawFd,
     set: &mut ParkedSet,
-    defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     match parked {
-        Parked::Approval(prepared, verdict) => {
-            finish_notification(*prepared, Some(verdict), ctx, fd, set, defer_sem).await
+        Parked::Chain(mut state, action) => {
+            if id_valid(fd, state.notif.id).is_err() {
+                return;
+            }
+            let action = match action {
+                NotifAction::Continue => state.chain.next().await,
+                decided => decided,
+            };
+            settle_chain(*state, action, ctx, fd, set).await
         }
-        Parked::Deferred(id, action) => {
+        Parked::Approval(prepared, verdict) => {
+            finish_notification(*prepared, Some(verdict), ctx, fd, set).await
+        }
+        Parked::Response(id, action) => {
             let _ = send_response(fd, id, action);
         }
     }
@@ -3271,14 +3369,16 @@ pub async fn supervisor(
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
-    let async_fd =
-        match tokio::io::unix::AsyncFd::with_interest(notif_fd, tokio::io::Interest::READABLE) {
-            Ok(fd) => fd,
-            Err(err) => {
-                let _ = startup.send(Err(err));
-                return;
-            }
-        };
+    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+        Arc::new(notif_fd),
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = startup.send(Err(err));
+            return;
+        }
+    };
     let fd = async_fd.get_ref().as_raw_fd();
 
     // Build the dispatch table once at startup.
@@ -3304,11 +3404,7 @@ pub async fn supervisor(
     // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
-    // Bounds the number of in-flight deferred handler futures (see
-    // `DEFER_MAX_INFLIGHT`). Shared across all notifications this supervisor
-    // processes.
-    let defer_sem = Arc::new(tokio::sync::Semaphore::new(DEFER_MAX_INFLIGHT));
-    let mut parked = ParkedSet::new();
+    let mut parked = ParkedSet::new(Arc::clone(async_fd.get_ref()), ctx.mem_gate.clone());
 
     // Edge-triggered drain: each `readable().await` returns once per
     // epoll edge, then we drain the kernel queue via `probe_notif_fd`
@@ -3319,7 +3415,7 @@ pub async fn supervisor(
     //
     // Notifications are processed sequentially (not spawned) to avoid
     // mutex contention between concurrent handlers. Policy verdicts and
-    // deferred handlers resolve in `parked` and are answered here too.
+    // parked handlers resolve in `parked` and are answered here too.
     'outer: loop {
         let mut ready = tokio::select! {
             ready = async_fd.readable() => match ready {
@@ -3327,7 +3423,7 @@ pub async fn supervisor(
                 Err(_) => break 'outer,
             },
             Some(done) = parked.join_next() => {
-                settle_parked(done, &ctx, fd, &mut parked, &defer_sem).await;
+                settle_parked(done, &ctx, fd, &mut parked).await;
                 continue;
             }
         };
@@ -3335,6 +3431,10 @@ pub async fn supervisor(
         drop(ready);
 
         loop {
+            // A child that keeps the queue full must not postpone settled parks.
+            if let Some(done) = parked.try_join_next() {
+                settle_parked(done, &ctx, fd, &mut parked).await;
+            }
             match probe_notif_fd(fd) {
                 NotifFdState::Pending => {
                     let notif = match recv_notif(fd) {
@@ -3351,8 +3451,15 @@ pub async fn supervisor(
                         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
                     };
-                    handle_notification(notif, &ctx, &dispatch_table, fd, &mut parked, &defer_sem)
-                        .await;
+                    let gate = parked.offload.gate.clone();
+                    gate.scope(handle_notification(
+                        notif,
+                        &ctx,
+                        &dispatch_table,
+                        fd,
+                        &mut parked,
+                    ))
+                    .await;
                 }
                 NotifFdState::Empty => break,
                 NotifFdState::Terminal => break 'outer,
@@ -3443,6 +3550,13 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_offload() -> Offload {
+        Offload {
+            gate: super::super::gate::MemGate::default(),
+            listener: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
+        }
+    }
 
     #[test]
     fn openat_how_matches_what_openat2_accepts() {
@@ -3785,68 +3899,65 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_future_need_not_be_sync() {
-        // A deferred future may capture Send-but-not-Sync state across an
-        // await. `Cell` is Send but never Sync; holding it across `.await`
-        // makes the future !Sync. Only `Send` is required (the supervisor
-        // moves the future to a worker, never shares it by reference).
         use std::cell::Cell;
         let action = NotifAction::defer(async move {
             let counter = Cell::new(0);
             counter.set(counter.get() + 41);
-            tokio::task::yield_now().await; // hold the !Sync Cell across await
+            tokio::task::yield_now().await;
             NotifAction::ReturnValue(counter.get() + 1)
         });
-        let NotifAction::Defer(d) = action else {
+        let NotifAction::Defer(deferred) = action else {
             panic!("expected Defer")
         };
-        assert!(matches!(d.run().await, NotifAction::ReturnValue(42)));
-    }
-
-    #[tokio::test]
-    async fn deferred_runs_to_its_terminal_action() {
-        // A Defer carries a future; running it yields the deferred decision.
-        let action = NotifAction::defer(async { NotifAction::ReturnValue(7) });
-        let NotifAction::Defer(deferred) = action else {
-            panic!("defer() must construct a NotifAction::Defer");
-        };
-        assert!(matches!(deferred.run().await, NotifAction::ReturnValue(7)));
+        assert!(matches!(deferred.run().await, NotifAction::ReturnValue(42)));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn deferred_times_out_to_eio() {
-        // A deferred future that exceeds its limit must fail closed (EIO) so
-        // the trapped child gets a definite response instead of parking
-        // forever (and leaking its DEFER_MAX_INFLIGHT slot).
+    async fn deferred_past_deadline_fails_with_eio() {
         let slow = Deferred::new(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             NotifAction::ReturnValue(7)
         });
-        let action = run_deferred_within(slow, std::time::Duration::from_secs(1)).await;
-        assert!(matches!(action, NotifAction::Errno(e) if e == libc::EIO));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(matches!(
+            slow.run_until(&test_offload(), deadline).await,
+            NotifAction::Errno(libc::EIO)
+        ));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn deferred_within_limit_passes_through() {
-        // A future that resolves within the limit returns its terminal action.
-        let fast = Deferred::new(async { NotifAction::ReturnValue(7) });
-        let action = run_deferred_within(fast, std::time::Duration::from_secs(1)).await;
-        assert!(matches!(action, NotifAction::ReturnValue(7)));
+    async fn patient_deferral_ignores_deadline() {
+        let slow = Deferred::patient(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            NotifAction::ReturnValue(7)
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(matches!(
+            slow.run_until(&test_offload(), deadline).await,
+            NotifAction::ReturnValue(7)
+        ));
     }
 
-    #[test]
-    fn finalize_deferred_collapses_nested_defer_to_eio() {
-        // A deferred future that itself resolves to Defer is a bug: collapse
-        // to EIO so the trapped child is never wedged waiting for a response.
-        let nested = NotifAction::defer(async { NotifAction::Continue });
-        assert!(matches!(finalize_deferred(nested), NotifAction::Errno(e) if e == libc::EIO));
-        // Non-nested terminal actions pass through unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn native_deferral_ignores_deadline() {
+        let slow = Deferred::native(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            NotifAction::ReturnValue(7)
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
         assert!(matches!(
-            finalize_deferred(NotifAction::Continue),
-            NotifAction::Continue
+            slow.run_until(&test_offload(), deadline).await,
+            NotifAction::ReturnValue(7)
         ));
+    }
+
+    #[tokio::test]
+    async fn deferred_resolving_to_unexecuted_work_fails_with_eio() {
+        let nested = Deferred::new(async { NotifAction::defer(async { NotifAction::Continue }) });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         assert!(matches!(
-            finalize_deferred(NotifAction::ReturnValue(3)),
-            NotifAction::ReturnValue(3)
+            nested.run_until(&test_offload(), deadline).await,
+            NotifAction::Errno(libc::EIO)
         ));
     }
 

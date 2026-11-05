@@ -387,7 +387,11 @@ fn parse_fdinfo(pid: i32, fd: i32) -> io::Result<(i32, u64)> {
 
 /// Capture a checkpoint from a running, stopped sandbox.
 /// The sandbox must already be frozen (SIGSTOP'd and fork-held).
-pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, SandlockError> {
+pub(crate) fn capture(
+    pid: i32,
+    policy: &Sandbox,
+    mem_gate: Option<&crate::seccomp::gate::MemGate>,
+) -> Result<Checkpoint, SandlockError> {
     // Credential-injection rules hold supervisor-only secrets that are
     // deliberately not serialized (`#[serde(skip)]`). A checkpoint image would
     // therefore restore with no injection rules and send every request
@@ -411,6 +415,11 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
     // returning early here would leave the workload stopped under a tracer that
     // is walking away, which turns a failed checkpoint into a hung sandbox.
     let captured = (|| {
+        // The seize waited for the target to stop, so the handler of any
+        // syscall it was trapped in has answered. Handlers for the rest of the
+        // sandbox, inline or parked, may still write memory the target shares:
+        // hold their writes until the capture is done.
+        let _writes_held = mem_gate.map(|gate| gate.exclusive());
         let regs = ptrace_getregs(pid).map_err(|e| {
             SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
         })?;
@@ -643,7 +652,7 @@ mod tests {
         unsafe { libc::usleep(100_000) }; // let the child finish its mmap
 
         let policy = Sandbox::builder().build().expect("build policy");
-        let result = capture(child, &policy);
+        let result = capture(child, &policy, None);
 
         // Read the child's state while it is still alive: a capture that bailed
         // out without detaching would leave it in 't' (tracing stop) forever.
@@ -756,7 +765,7 @@ mod tests {
         let pid = child.id() as i32;
 
         let policy = Sandbox::builder().build().expect("build policy");
-        let captured = capture(pid, &policy);
+        let captured = capture(pid, &policy, None);
 
         let _ = child.kill();
         let _ = child.wait();

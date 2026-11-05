@@ -489,6 +489,44 @@ pub(crate) fn renameat_in_root(root: &Path, old_rel: &str, new_rel: &str) -> Res
     }
 }
 
+/// Move `src` to `rel` confined within `root`, failing with `EEXIST` rather
+/// than replacing. NFS, 9p, ceph and ecryptfs reject `RENAME_NOREPLACE` but
+/// can link, which is just as atomic; FAT cannot link, so neither alone does.
+pub(crate) fn install_in_root(src: &Path, root: &Path, rel: &str) -> Result<(), i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let csrc = CString::new(src.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    let (pfd, base) = parent_dir_in_root(root, rel)?;
+    let result = CString::new(base)
+        .map_err(|_| libc::EINVAL)
+        .and_then(|cbase| {
+            // Not every libc this builds against wraps renameat2.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    csrc.as_ptr(),
+                    pfd,
+                    cbase.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            match last_errno(libc::EIO) {
+                libc::EINVAL | libc::ENOSYS => {}
+                e => return Err(e),
+            }
+            if unsafe { libc::linkat(libc::AT_FDCWD, csrc.as_ptr(), pfd, cbase.as_ptr(), 0) } < 0 {
+                return Err(last_errno(libc::EIO));
+            }
+            unsafe { libc::unlink(csrc.as_ptr()) };
+            Ok(())
+        });
+    unsafe { libc::close(pfd) };
+    result
+}
+
 /// Create a hard link `new_rel -> old_rel` confined within `root`. The old path
 /// is not dereferenced (no `AT_SYMLINK_FOLLOW`).
 pub(crate) fn linkat_in_root(root: &Path, old_rel: &str, new_rel: &str) -> Result<(), i32> {
@@ -650,6 +688,27 @@ mod tests {
             Err(libc::ENOSYS) => {} // kernel without openat2
             Err(e) => panic!("unexpected error: {}", e),
         }
+    }
+
+    #[test]
+    fn install_in_root_moves_the_file_and_never_replaces() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        let staged = tmp.path().join("staged");
+
+        std::fs::write(&staged, "first").unwrap();
+        install_in_root(&staged, &root, "d/f").unwrap();
+        assert_eq!(std::fs::read(root.join("d/f")).unwrap(), b"first");
+        assert!(!staged.exists());
+
+        std::fs::write(&staged, "second").unwrap();
+        assert_eq!(install_in_root(&staged, &root, "d/f"), Err(libc::EEXIST));
+        assert_eq!(std::fs::read(root.join("d/f")).unwrap(), b"first");
+        assert!(
+            staged.exists(),
+            "the loser is left for its owner to discard"
+        );
     }
 
     #[test]

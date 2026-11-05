@@ -116,6 +116,7 @@ fn block_on_run(
     // `crate::runtime` for why this is `current_thread`. This path is
     // reached from `extern "C-unwind"` entry points, so user callback
     // panics are intentionally allowed to propagate.
+    let _callbacks: Vec<_> = handlers.iter().map(|(_, h)| h.run_guard()).collect();
     crate::runtime::with_runtime_unwind(|rt| {
         rt.block_on(async move {
             if interactive {

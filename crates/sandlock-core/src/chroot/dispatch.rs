@@ -475,6 +475,39 @@ fn resolve_chroot_path_existing(
     resolve_existing_in_root(ctx.root, &full_path)
 }
 
+/// Pin the socket inode a named unix address reaches in the sandbox's view
+/// and require write access to it, as the kernel's connect does.
+///
+/// The child's real root and cwd are the host's, so the kernel cannot be left
+/// to resolve the address: the grant is checked on where the pinned inode
+/// actually sits, after symlinks inside the root are followed.
+pub(crate) fn pin_writable_unix_target(
+    notif: &SeccompNotif,
+    ctx: &ChrootCtx<'_>,
+    sun_path: &Path,
+) -> Result<OwnedFd, i32> {
+    let vpath = build_virtual_path(
+        notif,
+        libc::AT_FDCWD as i64,
+        sun_path.to_str().ok_or(libc::ECONNREFUSED)?,
+        ctx,
+    )
+    .ok_or(libc::ECONNREFUSED)?;
+    let confined = confine(&vpath);
+    let (root, sub) = match ctx.mount_target(&confined) {
+        Some((mount, sub)) => (mount, sub),
+        None => (ctx.root, confined.to_string_lossy().into_owned()),
+    };
+    let fd = openat2_in_root(root, &sub, libc::O_PATH | libc::O_CLOEXEC, 0)
+        .map_err(|_| libc::ECONNREFUSED)?;
+    let pinned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let host = std::fs::read_link(format!("/proc/self/fd/{}", fd)).map_err(|_| libc::EACCES)?;
+    match ctx.host_to_virtual(&host) {
+        Some(virtual_path) if ctx.can_write(&virtual_path) => Ok(pinned),
+        _ => Err(libc::EACCES),
+    }
+}
+
 /// Convert a Path to CString, returning Errno on failure.
 fn path_cstr(path: &Path, err: i32) -> Result<CString, NotifAction> {
     CString::new(path.to_str().unwrap_or("")).map_err(|_| NotifAction::Errno(err))
@@ -560,6 +593,35 @@ fn read_and_resolve_existing(
 }
 
 /// Perform a libc syscall on a host path; return ReturnValue(0) or Errno.
+fn rename_on_host(old_host: &Path, new_host: &Path) -> NotifAction {
+    let c_old = match path_cstr(old_host, libc::EINVAL) {
+        Ok(c) => c,
+        Err(a) => return a,
+    };
+    let c_new = match path_cstr(new_host, libc::EINVAL) {
+        Ok(c) => c,
+        Err(a) => return a,
+    };
+    if unsafe { libc::rename(c_old.as_ptr(), c_new.as_ptr()) } < 0 {
+        NotifAction::Errno(last_errno(libc::EIO))
+    } else {
+        NotifAction::ReturnValue(0)
+    }
+}
+
+fn chown_on_host(host: &Path, uid: u32, gid: u32, nofollow: bool) -> NotifAction {
+    exec_on_host(
+        |p| unsafe {
+            if nofollow {
+                libc::lchown(p, uid, gid)
+            } else {
+                libc::chown(p, uid, gid)
+            }
+        },
+        host,
+    )
+}
+
 fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path) -> NotifAction {
     let c = match path_cstr(host, libc::EINVAL) {
         Ok(c) => c,
@@ -628,64 +690,10 @@ pub(crate) async fn handle_chroot_open(
     // COW path: the branch picks the layer, the kernel resolves the rest.
     // A symlink in the image is followed inside that layer's root, never on
     // the host, because the supervisor holds no chroot of its own.
+    #[cfg(feature = "cow")]
+    if let Some(action) = chroot_cow_open(notif, notif_fd, cow_state, &host_path, flags, mode).await
     {
-        #[cfg(feature = "cow")]
-        let mut cs = cow_state.lock().await;
-        #[cfg(feature = "cow")]
-        if let Some(cow) = cs.branch.as_mut() {
-            let host_str = host_path.to_string_lossy();
-            if cow.matches(&host_str) {
-                match cow.handle_open(&host_str, flags) {
-                    Ok(Some(real_path)) => {
-                        let upper_root = cow.upper_dir().to_path_buf();
-                        let workdir_root = cow.workdir().to_path_buf();
-                        drop(cs);
-                        let fd = match crate::cow::dispatch::open_confined(
-                            &upper_root,
-                            &workdir_root,
-                            &real_path,
-                            flags_i,
-                            mode,
-                        ) {
-                            Ok(fd) => fd,
-                            Err(errno) => return NotifAction::Errno(errno),
-                        };
-                        let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
-                            libc::O_CLOEXEC as u32
-                        } else {
-                            0
-                        };
-                        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                        return NotifAction::InjectFdSend {
-                            srcfd: owned,
-                            newfd_flags,
-                        };
-                    }
-                    Ok(None) => {
-                        // Fall through to openat2_in_root below. This keeps
-                        // directory opens and other non-COW / non-whiteout
-                        // cases confined to the chroot instead of executing the
-                        // original host syscall. (Whiteouts are handled by the
-                        // BranchError::Deleted arm below, not here.)
-                    }
-                    Err(crate::error::BranchError::QuotaExceeded) => {
-                        return NotifAction::Errno(libc::ENOSPC);
-                    }
-                    Err(crate::error::BranchError::Exists) => {
-                        return NotifAction::Errno(libc::EEXIST);
-                    }
-                    Err(crate::error::BranchError::Deleted) => {
-                        // Whiteout read-open: the lower file still physically
-                        // exists, but the branch deleted it. Return ENOENT
-                        // rather than leaking pre-delete bytes — parity with the
-                        // async cow open path (cow/dispatch.rs) and
-                        // stat/statx/access/readlink.
-                        return NotifAction::Errno(libc::ENOENT);
-                    }
-                    Err(_) => return NotifAction::Errno(libc::EIO),
-                }
-            }
-        }
+        return action;
     }
 
     // Resolve the path to an fd to hand the child: either a freshly opened tree
@@ -700,6 +708,89 @@ pub(crate) async fn handle_chroot_open(
         Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
         Err(errno) => NotifAction::Errno(errno),
     }
+}
+
+/// The answer for an open the COW branch owns, or `None` to open it in the
+/// namespace.
+#[cfg(feature = "cow")]
+async fn chroot_cow_open(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    cow_state: &Arc<Mutex<CowState>>,
+    host_path: &Path,
+    flags: u64,
+    mode: u32,
+) -> Option<NotifAction> {
+    use crate::cow::dispatch::{Caller, CowOpen, Layers};
+
+    let host_str = host_path.to_string_lossy().into_owned();
+    let mut cs = cow_state.lock().await;
+    let cow = cs.branch.as_mut()?;
+    if !cow.matches(&host_str) {
+        return None;
+    }
+    if flags & libc::O_DIRECTORY as u64 != 0 {
+        // The namespace open sees every layer but a whiteout: the lower
+        // directory survives one, where the merged answer is ENOENT.
+        let rel = cow.safe_rel(&host_str)?;
+        return cow
+            .is_deleted(&rel)
+            .then_some(NotifAction::Errno(libc::ENOENT));
+    }
+    let open = CowOpen {
+        caller: Caller::of(notif, notif_fd),
+        layers: Layers::of(cow),
+        path: host_str,
+        flags,
+        open_flags: flags as i32,
+        mode,
+        may_continue: false,
+    };
+    open.run(cow_state, cow)
+}
+
+/// A branch handler's answer in chroot mode, where `host` is the syscall
+/// done on the host path for what the branch leaves to the kernel.
+#[cfg(feature = "cow")]
+fn branch_answer(
+    r: Result<bool, crate::error::BranchError>,
+    host: impl FnOnce() -> NotifAction,
+) -> NotifAction {
+    match r {
+        Ok(true) => NotifAction::ReturnValue(0),
+        Ok(false) | Err(crate::error::BranchError::NotOwned) => host(),
+        Err(e) => NotifAction::Errno(crate::cow::seccomp::branch_errno(e)),
+    }
+}
+
+/// Answer a chroot write the branch owns: copy up what it needs off the
+/// loop, then run `apply`, with `host` for what the branch leaves to the
+/// kernel.
+#[cfg(feature = "cow")]
+fn chroot_cow_write(
+    cow_state: &Arc<Mutex<CowState>>,
+    caller: crate::cow::dispatch::Caller,
+    cow: &mut crate::cow::seccomp::SeccompCowBranch,
+    path: String,
+    host: impl Fn() -> NotifAction + Clone + Send + 'static,
+    apply: impl FnOnce(
+            &mut crate::cow::seccomp::SeccompCowBranch,
+            &str,
+        ) -> Result<bool, crate::error::BranchError>
+        + Send
+        + 'static,
+) -> NotifAction {
+    use crate::cow::seccomp::CopyUp;
+    let need = cow.safe_rel(&path).map_or(CopyUp::Nothing, CopyUp::Entry);
+    let refuse_host = host.clone();
+    crate::cow::dispatch::after_copy_up(
+        cow_state,
+        caller,
+        cow,
+        need,
+        move |e| branch_answer(Err(e), &refuse_host),
+        move |cow| branch_answer(apply(cow, &path), host),
+    )
 }
 
 /// Open `virtual_path` within the child's virtual namespace, returning an fd to
@@ -1447,30 +1538,35 @@ pub(crate) async fn handle_chroot_write(
             let mut cs = cow_state.lock().await;
             #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
-                let old_str = old_host.to_string_lossy();
+                let old_str = old_host.to_string_lossy().into_owned();
                 if cow.matches(&old_str) {
-                    match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
-                        Ok(true) => return NotifAction::ReturnValue(0),
-                        Err(errno) => return NotifAction::Errno(errno),
-                        Ok(false) => {}
+                    let new_str = new_host.to_string_lossy().into_owned();
+                    // Refused before the copy, so a refused rename stages nothing.
+                    if let Err(errno) = cow.check_rename(&old_str, &new_str) {
+                        return NotifAction::Errno(errno);
                     }
+                    let need = cow
+                        .safe_rel(&old_str)
+                        .map_or(crate::cow::seccomp::CopyUp::Nothing, |r| {
+                            cow.rename_copy_up(r)
+                        });
+                    return crate::cow::dispatch::after_copy_up(
+                        cow_state,
+                        crate::cow::dispatch::Caller::of(notif, notif_fd),
+                        cow,
+                        need,
+                        |e| NotifAction::Errno(crate::cow::seccomp::branch_errno(e)),
+                        move |cow| match cow.handle_rename(&old_str, &new_str) {
+                            Ok(true) => NotifAction::ReturnValue(0),
+                            Err(errno) => NotifAction::Errno(errno),
+                            Ok(false) => rename_on_host(&old_host, &new_host),
+                        },
+                    );
                 }
             }
         }
 
-        let c_old = match path_cstr(&old_host, libc::EINVAL) {
-            Ok(c) => c,
-            Err(a) => return a,
-        };
-        let c_new = match path_cstr(&new_host, libc::EINVAL) {
-            Ok(c) => c,
-            Err(a) => return a,
-        };
-        return if unsafe { libc::rename(c_old.as_ptr(), c_new.as_ptr()) } < 0 {
-            NotifAction::Errno(last_errno(libc::EIO))
-        } else {
-            NotifAction::ReturnValue(0)
-        };
+        return rename_on_host(&old_host, &new_host);
     }
 
     if nr == libc::SYS_symlinkat {
@@ -1604,7 +1700,20 @@ pub(crate) async fn handle_chroot_write(
                     return NotifAction::Errno(libc::EXDEV);
                 }
                 if cow.matches(&new_s) {
-                    return crate::cow::result::link_result(cow.handle_link(&old_s, &new_s));
+                    let (old_s, new_s) = (old_s.into_owned(), new_s.into_owned());
+                    let need = cow
+                        .safe_rel(&old_s)
+                        .map_or(crate::cow::seccomp::CopyUp::Nothing, |r| {
+                            cow.link_copy_up(r)
+                        });
+                    return crate::cow::dispatch::after_copy_up(
+                        cow_state,
+                        crate::cow::dispatch::Caller::of(notif, notif_fd),
+                        cow,
+                        need,
+                        |e| crate::cow::result::link_result(Err(e)),
+                        move |cow| crate::cow::result::link_result(cow.handle_link(&old_s, &new_s)),
+                    );
                 }
             }
         }
@@ -1669,15 +1778,17 @@ pub(crate) async fn handle_chroot_write(
             let mut cs = cow_state.lock().await;
             #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
-                let s = host_path.to_string_lossy();
+                let s = host_path.to_string_lossy().into_owned();
                 if cow.matches(&s) {
-                    match cow.handle_chmod(&s, mode) {
-                        Ok(true) => return NotifAction::ReturnValue(0),
-                        Err(crate::error::BranchError::QuotaExceeded) => {
-                            return NotifAction::Errno(libc::ENOSPC)
-                        }
-                        _ => {}
-                    }
+                    let host = host_path.clone();
+                    return chroot_cow_write(
+                        cow_state,
+                        crate::cow::dispatch::Caller::of(notif, notif_fd),
+                        cow,
+                        s,
+                        move || exec_on_host(|p| unsafe { libc::chmod(p, mode) }, &host),
+                        move |cow, s| cow.handle_chmod(s, mode),
+                    );
                 }
             }
         }
@@ -1706,28 +1817,21 @@ pub(crate) async fn handle_chroot_write(
             let mut cs = cow_state.lock().await;
             #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
-                let s = host_path.to_string_lossy();
+                let s = host_path.to_string_lossy().into_owned();
                 if cow.matches(&s) {
-                    match cow.handle_chown(&s, uid, gid) {
-                        Ok(true) => return NotifAction::ReturnValue(0),
-                        Err(crate::error::BranchError::QuotaExceeded) => {
-                            return NotifAction::Errno(libc::ENOSPC)
-                        }
-                        _ => {}
-                    }
+                    let host = host_path.clone();
+                    return chroot_cow_write(
+                        cow_state,
+                        crate::cow::dispatch::Caller::of(notif, notif_fd),
+                        cow,
+                        s,
+                        move || chown_on_host(&host, uid, gid, nofollow),
+                        move |cow, s| cow.handle_chown(s, uid, gid),
+                    );
                 }
             }
         }
-        return exec_on_host(
-            |p| unsafe {
-                if nofollow {
-                    libc::lchown(p, uid, gid)
-                } else {
-                    libc::chown(p, uid, gid)
-                }
-            },
-            &host_path,
-        );
+        return chown_on_host(&host_path, uid, gid, nofollow);
     }
 
     if nr == libc::SYS_truncate {
@@ -1749,15 +1853,17 @@ pub(crate) async fn handle_chroot_write(
             let mut cs = cow_state.lock().await;
             #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
-                let s = host_path.to_string_lossy();
+                let s = host_path.to_string_lossy().into_owned();
                 if cow.matches(&s) {
-                    match cow.handle_truncate(&s, length) {
-                        Ok(true) => return NotifAction::ReturnValue(0),
-                        Err(crate::error::BranchError::QuotaExceeded) => {
-                            return NotifAction::Errno(libc::ENOSPC)
-                        }
-                        _ => {}
-                    }
+                    let host = host_path.clone();
+                    return chroot_cow_write(
+                        cow_state,
+                        crate::cow::dispatch::Caller::of(notif, notif_fd),
+                        cow,
+                        s,
+                        move || exec_on_host(|p| unsafe { libc::truncate(p, length) }, &host),
+                        move |cow, s| cow.handle_truncate(s, length),
+                    );
                 }
             }
         }
