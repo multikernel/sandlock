@@ -31,7 +31,11 @@ impl Reaper {
 
     /// The reaper exits once the session has no process left.
     pub async fn exit(&self) {
-        if let Ok(fd) = tokio::io::unix::AsyncFd::new(self.pidfd.as_raw_fd()) {
+        let Ok(pidfd) = self.pidfd.try_clone() else {
+            return;
+        };
+        // SAFETY: the AsyncFd owns its own dup of the pidfd.
+        if let Ok(fd) = unsafe { tokio::io::unix::AsyncFd::register(pidfd) } {
             let _ = fd.readable().await;
         }
     }
