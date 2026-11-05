@@ -198,6 +198,29 @@ pub(crate) fn open_confined(
     crate::sys::fs::openat2_in_root(root, &rel, flags, mode)
 }
 
+/// Reopen an `O_PATH` descriptor as `O_RDONLY`, for a regular file or a
+/// directory. `None` for anything else. TOCTOU-safe: the stat and the
+/// reopen both go through the held descriptor.
+fn reopen_o_path_readable(fd: RawFd) -> Option<RawFd> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let empty = c"".as_ptr();
+    if unsafe { libc::fstatat(fd, empty, &mut st, libc::AT_EMPTY_PATH) } < 0 {
+        return None;
+    }
+    let flags = match st.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        libc::S_IFREG => libc::O_RDONLY | libc::O_CLOEXEC,
+        _ => return None, // symlink, FIFO, socket, device
+    };
+    let link = std::ffi::CString::new(format!("/proc/self/fd/{}", fd)).ok()?;
+    let reopened = unsafe { libc::open(link.as_ptr(), flags) };
+    if reopened < 0 {
+        return None;
+    }
+    unsafe { libc::close(fd) };
+    Some(reopened)
+}
+
 /// The branch's directories, taken under the lock for work done without it.
 #[derive(Clone)]
 pub(crate) struct Layers {
@@ -433,6 +456,22 @@ impl CowOpen {
             // The kernel cannot see the upper layer, so its answer would be wrong.
             Err(errno) => return NotifAction::Errno(errno),
         };
+
+        // ADDFD refuses an O_PATH source fd, so hand over a readable handle to
+        // the same entry. Under COW the workdir governs access to upper-layer
+        // entries, so this grants nothing a plain O_RDONLY would not. The
+        // child's fd reports O_RDONLY via F_GETFL, not O_PATH, and read() on
+        // it succeeds. Entries without read permission still return
+        // EOPNOTSUPP.
+        let fd = if self.open_flags & libc::O_PATH != 0 {
+            match reopen_o_path_readable(fd) {
+                Some(reopened) => reopened,
+                None => fd,
+            }
+        } else {
+            fd
+        };
+
         // Preserve O_CLOEXEC from the original openat flags.
         let newfd_flags = if self.flags & libc::O_CLOEXEC as u64 != 0 {
             libc::O_CLOEXEC as u32
