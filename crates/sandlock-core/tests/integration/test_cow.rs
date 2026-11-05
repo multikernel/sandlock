@@ -2105,3 +2105,203 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
     assert!(!workdir.join("made").exists());
     let _ = fs::remove_dir_all(&workdir);
 }
+
+/// A read is intercepted only for a path the branch actually owns; anything
+/// else must reach the kernel, not the supervisor. /proc/self and a pipe
+/// made in the child (not inherited, so the supervisor has no fd of the
+/// same number pointing at it) make the unowned case observable, since
+/// intercepted they'd answer for the supervisor instead of the caller.
+#[tokio::test]
+async fn test_seccomp_cow_read_intercept_follows_ownership() {
+    let staged = std::env::temp_dir().join(format!("sandlock-proc-self-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staged);
+
+    let script = format!(
+        concat!(
+            "import os, sys\n",
+            "os.mkdir('{staged}')\n", // staged in upper, this one must be intercepted
+            "dfd = os.open('/etc', os.O_RDONLY | os.O_DIRECTORY)\n",
+            "exe = os.readlink('/proc/self/exe', dir_fd=dfd)\n",
+            "r, w = os.pipe()\n",
+            "own_pipe = os.stat('/proc/self/fd/%d' % r).st_ino == os.fstat(r).st_ino\n",
+            "staged_ok = os.path.isdir('{staged}')\n",
+            "sys.stdout.write(exe + '\\n' + str(own_pipe) + '\\n' + str(staged_ok))\n",
+        ),
+        staged = staged.display()
+    );
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .workdir("/")
+        .cwd("/tmp")
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+
+    let out = result.stdout_str().unwrap_or("").to_string();
+    let mut lines = out.lines();
+    let exe = lines.next().unwrap_or("");
+    let own_pipe = lines.next().unwrap_or("");
+    let staged_ok = lines.next().unwrap_or("");
+    assert!(
+        exe.contains("python"),
+        "not intercepted: /proc/self/exe must name the child's interpreter, not the supervisor: {exe}"
+    );
+    assert_eq!(
+        own_pipe, "True",
+        "not intercepted: /proc/self/fd/N must resolve to the child's own fd, not the supervisor's"
+    );
+    assert_eq!(
+        staged_ok, "True",
+        "intercepted: the staged directory is owned by the branch and must still be visible"
+    );
+
+    let _ = fs::remove_dir_all(&staged);
+}
+
+/// readlink(path, buf, size) and readlinkat(dirfd, path, buf, size) do not
+/// share an argument layout. Read as readlinkat, a legacy readlink has its
+/// output buffer taken as the path, so the branch never recognises the call
+/// and a symlink created during the run cannot be read back.
+#[tokio::test]
+async fn test_seccomp_cow_legacy_readlink_reads_its_own_arguments() {
+    let workdir = temp_dir("seccomp-cow-legacy-readlink");
+
+    let script = concat!(
+        "import os, sys\n",
+        "os.symlink('target', 'lnk')\n", // exists only in the upper layer
+        "try:\n",
+        "    sys.stdout.write(os.readlink('lnk'))\n",
+        "except OSError as e:\n",
+        "    sys.stdout.write('errno=%d' % e.errno)\n",
+    );
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        result.stdout_str().unwrap_or("").trim(),
+        "target",
+        "a symlink created during the run must read back through legacy readlink"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// An O_PATH open of an entry that lives only in the upper layer must be
+/// served. ADDFD refuses an O_PATH source descriptor, so the supervisor hands
+/// over a read-only handle to the same entry instead, which grants nothing a
+/// plain O_RDONLY would not under COW.
+///
+/// Callers do not reliably pass O_DIRECTORY even when opening a directory, so
+/// the decision is made on what the entry is, not on the flags.
+#[tokio::test]
+async fn test_seccomp_cow_o_path_open_of_created_entries() {
+    let workdir = temp_dir("seccomp-cow-o-path-kinds");
+
+    let script = format!(
+        concat!(
+            "import os, sys, fcntl\n",
+            "os.mkdir('{wd}/d')\n",
+            "open('{wd}/f', 'w').write('x')\n",
+            "open('{wd}/noperm', 'w').write('x')\n",
+            "os.chmod('{wd}/noperm', 0)\n",
+            "def probe_dir(p):\n",
+            "    try:\n",
+            "        fd = os.open(p, os.O_PATH)\n",
+            "        os.close(fd)\n",
+            "        return 'ok'\n",
+            "    except OSError as e:\n",
+            "        return 'errno=%d' % e.errno\n",
+            "def probe_file(p):\n",
+            "    try:\n",
+            "        fd = os.open(p, os.O_PATH)\n",
+            "    except OSError as e:\n",
+            "        return 'errno=%d' % e.errno\n",
+            "    try:\n",
+            "        rdonly = (fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE) == os.O_RDONLY\n",
+            "        return 'ok rdonly=%s data=%s' % (rdonly, os.read(fd, 1) == b'x')\n",
+            "    finally:\n",
+            "        os.close(fd)\n",
+            // no O_DIRECTORY on the directory: that is what callers actually do
+            "sys.stdout.write('dir=%s|file=%s|noperm=%s' % (\n",
+            "    probe_dir('{wd}/d'), probe_file('{wd}/f'), probe_file('{wd}/noperm')))\n",
+        ),
+        wd = workdir.display()
+    );
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+
+    let got = result.stdout_str().unwrap_or("").trim().to_string();
+    let file_ok = "file=ok rdonly=True data=True";
+    let noperm = if unsafe { libc::geteuid() } == 0 {
+        // A root supervisor's reopen bypasses the permission bit too.
+        "noperm=ok rdonly=True data=True".to_string()
+    } else {
+        format!("noperm=errno={}", libc::EOPNOTSUPP)
+    };
+    assert_eq!(
+        got,
+        format!("dir=ok|{file_ok}|{noperm}"),
+        "O_PATH of an upper-layer entry: served with a real O_RDONLY fd, \
+         not a bare O_PATH one"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}

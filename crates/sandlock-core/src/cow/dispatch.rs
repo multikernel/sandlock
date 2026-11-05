@@ -198,6 +198,29 @@ pub(crate) fn open_confined(
     crate::sys::fs::openat2_in_root(root, &rel, flags, mode)
 }
 
+/// Reopen an `O_PATH` descriptor as `O_RDONLY`, for a regular file or a
+/// directory. `None` for anything else. TOCTOU-safe: the stat and the
+/// reopen both go through the held descriptor.
+fn reopen_o_path_readable(fd: RawFd) -> Option<RawFd> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let empty = c"".as_ptr();
+    if unsafe { libc::fstatat(fd, empty, &mut st, libc::AT_EMPTY_PATH) } < 0 {
+        return None;
+    }
+    let flags = match st.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        libc::S_IFREG => libc::O_RDONLY | libc::O_CLOEXEC,
+        _ => return None, // symlink, FIFO, socket, device
+    };
+    let link = std::ffi::CString::new(format!("/proc/self/fd/{}", fd)).ok()?;
+    let reopened = unsafe { libc::open(link.as_ptr(), flags) };
+    if reopened < 0 {
+        return None;
+    }
+    unsafe { libc::close(fd) };
+    Some(reopened)
+}
+
 /// The branch's directories, taken under the lock for work done without it.
 #[derive(Clone)]
 pub(crate) struct Layers {
@@ -433,6 +456,22 @@ impl CowOpen {
             // The kernel cannot see the upper layer, so its answer would be wrong.
             Err(errno) => return NotifAction::Errno(errno),
         };
+
+        // ADDFD refuses an O_PATH source fd, so hand over a readable handle to
+        // the same entry. Under COW the workdir governs access to upper-layer
+        // entries, so this grants nothing a plain O_RDONLY would not. The
+        // child's fd reports O_RDONLY via F_GETFL, not O_PATH, and read() on
+        // it succeeds. Entries without read permission still return
+        // EOPNOTSUPP.
+        let fd = if self.open_flags & libc::O_PATH != 0 {
+            match reopen_o_path_readable(fd) {
+                Some(reopened) => reopened,
+                None => fd,
+            }
+        } else {
+            fd
+        };
+
         // Preserve O_CLOEXEC from the original openat flags.
         let newfd_flags = if self.flags & libc::O_CLOEXEC as u64 != 0 {
             libc::O_CLOEXEC as u32
@@ -1122,7 +1161,7 @@ pub(crate) async fn handle_cow_stat(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
             return NotifAction::Continue;
         }
         let real = match cow.handle_stat(&path) {
@@ -1226,7 +1265,7 @@ pub(crate) async fn handle_cow_statx(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
             return NotifAction::Continue;
         }
         let real = match cow.handle_stat(&path) {
@@ -1311,7 +1350,7 @@ pub(crate) async fn handle_cow_exec(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &resolved);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
             return NotifAction::Continue;
         }
         let real = match cow.handle_stat(&path) {
@@ -1381,15 +1420,21 @@ pub(crate) async fn handle_cow_readlink(
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
-    // readlinkat(dirfd, pathname, buf, bufsiz)
-    let dirfd = notif.data.args[0] as i64;
+    // readlinkat(dirfd, pathname, buf, bufsiz), and legacy
+    // readlink(pathname, buf, bufsiz), which shifts every argument by one.
+    let a = notif.data.args;
+    let (dirfd, path_ptr, buf_addr, bufsiz) = if arch::sys_readlink() == Some(notif.data.nr as i64)
+    {
+        (libc::AT_FDCWD as i64, a[0], a[1], a[2])
+    } else {
+        (a[0] as i64, a[1], a[2], a[3])
+    };
+    let bufsiz = (bufsiz & 0xFFFFFFFF) as usize;
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, notif.data.args[1], notif_fd) {
+    let path = match read_path(notif, path_ptr, notif_fd) {
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
-    let buf_addr = notif.data.args[2];
-    let bufsiz = (notif.data.args[3] & 0xFFFFFFFF) as usize;
 
     let st = cow_state.lock().await;
     let cow = match st.branch.as_ref() {
@@ -1398,7 +1443,7 @@ pub(crate) async fn handle_cow_readlink(
     };
 
     let path = map_cow_upper_path(cow, &path);
-    if !cow.has_changes() || !cow.matches(&path) {
+    if !cow.has_changes() || !cow.matches(&path) || !cow.needs_read_intercept(&path) {
         return NotifAction::Continue;
     }
 

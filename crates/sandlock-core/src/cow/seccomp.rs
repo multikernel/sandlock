@@ -1099,7 +1099,8 @@ impl SeccompCowBranch {
     /// read must be redirected there, never fall through to the lower file.
     pub fn needs_read_intercept(&self, path: &str) -> bool {
         if let Some(rel) = self.safe_rel(path) {
-            self.deleted.covers(&rel) || self.upper.join(&rel).exists()
+            let upper_entry = self.upper.join(&rel);
+            self.deleted.covers(&rel) || upper_entry.exists() || upper_entry.is_symlink()
         } else {
             false
         }
@@ -3969,6 +3970,20 @@ mod tests {
             !branch.matches(branch.storage_dir.to_str().unwrap()),
             "the branch's own storage dir must not be intercepted either",
         );
+    }
+
+    /// A dangling symlink staged in upper (target does not exist) must still
+    /// report as intercepted: `Path::exists()` follows symlinks, so a naive
+    /// check would miss it.
+    #[test]
+    fn needs_read_intercept_sees_a_dangling_symlink_in_upper() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let lnk = abs(&branch, "lnk");
+
+        assert!(!branch.needs_read_intercept(&lnk));
+        branch.handle_symlink("missing-target", &lnk).unwrap();
+        assert!(branch.needs_read_intercept(&lnk));
     }
 
     /// Nothing outside the workdir may be mapped into the upper. `safe_rel` is
