@@ -112,8 +112,13 @@ impl MainExit {
         let Some(fd) = &self.pipe else {
             return Err(std::io::Error::other("main's exit has no status pipe"));
         };
-        let ready =
-            tokio::io::unix::AsyncFd::with_interest(fd.as_raw_fd(), tokio::io::Interest::READABLE)?;
+        // SAFETY: the AsyncFd owns its own dup of the pipe.
+        let ready = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(
+                fd.try_clone()?,
+                tokio::io::Interest::READABLE,
+            )
+        }?;
         loop {
             if let Some(exit) = self.get() {
                 return Ok(exit);
