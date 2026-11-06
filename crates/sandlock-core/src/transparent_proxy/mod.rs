@@ -53,6 +53,7 @@ pub(crate) async fn spawn_transparent_proxy(
     ca_cert_pem: Option<&str>,
     ca_key_pem: Option<&str>,
     log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    body_fn: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
 ) -> std::io::Result<HttpAclProxyHandle> {
     let orig_dest: OrigDestMap = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let forwarder = Forwarder::new()?;
@@ -63,6 +64,7 @@ pub(crate) async fn spawn_transparent_proxy(
         Arc::clone(&orig_dest),
         forwarder,
         log_fn,
+        body_fn,
     );
 
     let signer = match (ca_cert_pem, ca_key_pem) {
@@ -194,6 +196,7 @@ mod tests {
             Arc::new(vec![]),
             Some(&ca.cert_pem),
             Some(&ca.key_pem),
+            None,
             None,
         )
         .await

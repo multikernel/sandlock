@@ -120,6 +120,11 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub http_log_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
 
+    /// Optional callback given the body of every request that reaches the
+    /// proxy, in addition to method/host/path.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub http_body_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
+
     // max_memory uses a string in the CLI (e.g. "512M"); not directly clap-friendly as ByteSize.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub max_memory: Option<ByteSize>,
@@ -296,6 +301,7 @@ impl Default for SandboxBuilder {
             http_inject_ca: Vec::new(),
             http_ca_out: None,
             http_log_fn: None,
+            http_body_fn: None,
             max_memory: None,
             max_processes: None,
             max_open_files: None,
@@ -363,6 +369,7 @@ impl Clone for SandboxBuilder {
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
             http_log_fn: self.http_log_fn.clone(),
+            http_body_fn: self.http_body_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -612,6 +619,16 @@ impl SandboxBuilder {
         f: std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>,
     ) -> Self {
         self.http_log_fn = Some(f);
+        self
+    }
+
+    /// Observe the body of every request that reaches the proxy, with its
+    /// method, host and path. Independent of [`Self::http_log_fn`].
+    pub fn http_body_fn(
+        mut self,
+        f: std::sync::Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>,
+    ) -> Self {
+        self.http_body_fn = Some(f);
         self
     }
 
@@ -1085,6 +1102,7 @@ impl SandboxBuilder {
                 ("--http-auth", !self.http_auth.is_empty()),
                 ("--credential", !self.credentials.is_empty()),
                 ("http_log_fn", self.http_log_fn.is_some()),
+                ("http_body_fn", self.http_body_fn.is_some()),
             ];
             if let Some((what, _)) = set.iter().find(|(_, on)| *on) {
                 return Err(SandboxError::FeatureDisabled {
@@ -1102,12 +1120,16 @@ impl SandboxBuilder {
         }
 
         // --http-inject-ca / --http-ca-out are meaningless without an HTTP ACL
-        // proxy to do MITM, which only spawns when http rules or a log callback exist.
-        let has_http_rules =
-            !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some();
+        // proxy to do MITM, which only spawns when http rules or an observation
+        // callback exist.
+        let has_http_rules = !self.http_allow.is_empty()
+            || !self.http_deny.is_empty()
+            || self.http_log_fn.is_some()
+            || self.http_body_fn.is_some();
         if !self.http_inject_ca.is_empty() && !has_http_rules {
             return Err(SandboxError::Invalid(
-                "--http-inject-ca requires --http-allow or --http-deny".into(),
+                "--http-inject-ca requires --http-allow, --http-deny, or an observation callback"
+                    .into(),
             ));
         }
         // --http-ca-out needs an actual CA to export (BYO or generated).
@@ -1270,6 +1292,7 @@ impl SandboxBuilder {
             http_inject_ca: self.http_inject_ca,
             http_ca_out: self.http_ca_out,
             http_log_fn: self.http_log_fn,
+            http_body_fn: self.http_body_fn,
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
