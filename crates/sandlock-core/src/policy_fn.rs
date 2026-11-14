@@ -48,8 +48,10 @@ pub enum SyscallCategory {
     Filesystem,
     /// Network operations (connect, sendto, bind, etc.)
     Network,
-    /// Process lifecycle (clone, execve, vfork, etc.)
+    /// Process creation (clone, clone3, fork, vfork), observation only.
     Process,
+    /// Program execution (execve, execveat), held for a verdict with argv.
+    Exec,
 }
 
 /// The event categories a policy callback subscribes to.
@@ -58,7 +60,7 @@ pub(crate) struct CategorySet(u8);
 
 impl CategorySet {
     pub(crate) const NONE: Self = Self(0);
-    pub(crate) const ALL: Self = Self(0b111);
+    pub(crate) const ALL: Self = Self(0b1111);
 
     pub(crate) fn of(categories: &[SyscallCategory]) -> Self {
         Self(categories.iter().fold(0, |bits, &c| bits | 1 << c as u8))
@@ -84,7 +86,7 @@ impl CategorySet {
 /// (`fs_read` / `fs_write` / `fs_deny`); see issue #27.
 ///
 /// `argv` *is* exposed for `execve`/`execveat` and is TOCTOU-safe by
-/// construction: with `policy_fn` active, fork-like syscalls are traced
+/// construction: with exec events subscribed, fork-like syscalls are traced
 /// for one ptrace creation event, so children are registered in
 /// `ProcessIndex` before they can run user code. Before the supervisor
 /// exposes `argv` to `policy_fn` or returns `Continue` for an execve, it
@@ -122,8 +124,8 @@ pub struct SyscallEvent {
     /// in `ProcessIndex` (caller's siblings and peer processes) is
     /// frozen before argv is read for this event and before the kernel
     /// re-reads argv from child memory; fork-like syscalls register
-    /// children before they can run user code while `policy_fn` is
-    /// active.
+    /// children before they can run user code while exec events are
+    /// subscribed.
     pub argv: Option<Vec<String>>,
     /// Whether the supervisor denied this syscall.
     pub denied: bool,
@@ -1053,12 +1055,14 @@ mod tests {
         assert!(net.contains(SyscallCategory::Network));
         assert!(!net.contains(SyscallCategory::Filesystem));
         assert!(!net.contains(SyscallCategory::Process));
+        assert!(!net.contains(SyscallCategory::Exec));
         assert!(!CategorySet::NONE.contains(SyscallCategory::Filesystem));
         assert_eq!(
             CategorySet::of(&[
                 SyscallCategory::Filesystem,
                 SyscallCategory::Network,
                 SyscallCategory::Process,
+                SyscallCategory::Exec,
             ]),
             CategorySet::ALL
         );
@@ -1089,7 +1093,7 @@ mod tests {
     fn test_event_argv_contains() {
         let event = SyscallEvent {
             syscall: "execve".to_string(),
-            category: SyscallCategory::Process,
+            category: SyscallCategory::Exec,
             pid: 1,
             parent_pid: Some(0),
             host: None,
@@ -1106,7 +1110,7 @@ mod tests {
         assert!(event.argv_contains("python3"));
         assert!(event.argv_contains("-c"));
         assert!(!event.argv_contains("ruby"));
-        assert_eq!(event.category, SyscallCategory::Process);
+        assert_eq!(event.category, SyscallCategory::Exec);
     }
 
     #[test]

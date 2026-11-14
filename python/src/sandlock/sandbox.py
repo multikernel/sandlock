@@ -186,7 +186,7 @@ class Image:
     config: ImageConfig = field(default_factory=ImageConfig)
 
 
-_EVENT_CATEGORIES = {"filesystem": 1 << 0, "network": 1 << 1, "process": 1 << 2}
+_EVENT_CATEGORIES = {"filesystem": 1 << 0, "network": 1 << 1, "process": 1 << 2, "exec": 1 << 3}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -244,7 +244,7 @@ class PolicyFn:
     kept and answered later from any thread, and None otherwise."""
     events: frozenset[str] = field(default=frozenset(_EVENT_CATEGORIES), kw_only=True)
     """Event categories delivered to the callback: ``"filesystem"``,
-    ``"network"``, ``"process"``. Syscalls outside them are not intercepted for
+    ``"network"``, ``"process"``, ``"exec"``. Syscalls outside them are not intercepted for
     the callback and stay governed by the static policy."""
     approvable: Permissions | None = field(default=None, kw_only=True)
     """The most an approval may open beyond ``net_allow``. Destinations here

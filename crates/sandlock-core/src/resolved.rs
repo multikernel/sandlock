@@ -99,11 +99,36 @@ impl SandboxFeatures {
             policy_events,
             port_remap: sandbox.port_remap,
             http_acl,
-            argv_safety_required: policy_events.contains(SyscallCategory::Process) || exec_handler,
+            argv_safety_required: policy_events.contains(SyscallCategory::Exec) || exec_handler,
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
             net_allow_present: sandbox.net_allow_is_active()
                 || !sandbox.approvable_net_allow().is_empty(),
             net_deny: !sandbox.net_deny.is_empty(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy_fn::{PolicyFn, Verdict};
+
+    fn argv_safety(events: &[SyscallCategory], handler_syscalls: &[i64]) -> bool {
+        let sandbox = Sandbox::builder()
+            .policy_fn(PolicyFn::new(|_e, _c| Verdict::Allow).events(events))
+            .build()
+            .unwrap();
+        SandboxFeatures::from_sandbox(&sandbox, None, handler_syscalls).argv_safety_required
+    }
+
+    #[test]
+    fn only_exec_events_require_argv_safety() {
+        assert!(!argv_safety(&[SyscallCategory::Process], &[]));
+        assert!(!argv_safety(&[SyscallCategory::Network], &[]));
+        assert!(argv_safety(&[SyscallCategory::Exec], &[]));
+        assert!(argv_safety(
+            &[SyscallCategory::Network],
+            &[libc::SYS_execve]
+        ));
     }
 }

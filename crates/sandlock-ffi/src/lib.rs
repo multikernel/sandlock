@@ -2312,7 +2312,7 @@ pub unsafe extern "C" fn sandlock_gather_free(g: *mut sandlock_gather_t) {
 #[repr(C)]
 pub struct sandlock_event_t {
     pub syscall: *const c_char,
-    /// Category: 0=Filesystem, 1=Network, 2=Process
+    /// Category: 0=Filesystem, 1=Network, 2=Process, 3=Exec
     pub category: u8,
     pub pid: u32,
     pub parent_pid: u32,     // 0 if unknown
@@ -2448,6 +2448,7 @@ fn with_c_event<R>(
         sandlock_core::policy_fn::SyscallCategory::Filesystem => 0u8,
         sandlock_core::policy_fn::SyscallCategory::Network => 1,
         sandlock_core::policy_fn::SyscallCategory::Process => 2,
+        sandlock_core::policy_fn::SyscallCategory::Exec => 3,
     };
 
     let c_event = sandlock_event_t {
@@ -2473,11 +2474,15 @@ fn with_c_event<R>(
 pub const SANDLOCK_EVENT_FILESYSTEM: u32 = 1 << 0;
 /// `events` bit for network syscall events of a policy callback.
 pub const SANDLOCK_EVENT_NETWORK: u32 = 1 << 1;
-/// `events` bit for process syscall events of a policy callback.
+/// `events` bit for process creation events of a policy callback.
 pub const SANDLOCK_EVENT_PROCESS: u32 = 1 << 2;
+/// `events` bit for execve/execveat events of a policy callback.
+pub const SANDLOCK_EVENT_EXEC: u32 = 1 << 3;
 /// Every policy callback event category.
-pub const SANDLOCK_EVENT_ALL: u32 =
-    SANDLOCK_EVENT_FILESYSTEM | SANDLOCK_EVENT_NETWORK | SANDLOCK_EVENT_PROCESS;
+pub const SANDLOCK_EVENT_ALL: u32 = SANDLOCK_EVENT_FILESYSTEM
+    | SANDLOCK_EVENT_NETWORK
+    | SANDLOCK_EVENT_PROCESS
+    | SANDLOCK_EVENT_EXEC;
 
 fn event_categories(events: u32) -> Vec<sandlock_core::policy_fn::SyscallCategory> {
     use sandlock_core::policy_fn::SyscallCategory;
@@ -2485,6 +2490,7 @@ fn event_categories(events: u32) -> Vec<sandlock_core::policy_fn::SyscallCategor
         (SANDLOCK_EVENT_FILESYSTEM, SyscallCategory::Filesystem),
         (SANDLOCK_EVENT_NETWORK, SyscallCategory::Network),
         (SANDLOCK_EVENT_PROCESS, SyscallCategory::Process),
+        (SANDLOCK_EVENT_EXEC, SyscallCategory::Exec),
     ]
     .into_iter()
     .filter(|&(bit, _)| events & bit != 0)

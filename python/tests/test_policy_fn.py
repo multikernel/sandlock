@@ -74,7 +74,7 @@ class TestSyscallEvent:
 
     def test_argv_contains(self):
         e = SyscallEvent(
-            syscall="execve", category="process", pid=1,
+            syscall="execve", category="exec", pid=1,
             argv=("python3", "-c", "print(1)"),
         )
         assert e.argv_contains("python3")
@@ -430,7 +430,7 @@ def test_events_rejects_bare_string():
 
 
 def test_events_default_to_all_categories():
-    assert PolicyFn(lambda event, ctx: Allow()).events == {"filesystem", "network", "process"}
+    assert PolicyFn(lambda event, ctx: Allow()).events == {"filesystem", "network", "process", "exec"}
 
 
 def test_network_events_only():

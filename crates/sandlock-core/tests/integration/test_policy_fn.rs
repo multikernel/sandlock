@@ -454,11 +454,12 @@ async fn test_policy_fn_event_categories() {
         "should have File category events, got: {:?}",
         *captured
     );
-    // execve should be Process
-    let has_process = captured.iter().any(|(_, c)| *c == SyscallCategory::Process);
+    let has_exec = captured
+        .iter()
+        .any(|(s, c)| s == "execve" && *c == SyscallCategory::Exec);
     assert!(
-        has_process,
-        "should have Process category events, got: {:?}",
+        has_exec,
+        "execve should be an Exec event, got: {:?}",
         *captured
     );
 }

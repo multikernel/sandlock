@@ -48,7 +48,7 @@ result = sandbox.run(["python3", "agent.py"])
 allow (see [Approve network on demand](#approve-network-on-demand)). Any other
 return value raises `TypeError` and denies.
 
-**Event fields:** `syscall`, `category` (filesystem/network/process),
+**Event fields:** `syscall`, `category` (filesystem/network/process/exec),
 `pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
 
 > **TOCTOU NOTE** Per `seccomp_unotify(2)`, the kernel
@@ -66,7 +66,7 @@ return value raises `TypeError` and denies.
 >   including peer processes that may alias argv through shared memory,
 >   re-reads `argv` and the path, and denies the `execve` with `EPERM`
 >   unless they match what the callback judged. The freeze lasts until
->   the kernel has copied `argv`. With `policy_fn` active, fork-like
+>   the kernel has copied `argv`. With `exec` events subscribed, fork-like
 >   syscalls are traced for one ptrace creation event, so children are
 >   registered in `ProcessIndex` before they can run user code. If the
 >   freeze or creation tracking cannot be established (e.g., YAMA blocks
@@ -142,8 +142,8 @@ interrupt a callback already running. Its eventual verdict is ignored.
 
 A callback receives every event category by default. Subscribing to fewer
 categories also drops the interception that only those categories need: a
-network-only callback leaves file syscalls untrapped and skips the ptrace
-fork tracking and `execve` freeze that make `argv` safe to inspect.
+callback without `exec` events skips the ptrace fork tracking and `execve`
+freeze that make `argv` safe to inspect.
 
 ```python
 PolicyFn(on_net, events={"network"})
@@ -158,11 +158,13 @@ every category).
 |----------|----------|------------------|
 | `filesystem` | `open`, `openat`, `openat2`, `mkdir(at)`, `mknod(at)`, `unlink(at)`, `rmdir`, `symlink(at)`, `link(at)`, `rename(at)`, `renameat2`, `truncate` | traps on these path syscalls, plus those `ctx.deny_path()` gates |
 | `network` | `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind` | traps on these syscalls |
-| `process` | `execve`, `execveat`, `clone`, `clone3`, `fork`, `vfork` | `execve` traps, ptrace fork tracking, and the `execve` freeze |
+| `process` | `clone`, `clone3`, `fork`, `vfork` | nothing; these events are observation only |
+| `exec` | `execve`, `execveat` | `execve` traps, ptrace fork tracking, and the `execve` freeze |
 
 Process creation syscalls are always trapped for process accounting, so
-subscribing to `process` adds no traps for them; it delivers their events and
-tracks each new child with ptrace.
+subscribing to `process` adds no traps and no ptrace; it only delivers their
+events. Subscribing to `exec` tracks each new child with ptrace so the
+`execve` freeze can find it.
 
 Unsubscribed syscalls remain governed by the static policy. Network supervision
 stays on for any callback, so `ctx.restrict()` works from every

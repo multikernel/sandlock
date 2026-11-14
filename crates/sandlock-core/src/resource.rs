@@ -59,7 +59,7 @@ fn is_thread_create(notif: &SeccompNotif) -> bool {
 ///
 /// Note: `notif.pid` here is the *parent* (the task issuing
 /// fork/clone/vfork). The kernel hasn't run the syscall yet, so we don't
-/// know the child's pid yet. When `policy_fn` is active, the supervisor
+/// know the child's pid yet. When argv safety is required, the supervisor
 /// wraps the eventual `Continue` in one-shot ptrace fork-event tracking
 /// and registers the new child before it can run user code.
 pub(crate) async fn handle_fork(
@@ -122,9 +122,9 @@ pub(crate) async fn handle_fork(
 /// run, so handlers can rely on `ProcessIndex::key_for(notif.pid)`
 /// returning a fresh PidKey.
 ///
-/// With `policy_fn` active, fork-like syscalls additionally register
+/// When argv safety is required, fork-like syscalls additionally register
 /// new child processes at creation time via ptrace fork events, before
-/// the child can run user code. Without `policy_fn`, lazy registration
+/// the child can run user code. Otherwise lazy registration
 /// is enough because no argv-based security decision is exposed.
 ///
 /// The fast path is a single `RwLock` read: if the pid is already

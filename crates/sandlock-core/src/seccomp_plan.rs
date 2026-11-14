@@ -358,7 +358,7 @@ const POLICY_NETWORK_EVENT_SYSCALLS: &[i64] = &[
     libc::SYS_bind,
 ];
 
-const POLICY_PROCESS_EVENT_SYSCALLS: &[i64] = &[libc::SYS_execve, libc::SYS_execveat];
+const POLICY_EXEC_EVENT_SYSCALLS: &[i64] = &[libc::SYS_execve, libc::SYS_execveat];
 
 const PORT_REMAP_SYSCALLS: &[i64] = &[libc::SYS_bind, libc::SYS_getsockname];
 
@@ -453,8 +453,8 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     if features.policy_events.contains(SyscallCategory::Network) {
         nrs.extend(POLICY_NETWORK_EVENT_SYSCALLS);
     }
-    if features.policy_events.contains(SyscallCategory::Process) {
-        nrs.extend(POLICY_PROCESS_EVENT_SYSCALLS);
+    if features.policy_events.contains(SyscallCategory::Exec) {
+        nrs.extend(POLICY_EXEC_EVENT_SYSCALLS);
     }
 
     // Port remapping
