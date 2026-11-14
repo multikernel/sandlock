@@ -68,8 +68,10 @@ const (
 	CategoryFilesystem SyscallCategory = iota
 	// CategoryNetwork covers network operations such as connect and bind.
 	CategoryNetwork
-	// CategoryProcess covers process lifecycle operations such as execve.
+	// CategoryProcess covers process creation such as clone and fork.
 	CategoryProcess
+	// CategoryExec covers execve and execveat, the only events carrying Argv.
+	CategoryExec
 )
 
 // String returns the category name used by the Python SDK.
@@ -81,6 +83,8 @@ func (c SyscallCategory) String() string {
 		return "network"
 	case CategoryProcess:
 		return "process"
+	case CategoryExec:
+		return "exec"
 	default:
 		return "unknown"
 	}

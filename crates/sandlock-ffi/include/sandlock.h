@@ -44,14 +44,19 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 #define SANDLOCK_EVENT_NETWORK (1 << 1)
 
 /**
- * `events` bit for process syscall events of a policy callback.
+ * `events` bit for process creation events of a policy callback.
  */
 #define SANDLOCK_EVENT_PROCESS (1 << 2)
 
 /**
+ * `events` bit for execve/execveat events of a policy callback.
+ */
+#define SANDLOCK_EVENT_EXEC (1 << 3)
+
+/**
  * Every policy callback event category.
  */
-#define SANDLOCK_EVENT_ALL ((SANDLOCK_EVENT_FILESYSTEM | SANDLOCK_EVENT_NETWORK) | SANDLOCK_EVENT_PROCESS)
+#define SANDLOCK_EVENT_ALL (((SANDLOCK_EVENT_FILESYSTEM | SANDLOCK_EVENT_NETWORK) | SANDLOCK_EVENT_PROCESS) | SANDLOCK_EVENT_EXEC)
 
 /**
  * `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
@@ -267,7 +272,7 @@ typedef struct {
 typedef struct {
   const char *syscall;
   /**
-   * Category: 0=Filesystem, 1=Network, 2=Process
+   * Category: 0=Filesystem, 1=Network, 2=Process, 3=Exec
    */
   uint8_t category;
   uint32_t pid;

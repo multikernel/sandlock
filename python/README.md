@@ -702,7 +702,7 @@ sb = Sandbox(..., policy_fn=PolicyFn(my_policy))
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `syscall` | `str` | Syscall name (e.g. `"openat"`, `"connect"`) |
-| `category` | `str` | `"filesystem"`, `"network"`, or `"process"` |
+| `category` | `str` | `"filesystem"`, `"network"`, `"process"`, or `"exec"` |
 | `pid` | `int` | Process ID |
 | `parent_pid` | `int` | Parent process ID |
 | `path` | `str \| None` | File path (for filesystem events) |

@@ -18,8 +18,8 @@
 //!    that share the calling task's `mm_struct` via
 //!    `clone(CLONE_VM)` without `CLONE_THREAD`.
 //!
-//! `freeze_sandbox_for_execve` closes both classes. When `policy_fn`
-//! is active, every fork-like syscall is traced for one ptrace
+//! `freeze_sandbox_for_execve` closes both classes. When argv safety
+//! is required, every fork-like syscall is traced for one ptrace
 //! fork/clone/vfork event and the child is registered in
 //! `ProcessIndex` before it can run user code. The exec freeze can
 //! therefore enumerate every tracked TGID, walk `/proc/<tgid>/task`,
@@ -276,7 +276,7 @@ impl std::fmt::Display for FreezeError {
 /// every TID except `caller_tid` and the `parked` tids the supervisor holds
 /// in unanswered notifications. Sibling threads of `caller_tid` and
 /// peer threads in other TGIDs are both covered. `processes` is
-/// complete for `policy_fn` runs because fork-like syscalls are tracked
+/// complete under argv safety because fork-like syscalls are tracked
 /// before new children can run.
 ///
 /// Strict semantics: if any task refuses to be frozen, every

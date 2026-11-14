@@ -2294,12 +2294,11 @@ fn syscall_category(nr: i64) -> Option<crate::policy_fn::SyscallCategory> {
         n if n == libc::SYS_clone
             || n == libc::SYS_clone3
             || Some(n) == arch::sys_vfork()
-            || Some(n) == arch::sys_fork()
-            || n == libc::SYS_execve
-            || n == libc::SYS_execveat =>
+            || Some(n) == arch::sys_fork() =>
         {
             Some(SyscallCategory::Process)
         }
+        n if n == libc::SYS_execve || n == libc::SYS_execveat => Some(SyscallCategory::Exec),
         _ => None,
     }
 }
@@ -3219,7 +3218,7 @@ async fn finish_notification(
         crate::resource::rollback_fork_count(&ctx.resource).await;
     }
 
-    // With policy_fn active, fork-like syscalls are traced for exactly
+    // Under argv safety, fork-like syscalls are traced for exactly
     // one ptrace event so ProcessIndex becomes complete before the new
     // child can run user code. That closes the race where a peer
     // process could exist without ever having produced a notification.

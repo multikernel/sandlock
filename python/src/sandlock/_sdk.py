@@ -743,7 +743,7 @@ class SyscallEvent:
     cost.
     """
     syscall: str
-    category: str  # "filesystem", "network", "process"
+    category: str  # "filesystem", "network", "process", "exec"
     pid: int
     parent_pid: int = 0
     host: str | None = None
@@ -1501,7 +1501,7 @@ class _NativePolicy:
                         for i in range(ev.argc)
                         if ev.argv[i]
                     )
-                _CATEGORIES = {0: "filesystem", 1: "network", 2: "process"}
+                _CATEGORIES = {0: "filesystem", 1: "network", 2: "process", 3: "exec"}
                 return SyscallEvent(
                     syscall=ev.syscall.decode("utf-8") if ev.syscall else "",
                     category=_CATEGORIES[ev.category],
