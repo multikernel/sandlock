@@ -12,22 +12,16 @@ use std::time::Duration;
 /// CARGO_BIN_EXE_sandlock is not available; find it relative to the
 /// current executable's location.
 fn sandlock_bin() -> Command {
-    // The test binary is in target/release/deps/; go up two levels to
-    // the workspace root, then into target/release/sandlock.
+    // Cargo moved test binaries from <profile>/deps to
+    // <profile>/build/<pkg>/<hash>/out, so search upward instead of assuming
+    // a depth. is_file skips the checkout directory, which is also "sandlock".
     let exe = std::env::current_exe().expect("current_exe");
-    let deps_dir = exe.parent().expect("parent of test binary");
-    let target_dir = deps_dir.parent().expect("parent of deps dir");
-    let sandlock_path = target_dir.join("sandlock");
-    if sandlock_path.exists() {
-        return Command::new(&sandlock_path);
-    }
-    // Fallback: assume workspace root is grandparent of target_dir.
-    let workspace_root = target_dir.parent().expect("parent of target dir");
-    let alt_path = workspace_root.join("target/release/sandlock");
-    if alt_path.exists() {
-        return Command::new(&alt_path);
-    }
-    Command::new("sandlock")
+    let found = exe
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join("sandlock"))
+        .find(|path| path.is_file());
+    Command::new(found.unwrap_or_else(|| "sandlock".into()))
 }
 
 /// Start a sandbox running `sleep 30`, wait for it to appear in `ps`,
