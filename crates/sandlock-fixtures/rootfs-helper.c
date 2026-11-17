@@ -751,6 +751,24 @@ static int cmd_openat2(int argc, char **argv) {
     return 0;
 }
 
+/* ── opath (open with O_PATH and stat through the descriptor) ──── */
+static int cmd_opath(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "opath: missing operand\n"); return 1; }
+    int fd = open(argv[0], O_PATH | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "opath: %s: errno=%d\n", argv[0], errno);
+        return 1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        fprintf(stderr, "opath: fstat: errno=%d\n", errno);
+        return 1;
+    }
+    printf("%s\n", S_ISDIR(st.st_mode) ? "dir" : S_ISREG(st.st_mode) ? "file" : "other");
+    close(fd);
+    return 0;
+}
+
 /* ── fchdir (change directory through an already-open dirfd) ──── */
 /*
  * fchdir() carries no path for the supervisor to inspect, so a supervisor
@@ -916,6 +934,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "unix-send") == 0)      return cmd_unix_send(argc, argv);
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
+    if (strcmp(cmd, "opath") == 0)          return cmd_opath(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);

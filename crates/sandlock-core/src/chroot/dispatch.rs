@@ -838,8 +838,17 @@ fn open_in_namespace(
         None => (ctx.root.to_path_buf(), vp_str.to_string()),
     };
     match openat2_in_root_with_resolve(&root, &sub, flags, mode, resolve) {
-        // Category 1.
-        Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        // Category 1. ADDFD refuses an O_PATH source, so hand over a readable
+        // handle: the caller already checked can_read on this path. Only a
+        // fresh open is swapped, never a dup of the child's own descriptor.
+        Ok(fd) => {
+            let fd = if flags & libc::O_PATH != 0 {
+                crate::sys::fs::reopen_o_path_readable(fd).unwrap_or(fd)
+            } else {
+                fd
+            };
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
         // Category 2, reached through symlinks.
         Err(errno) if matches!(errno, libc::EXDEV | libc::ENOENT | libc::ENOTDIR) => {
             match resolve_self_fd_magic(ctx, child_pid, &vp_str) {

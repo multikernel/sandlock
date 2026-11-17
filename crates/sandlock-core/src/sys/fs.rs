@@ -103,6 +103,28 @@ pub(crate) fn openat2_in_root_with_resolve(
 /// Empty C string for the `AT_EMPTY_PATH` family of calls (operate on the fd).
 const EMPTY: *const libc::c_char = b"\0".as_ptr() as *const libc::c_char;
 
+/// Reopen an `O_PATH` descriptor as `O_RDONLY`, for a regular file or a
+/// directory. `None` for anything else. TOCTOU-safe: the stat and the
+/// reopen both go through the held descriptor.
+pub(crate) fn reopen_o_path_readable(fd: RawFd) -> Option<RawFd> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(fd, EMPTY, &mut st, libc::AT_EMPTY_PATH) } < 0 {
+        return None;
+    }
+    let flags = match st.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        libc::S_IFREG => libc::O_RDONLY | libc::O_CLOEXEC,
+        _ => return None, // symlink, FIFO, socket, device
+    };
+    let link = std::ffi::CString::new(format!("/proc/self/fd/{}", fd)).ok()?;
+    let reopened = unsafe { libc::open(link.as_ptr(), flags) };
+    if reopened < 0 {
+        return None;
+    }
+    unsafe { libc::close(fd) };
+    Some(reopened)
+}
+
 /// Open a confined `O_PATH` handle to `path` under `root`.
 ///
 /// `O_PATH` needs no read permission and does no I/O, so it is the right
