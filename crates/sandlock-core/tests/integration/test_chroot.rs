@@ -741,6 +741,35 @@ async fn test_chroot_openat2_resolves_inside_the_rootfs() {
     cleanup_rootfs(&rootfs);
 }
 
+/// ADDFD cannot hand the child an O_PATH descriptor, so an O_PATH open of a
+/// readable file or directory failed where a plain read succeeded (issue #347).
+#[tokio::test]
+async fn test_chroot_o_path_open_of_readable_entries() {
+    let rootfs = build_test_rootfs("o-path-open");
+    fs::write(rootfs.join("etc/marker.txt"), "from-rootfs\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .build()
+        .unwrap();
+
+    for (path, kind) in [("/etc/marker.txt", "file"), ("/etc", "dir")] {
+        match policy.clone().run(&["rootfs-helper", "opath", path]).await {
+            Ok(r) => {
+                assert!(
+                    r.success(),
+                    "O_PATH open of {path} should succeed, stderr: {}",
+                    r.stderr_str().unwrap_or("")
+                );
+                assert_eq!(r.stdout_str().unwrap_or("").trim(), kind);
+            }
+            Err(e) => eprintln!("Chroot test skipped: {}", e),
+        }
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// The same for a relative openat2 after a chdir: it resolves against the
 /// supervisor's notion of the cwd, like every other relative path does.
 #[tokio::test]
