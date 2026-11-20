@@ -3,6 +3,75 @@ use serde::{Deserialize, Serialize};
 use crate::error::SandboxError;
 use crate::network::{NetAllow, NetTarget, Protocol};
 
+/// Re-exported so an observer can name the type without depending on `hyper`.
+#[cfg(feature = "http")]
+pub use hyper::http::HeaderMap;
+
+/// One request observed by the proxy, borrowed for the duration of the call.
+#[cfg(feature = "http")]
+pub struct HttpRequestEvent<'a> {
+    pub method: &'a str,
+    /// Validated authority, never the raw `Host` header.
+    pub host: &'a str,
+    pub path: &'a str,
+    pub headers: &'a hyper::http::HeaderMap,
+    pub allowed: bool,
+}
+
+/// One upstream response, borrowed for the duration of the call.
+#[cfg(feature = "http")]
+pub struct HttpResponseEvent<'a> {
+    pub status: u16,
+    pub headers: &'a hyper::http::HeaderMap,
+}
+
+/// How an exchange finished, so a partial record is never mistaken for a whole
+/// one.
+#[cfg(feature = "http")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpEnd {
+    /// Nothing was truncated, a denied request included.
+    Complete,
+    /// The upstream could not be reached, or failed before the body finished.
+    Error,
+    /// The child went away mid-stream.
+    Aborted,
+}
+
+/// One observed request and its response. Every method is called on the same
+/// value, so state lives in `self`.
+///
+/// `end` is always called exactly once, last.
+///
+/// Calls arrive on a dedicated thread, never the supervisor's. That thread is
+/// fed by one bounded queue shared by the whole proxy, so blocking here holds
+/// up observed traffic: hand slow work to a thread of your own.
+#[cfg(feature = "http")]
+pub trait HttpExchange: Send {
+    /// A chunk of the request body, on its way to the upstream.
+    fn request_chunk(&mut self, _chunk: &[u8]) {}
+
+    /// The upstream response. Return true to receive its body.
+    ///
+    /// Not called for a request the ACL denied, which has no upstream response,
+    /// nor when the upstream could not be reached.
+    fn response(&mut self, _event: &HttpResponseEvent) -> bool {
+        false
+    }
+
+    /// A chunk of the response body, on its way to the child.
+    fn response_chunk(&mut self, _chunk: &[u8]) {}
+
+    /// The exchange is over.
+    fn end(&mut self, _end: HttpEnd) {}
+}
+
+/// Observes every request reaching the proxy. `Some` follows that exchange,
+/// `None` ignores it.
+#[cfg(feature = "http")]
+pub type HttpObserver =
+    std::sync::Arc<dyn Fn(&HttpRequestEvent) -> Option<Box<dyn HttpExchange>> + Send + Sync>;
+
 /// An HTTP access control rule.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HttpRule {

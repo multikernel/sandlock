@@ -115,10 +115,11 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "http-ca-out", value_name = "PATH"))]
     pub http_ca_out: Option<PathBuf>,
 
-    /// Optional observation callback for HTTP learn mode. When set, the proxy is
-    /// spawned even without ACL rules so every request is logged via this closure.
+    /// Optional observation callback. When set, the proxy is spawned even
+    /// without ACL rules so every request reaching it is observed.
+    #[cfg(feature = "http")]
     #[cfg_attr(feature = "cli", clap(skip))]
-    pub http_log_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    pub http_observer: Option<crate::http::HttpObserver>,
 
     // max_memory uses a string in the CLI (e.g. "512M"); not directly clap-friendly as ByteSize.
     #[cfg_attr(feature = "cli", clap(skip))]
@@ -295,7 +296,8 @@ impl Default for SandboxBuilder {
             http_key: None,
             http_inject_ca: Vec::new(),
             http_ca_out: None,
-            http_log_fn: None,
+            #[cfg(feature = "http")]
+            http_observer: None,
             max_memory: None,
             max_processes: None,
             max_open_files: None,
@@ -362,7 +364,8 @@ impl Clone for SandboxBuilder {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
-            http_log_fn: self.http_log_fn.clone(),
+            #[cfg(feature = "http")]
+            http_observer: self.http_observer.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -607,11 +610,13 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn http_log_fn(
-        mut self,
-        f: std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>,
-    ) -> Self {
-        self.http_log_fn = Some(f);
+    /// Observe every request that reaches the proxy, allowed or denied.
+    ///
+    /// Returning [`Some`] follows that exchange through its bodies and its end,
+    /// [`None`] ignores it.
+    #[cfg(feature = "http")]
+    pub fn http_observer(mut self, f: crate::http::HttpObserver) -> Self {
+        self.http_observer = Some(f);
         self
     }
 
@@ -1084,7 +1089,6 @@ impl SandboxBuilder {
                 ("--http-ca-out", self.http_ca_out.is_some()),
                 ("--http-auth", !self.http_auth.is_empty()),
                 ("--credential", !self.credentials.is_empty()),
-                ("http_log_fn", self.http_log_fn.is_some()),
             ];
             if let Some((what, _)) = set.iter().find(|(_, on)| *on) {
                 return Err(SandboxError::FeatureDisabled {
@@ -1102,12 +1106,17 @@ impl SandboxBuilder {
         }
 
         // --http-inject-ca / --http-ca-out are meaningless without an HTTP ACL
-        // proxy to do MITM, which only spawns when http rules or a log callback exist.
-        let has_http_rules =
-            !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some();
+        // proxy to do MITM, which only spawns when http rules or an observation
+        // callback exist.
+        #[cfg(feature = "http")]
+        let observing = self.http_observer.is_some();
+        #[cfg(not(feature = "http"))]
+        let observing = false;
+        let has_http_rules = !self.http_allow.is_empty() || !self.http_deny.is_empty() || observing;
         if !self.http_inject_ca.is_empty() && !has_http_rules {
             return Err(SandboxError::Invalid(
-                "--http-inject-ca requires --http-allow or --http-deny".into(),
+                "--http-inject-ca requires --http-allow, --http-deny, or an observation callback"
+                    .into(),
             ));
         }
         // --http-ca-out needs an actual CA to export (BYO or generated).
@@ -1269,7 +1278,8 @@ impl SandboxBuilder {
             http_key: self.http_key,
             http_inject_ca: self.http_inject_ca,
             http_ca_out: self.http_ca_out,
-            http_log_fn: self.http_log_fn,
+            #[cfg(feature = "http")]
+            http_observer: self.http_observer,
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,

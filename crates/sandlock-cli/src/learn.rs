@@ -639,14 +639,14 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     #[cfg(feature = "http")]
     {
         let http_requests_cb = Arc::clone(&observer.http_requests);
-        let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
-            Arc::new(move |method, host, path| {
-                http_requests_cb
-                    .lock()
-                    .unwrap()
-                    .insert(format!("{method} {host}{path}"));
-            });
-        builder = builder.http_log_fn(http_log);
+        let http_observer: sandlock_core::http::HttpObserver = Arc::new(move |event| {
+            http_requests_cb
+                .lock()
+                .unwrap()
+                .insert(format!("{} {}{}", event.method, event.host, event.path));
+            None
+        });
+        builder = builder.http_observer(http_observer);
     }
     for path in &args.http_inject_ca {
         builder = builder.http_inject_ca(path);
