@@ -10,6 +10,10 @@ use std::sync::Arc;
 
 use crate::http::HttpRule;
 
+/// The observer argument, so the spawn call reads the same with or without
+/// the `http` feature.
+pub(crate) type ProxyObserver = ();
+
 pub(crate) type OrigDestMap = Arc<std::sync::RwLock<HashMap<SocketAddr, IpAddr>>>;
 
 pub(crate) struct CaMaterial {
@@ -43,7 +47,7 @@ pub(crate) async fn spawn_transparent_proxy(
     _: Arc<Vec<crate::credential::InjectRule>>,
     _: Option<&str>,
     _: Option<&str>,
-    _: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    _: ProxyObserver,
 ) -> io::Result<HttpAclProxyHandle> {
     Err(disabled())
 }

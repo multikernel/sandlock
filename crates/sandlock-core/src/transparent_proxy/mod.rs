@@ -1,4 +1,5 @@
 mod ca;
+mod observer;
 mod service;
 mod tls;
 mod upstream;
@@ -19,6 +20,8 @@ use self::upstream::Forwarder;
 use crate::http::HttpRule;
 
 pub(crate) use self::ca::resolve_ca;
+
+pub(crate) type ProxyObserver = Option<crate::http::HttpObserver>;
 pub(crate) use self::service::OrigDestMap;
 
 /// Handle returned by [`spawn_transparent_proxy`]. Dropping it shuts the proxy down.
@@ -26,6 +29,8 @@ pub(crate) struct HttpAclProxyHandle {
     pub(crate) addr: SocketAddr,
     pub(crate) orig_dest: OrigDestMap,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Never read: held so its `Drop` drains the queue and joins the thread.
+    _observer: Option<self::observer::ObserverWorker>,
 }
 
 impl Drop for HttpAclProxyHandle {
@@ -52,17 +57,18 @@ pub(crate) async fn spawn_transparent_proxy(
     inject: Arc<Vec<crate::credential::InjectRule>>,
     ca_cert_pem: Option<&str>,
     ca_key_pem: Option<&str>,
-    log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    observer: ProxyObserver,
 ) -> std::io::Result<HttpAclProxyHandle> {
     let orig_dest: OrigDestMap = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let forwarder = Forwarder::new()?;
+    let observer_worker = observer.map(self::observer::spawn_observer);
     let svc = AclService::new(
         allow,
         deny,
         inject,
         Arc::clone(&orig_dest),
         forwarder,
-        log_fn,
+        observer_worker.as_ref().map(|w| w.sender()),
     );
 
     let signer = match (ca_cert_pem, ca_key_pem) {
@@ -96,6 +102,7 @@ pub(crate) async fn spawn_transparent_proxy(
         addr,
         orig_dest,
         shutdown_tx: Some(shutdown_tx),
+        _observer: observer_worker,
     })
 }
 

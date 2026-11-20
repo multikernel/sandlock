@@ -132,8 +132,8 @@ Top-level configuration for the supervisor and COW workspace.
 | ------------ | ----------- | ------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `http_ca`    | `http_ca`   | `str \| None` | `None`  | PEM CA certificate path for HTTPS MITM. When set, port `443` is added to `http_ports`.   |
 | `http_key`   | `http_key`  | `str \| None` | `None`  | PEM CA private key path. Required whenever `http_ca` is set.                             |
-| `http_inject_ca` | `http_inject_ca` | `list[str]` | `[]` | Trust bundle paths to splice the active MITM CA's public cert into at open time. Without `http_ca`, generates an ephemeral CA (private key in memory only, never on disk) and intercepts port `443`. Requires at least one `http_allow` / `http_deny` rule. |
-| `http_ca_out` | `http_ca_out` | `str \| None` | `None`  | Writes the active CA's public certificate (PEM) to this path; never the private key. Requires at least one `http_allow` / `http_deny` rule. |
+| `http_inject_ca` | `http_inject_ca` | `list[str]` | `[]` | Trust bundle paths to splice the active MITM CA's public cert into at open time. Without `http_ca`, generates an ephemeral CA (private key in memory only, never on disk) and intercepts port `443`. Requires at least one `http_allow` / `http_deny` rule, or an observation callback. |
+| `http_ca_out` | `http_ca_out` | `str \| None` | `None`  | Writes the active CA's public certificate (PEM) to this path; never the private key. Requires at least one `http_allow` / `http_deny` rule, or an observation callback. |
 | `fs_storage` | `fs_storage`| `str \| None` | `None`  | Separate storage directory for the seccomp COW upper layer / deltas. |
 | `workdir`    | `workdir`   | `str \| None` | `None`  | COW root directory. Controls which directory COW tracks; does **not** set the child's working directory. |
 

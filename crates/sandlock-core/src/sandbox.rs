@@ -807,10 +807,11 @@ pub struct Sandbox {
     /// Path to write the active MITM CA public cert (PEM) for external trust
     /// wiring (e.g. NODE_EXTRA_CA_CERTS). Never writes the private key.
     pub http_ca_out: Option<PathBuf>,
-    /// Optional observation callback for HTTP learn mode. When set the proxy is
-    /// spawned even without ACL rules; every request is logged via this closure.
+    /// Optional observation callback. When set the proxy is spawned even
+    /// without ACL rules.
     #[serde(skip)]
-    pub(crate) http_log_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    #[cfg(feature = "http")]
+    pub(crate) http_observer: Option<crate::http::HttpObserver>,
 
     // Resource limits
     pub max_memory: Option<ByteSize>,
@@ -973,7 +974,8 @@ impl Clone for Sandbox {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
-            http_log_fn: self.http_log_fn.clone(),
+            #[cfg(feature = "http")]
+            http_observer: self.http_observer.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -2440,7 +2442,11 @@ impl Sandbox {
         );
 
         let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
-        if !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some() {
+        #[cfg(feature = "http")]
+        let observing = self.http_observer.is_some();
+        #[cfg(not(feature = "http"))]
+        let observing = false;
+        if !self.http_allow.is_empty() || !self.http_deny.is_empty() || observing {
             // Generate an ephemeral CA when injection is requested without BYO.
             let generate = !self.http_inject_ca.is_empty();
             let ca_material = crate::transparent_proxy::resolve_ca(
@@ -2467,13 +2473,18 @@ impl Sandbox {
                 None => (None, None),
             };
 
+            // A `let` can carry the attribute an argument cannot.
+            #[cfg(feature = "http")]
+            let observer = self.http_observer.clone();
+            #[cfg(not(feature = "http"))]
+            let observer = ();
             let handle = crate::transparent_proxy::spawn_transparent_proxy(
                 self.http_allow.clone(),
                 self.http_deny.clone(),
                 std::sync::Arc::clone(&self.inject),
                 cert_pem,
                 key_pem,
-                self.http_log_fn.clone(),
+                observer,
             )
             .await
             .map_err(SandboxRuntimeError::Io)?;

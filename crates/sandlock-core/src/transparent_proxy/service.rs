@@ -14,9 +14,10 @@ use hyper::body::Bytes;
 use hyper::{Request, Response, StatusCode};
 use tokio::sync::Mutex;
 
+use super::observer::{set_outcome, EndGuard, ObsMsg, ObsSender, OwnedRequest, TeeBody};
 use super::upstream::{box_incoming, Forwarder};
 use crate::credential::InjectRule;
-use crate::http::{http_acl_check, HttpRule};
+use crate::http::{http_acl_check, HttpEnd, HttpRule};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type OrigDestMap = Arc<std::sync::RwLock<HashMap<SocketAddr, IpAddr>>>;
@@ -41,9 +42,9 @@ pub(crate) struct AclService {
     /// so a library/API caller gets the warning once per run instead of per
     /// request. See [`first_cleartext_warn`].
     cleartext_warned: Arc<AtomicBool>,
-    /// Optional observation callback for learn mode. Called with (method, host, path)
-    /// for every request after the host is validated, before the ACL check.
-    pub(crate) log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    /// Messages to the observer thread, and the exchange ids they refer to.
+    pub(crate) observer: Option<ObsSender>,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Whether this cleartext injection should emit the one-per-run warning: true the
@@ -103,7 +104,7 @@ impl AclService {
         inject: Arc<Vec<InjectRule>>,
         orig_dest: OrigDestMap,
         forwarder: Forwarder,
-        log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+        observer: Option<ObsSender>,
     ) -> Self {
         Self {
             allow: Arc::new(allow),
@@ -113,7 +114,8 @@ impl AclService {
             forwarder,
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
             cleartext_warned: Arc::new(AtomicBool::new(false)),
-            log_fn,
+            observer,
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -200,30 +202,67 @@ impl AclService {
             m.remove(&client_addr);
         }
 
-        if let Some(ref f) = self.log_fn {
-            f(&method, &host, &path);
+        let allowed = http_acl_check(&self.allow, &self.deny, &method, &host, &path);
+
+        // Waits for the observer thread
+        let mut tracked: Option<(ObsSender, u64)> = None;
+        if let Some(tx) = self.observer.as_ref() {
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let sent = tx
+                .send(ObsMsg::Begin {
+                    id,
+                    request: Box::new(OwnedRequest {
+                        method: method.clone(),
+                        host: host.clone(),
+                        path: path.clone(),
+                        headers: req.headers().clone(),
+                        allowed,
+                    }),
+                    reply,
+                })
+                .await;
+            if sent.is_ok() && answer.await.unwrap_or(false) {
+                tracked = Some((tx.clone(), id));
+            }
         }
 
-        if !http_acl_check(&self.allow, &self.deny, &method, &host, &path) {
+        let mut end = tracked
+            .as_ref()
+            .map(|(tx, id)| EndGuard::new(tx.clone(), *id));
+
+        if !allowed {
+            // Nothing further will stream, so the exchange is over here.
+            set_outcome(&mut end, HttpEnd::Complete);
             return text_response(StatusCode::FORBIDDEN, "Blocked by sandlock HTTP ACL policy");
         }
+
+        let (mut parts, body) = req.into_parts();
+        let body = match tracked.as_ref() {
+            Some((tx, id)) => TeeBody::new(body, tx.clone(), *id, false, None)
+                .map_err(|e| Box::new(e) as BoxError)
+                .boxed(),
+            None => box_incoming(body),
+        };
 
         // Rebuild an absolute-URI request for the upstream client from the SAME
         // validated authority — never the raw Host header — so the forward host
         // equals the host the ACL/credential match ran against.
-        let pq = req
-            .uri()
+        let pq = parts
+            .uri
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/")
             .to_string();
-        let uri: hyper::Uri = match format!("{scheme}://{authority}{pq}").parse() {
+        parts.uri = match format!("{scheme}://{authority}{pq}").parse() {
             Ok(u) => u,
-            Err(_) => return text_response(StatusCode::BAD_GATEWAY, "bad upstream URI"),
+            Err(_) => {
+                set_outcome(&mut end, HttpEnd::Error);
+                return text_response(StatusCode::BAD_GATEWAY, "bad upstream URI");
+            }
         };
-
-        let (mut parts, body) = req.into_parts();
-        parts.uri = uri;
 
         // ACL passed: attach a credential if a rule matches. First match wins.
         // The secret is rendered into the outbound request only here — never on
@@ -242,6 +281,7 @@ impl AclService {
                             host,
                             path
                         );
+                        set_outcome(&mut end, HttpEnd::Error);
                         return text_response(
                             StatusCode::BAD_GATEWAY,
                             "Blocked by sandlock: credential could not be applied",
@@ -286,12 +326,42 @@ impl AclService {
             }
         }
 
-        let out_req = Request::from_parts(parts, box_incoming(body));
+        let out_req = Request::from_parts(parts, body);
 
-        match self.forwarder.forward(out_req).await {
+        let resp = match self.forwarder.forward(out_req).await {
             Ok(resp) => resp,
-            Err(_) => text_response(StatusCode::BAD_GATEWAY, "upstream error"),
+            Err(_) => {
+                set_outcome(&mut end, HttpEnd::Error);
+                return text_response(StatusCode::BAD_GATEWAY, "upstream error");
+            }
+        };
+
+        let Some((tx, id)) = tracked else {
+            return resp;
+        };
+        let (parts, body) = resp.into_parts();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent = tx
+            .send(ObsMsg::Response {
+                id,
+                status: parts.status.as_u16(),
+                headers: Box::new(parts.headers.clone()),
+                reply,
+            })
+            .await;
+        let wants_body = sent.is_ok() && answer.await.unwrap_or(false);
+
+        if !wants_body {
+            // Nothing more is reported, so the guard ends it as this returns.
+            set_outcome(&mut end, HttpEnd::Complete);
+            return Response::from_parts(parts, body);
         }
+        // Nothing is left to stream, so the outcome is settled here.
+        if hyper::body::Body::is_end_stream(&body) {
+            set_outcome(&mut end, HttpEnd::Complete);
+        }
+        let body = TeeBody::new(body, tx, id, true, end.take()).boxed();
+        Response::from_parts(parts, body)
     }
 }
 

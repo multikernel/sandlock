@@ -199,6 +199,7 @@ confine(&confinement)?;
 | [`docs/sandbox-reference.md`](docs/sandbox-reference.md) | Every `Sandbox` field, default, and TOML key; credentials; protection opt-out |
 | [`docs/network.md`](docs/network.md) | Endpoint grammar, protocol gating, HTTP interception, bind rules, port virtualization |
 | [`docs/policy-fn.md`](docs/policy-fn.md) | Dynamic policy callbacks: events, verdicts, context methods, TOCTOU guarantees |
+| [`docs/http-observer.md`](docs/http-observer.md) | HTTP observation callbacks: requests, response status, streamed bodies |
 | [`docs/pipelines.md`](docs/pipelines.md) | Pipelines, the XOA pattern, COW fork and map-reduce |
 | [`docs/prompt_injection.md`](docs/prompt_injection.md) | Prompt injection defenses: isolation, permissions, credentials, and text inspection |
 | [`docs/architecture.md`](docs/architecture.md) | Crate layout, confinement sequence, supervisor handlers, COW filesystem |
