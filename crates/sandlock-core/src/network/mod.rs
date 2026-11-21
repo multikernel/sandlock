@@ -163,9 +163,10 @@ fn socket_is_unix(fd: RawFd) -> bool {
 ///      virtualization) — or fails closed with EAFNOSUPPORT for an AF_UNIX
 ///      address with no pathname to pin, notably an abstract one: the
 ///      supervisor has no Landlock domain, so an on-behalf abstract send would
-///      escape the child's scope. `connect`'s abstract/unnamed/non-AF_UNIX
-///      arm still Continues under a destination policy, which is the residue
-///      tracked by issues #27 / #143.
+///      escape the child's scope. `connect`'s abstract/unnamed arm still
+///      Continues under a destination policy, for the same reason. Landlock
+///      refuses a TCP connect that races past it (see `confine_supervised`);
+///      a UDP or ping socket is the residue of issues #27 / #143.
 ///   2. Connected sockets with addr_ptr == 0 — the address was already
 ///      validated at connect time, so the kernel re-read of (nothing) is
 ///      moot.

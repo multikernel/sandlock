@@ -155,7 +155,7 @@ pub(crate) enum DestShape {
     /// re-resolve in the child's root view.
     UnixNamed(std::path::PathBuf),
     /// `sa_family == AF_UNIX` with no usable pathname: an ABSTRACT address
-    /// (`sun_path[0] == 0`), an unnamed one, a non-UTF-8 `sun_path`, or a
+    /// (`sun_path[0] == 0`), an unnamed one, or a
     /// buffer too short to carry a family at all.
     UnixNoPath,
     /// `sa_family != AF_UNIX`. Reached here only for families
@@ -205,7 +205,7 @@ pub(crate) enum SendPath {
     /// Everything else, failed closed with `EAFNOSUPPORT`:
     ///   - a non-IP address on a non-unix socket — the address-family-swap shape;
     ///   - an `AF_UNIX` destination we cannot pin in the child's context: an
-    ///     ABSTRACT address, an empty one, or a non-UTF-8 `sun_path`.
+    ///     ABSTRACT address or an empty one.
     ///
     /// Abstract addresses fail closed because an on-behalf send is executed by
     /// the supervisor, which carries no Landlock domain, and
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn send_path_abstract_unix_destination_is_rejected() {
-        // An abstract (or empty, or non-UTF-8) AF_UNIX address has no pathname
+        // An abstract (or empty) AF_UNIX address has no pathname
         // to pin. It must fail closed rather than be sent on-behalf — the
         // supervisor carries no Landlock domain, so an on-behalf abstract send
         // would escape the child's LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET.
