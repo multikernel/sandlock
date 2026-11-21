@@ -435,8 +435,18 @@ fn confine_inner(
     // derived from, so the two cannot diverge.
     use crate::sandbox::Protocol;
     let (handled_access_net, net_wildcard) = compute_net_mask(abi, pol, policy, handle_net);
-    let handled_access_net =
+    let mut handled_access_net =
         BitFlags::<AccessNet>::from_bits(handled_access_net).expect("known network rights");
+    let net_tcp_active =
+        ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
+    // Under a destination policy the supervisor makes every TCP connect, so
+    // one the child makes itself has raced past a Continue (issue #27): the
+    // kernel re-read a swapped descriptor and address. Allow it no port.
+    let supervisor_connects =
+        supervised && handle_net && net_tcp_active && policy.has_net_destination_policy();
+    if supervisor_connects {
+        handled_access_net |= AccessNet::ConnectTcp;
+    }
 
     // Scope: IPC + signal isolation, each gated on its protection's
     // resolved state.
@@ -555,8 +565,6 @@ fn confine_inner(
     // `Protection::NetTcp` is not `Active` (either policy-disabled or
     // degraded on a host without TCP network hooks) — `handled_access_net`
     // is 0 in that case and the kernel would reject any rule with EINVAL.
-    let net_tcp_active =
-        ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     // `BindPorts::All` installs no rules: BIND_TCP was dropped from the
     // handled set, so every bind is already allowed. A listed port `0` is
     // installed verbatim: Landlock permits only a `bind(0)` request with it
@@ -568,17 +576,14 @@ fn confine_inner(
             }
         }
     }
-    // For TCP connect, Landlock is the only enforcer on the direct path.
-    // The on-behalf path (when enabled) re-checks (ip, port) against the
-    // resolved allowlist, but Landlock must already permit the port or
-    // the kernel rejects before seccomp gets a chance to dispatch. Allow
-    // every port that any --net-allow rule mentions, plus every HTTP
-    // intercept port; the on-behalf check ensures the IP also matches.
+    // Where the child makes its own TCP connects, Landlock is their only
+    // enforcer: allow every port that any --net-allow rule mentions, plus
+    // every HTTP intercept port.
     //
     // When `net_wildcard` is set we already excluded CONNECT_TCP from
     // `handled_access_net`, so adding rules here would fail with EINVAL.
     // Skip — the on-behalf path is the sole enforcer.
-    if handle_net && net_tcp_active && !net_wildcard {
+    if handle_net && net_tcp_active && !net_wildcard && !supervisor_connects {
         let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
         // Explicit rules plus HTTP-derived reachability; HTTP intercept ports
         // are also added below (derived ports are a subset of them, kept here

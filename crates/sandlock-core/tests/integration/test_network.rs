@@ -1322,6 +1322,64 @@ async fn test_unspec_connect_disconnects_under_net_policy() {
     assert_eq!(got, "0:0", "connect(AF_UNSPEC) must succeed (got {got:?})");
 }
 
+/// An abstract unix connect is handed back to the kernel, which looks the
+/// descriptor and the address up again. One thread connects while another
+/// swaps in a TCP socket and a denied IP on an allowed port: Landlock must
+/// refuse whatever gets through. A miss proves nothing, a hit must not connect.
+#[tokio::test]
+async fn test_abstract_connect_race_cannot_reach_denied_tcp() {
+    let listener = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Positive control: the denied address is reachable from outside.
+    drop(std::net::TcpStream::connect(("127.0.0.2", port)).unwrap());
+    listener.accept().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let mut policy = base_policy()
+        .net_allow(&format!("127.0.0.1:{port}"))
+        .build()
+        .unwrap();
+
+    let script = format!(
+        concat!(
+            "import ctypes, os, socket, struct, sys, threading, time\n",
+            "sys.setswitchinterval(1e-5)\n",
+            "libc = ctypes.CDLL(None, use_errno=True)\n",
+            "unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "fd = os.dup(unix.fileno())\n",
+            "abstract = struct.pack('=H14s', socket.AF_UNIX, b'\\0sandlock-race')\n",
+            "denied = struct.pack('=H', socket.AF_INET) + struct.pack('!H', {port})\n",
+            "denied += socket.inet_aton('127.0.0.2') + bytes(8)\n",
+            "addr = ctypes.create_string_buffer(abstract, 16)\n",
+            "stop = time.monotonic() + 3\n",
+            "def swap():\n",
+            "    while time.monotonic() < stop:\n",
+            "        os.dup2(tcp.fileno(), fd)\n",
+            "        ctypes.memmove(addr, denied, 16)\n",
+            "        os.dup2(unix.fileno(), fd)\n",
+            "        ctypes.memmove(addr, abstract, 16)\n",
+            "swapper = threading.Thread(target=swap)\n",
+            "swapper.start()\n",
+            "while time.monotonic() < stop:\n",
+            "    libc.connect(fd, addr, 16)\n",
+            "swapper.join()\n",
+        ),
+        port = port
+    );
+
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a raced connect reached the denied address: {other:?}"),
+    }
+}
+
 /// Regression: a `sendmsg()` that passes a file descriptor via `SCM_RIGHTS` on a
 /// connected `AF_UNIX` socket must deliver a *working* fd when a `net_allow`
 /// policy routes the send on-behalf. The on-behalf path copies the control
