@@ -64,13 +64,7 @@ impl SandboxFeatures {
         handler_syscalls: &[i64],
     ) -> Self {
         let http_acl = !sandbox.http_allow.is_empty() || !sandbox.http_deny.is_empty();
-        let http_reachability = !sandbox.http_net_allow_rules().is_empty();
-        let network_destination_policy = !sandbox.net_allow.is_empty()
-            || http_reachability
-            || !sandbox.net_deny.is_empty()
-            // Live policy_fn rules replace the static allowlist on every connect.
-            || sandbox.policy_fn.is_some()
-            || http_acl;
+        let network_destination_policy = sandbox.has_net_destination_policy();
         let bind_denylist = !sandbox.net_deny_bind.is_empty();
         let exec_handler = handler_syscalls
             .iter()

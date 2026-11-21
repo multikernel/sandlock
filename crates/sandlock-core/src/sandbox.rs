@@ -2249,6 +2249,18 @@ impl Sandbox {
         !self.fs_readable.is_empty() || !self.fs_writable.is_empty()
     }
 
+    /// Whether a supervisor judges every IP destination, and so makes the
+    /// connects and sends itself.
+    pub(crate) fn has_net_destination_policy(&self) -> bool {
+        !self.net_allow.is_empty()
+            || !self.http_net_allow_rules().is_empty()
+            || !self.net_deny.is_empty()
+            // Live policy_fn rules replace the static allowlist on every connect.
+            || self.policy_fn.is_some()
+            || !self.http_allow.is_empty()
+            || !self.http_deny.is_empty()
+    }
+
     /// Lazily initialize the runtime block.
     ///
     /// Called by lifecycle methods (`spawn`, `run`, `fork`, etc.) on first
