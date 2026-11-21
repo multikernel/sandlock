@@ -1292,6 +1292,36 @@ async fn test_connected_unix_sendmsg_passes_through_under_net_policy() {
     );
 }
 
+/// `connect(AF_UNSPEC)` dissolves a socket's association and carries no
+/// destination, so a destination policy must let it through.
+#[tokio::test]
+async fn test_unspec_connect_disconnects_under_net_policy() {
+    let out = temp_file("unspec-connect-out");
+    let mut policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+
+    let script = format!(
+        concat!(
+            "import ctypes, socket\n",
+            "libc = ctypes.CDLL(None, use_errno=True)\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "unspec = ctypes.create_string_buffer(16)\n",
+            "rc = libc.connect(s.fileno(), unspec, 16)\n",
+            "open('{out}', 'w').write('%d:%d' % (rc, ctypes.get_errno()))\n",
+        ),
+        out = out.display()
+    );
+
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(got, "0:0", "connect(AF_UNSPEC) must succeed (got {got:?})");
+}
+
 /// Regression: a `sendmsg()` that passes a file descriptor via `SCM_RIGHTS` on a
 /// connected `AF_UNIX` socket must deliver a *working* fd when a `net_allow`
 /// policy routes the send on-behalf. The on-behalf path copies the control

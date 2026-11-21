@@ -377,7 +377,7 @@ pub(crate) fn build_dispatch_table(
     // gating named unix sockets). has_http_acl is already subsumed by
     // has_net_destination_policy, so it isn't listed.
     // ------------------------------------------------------------------
-    if policy.has_net_destination_policy || policy.supervises_unix_connect() {
+    if policy.has_net_destination_policy || policy.supervises_named_unix() {
         for &nr in &[
             libc::SYS_connect,
             libc::SYS_sendto,

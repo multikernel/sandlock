@@ -118,11 +118,26 @@ pub(super) fn connect_named_unix_on_behalf(
     sockfd: i32,
     sun_path: &std::path::Path,
 ) -> NotifAction {
-    let child_pid = notif.pid;
-    let pinned = match resolve_named_unix_target(notif, ctx, sun_path) {
-        Ok(fd) => fd,
-        Err(action) => return action,
-    };
+    match resolve_named_unix_target(notif, ctx, sun_path) {
+        Ok(pinned) => connect_pinned_unix(notif.pid, sockfd, pinned),
+        Err(action) => action,
+    }
+}
+
+/// [`connect_named_unix_on_behalf`] without the fs-grant check, for a sandbox
+/// that declares no fs gate to check against.
+pub(super) fn connect_ungated_unix_on_behalf(
+    notif: &SeccompNotif,
+    sockfd: i32,
+    sun_path: &std::path::Path,
+) -> NotifAction {
+    match pin_child_unix_target(notif.pid, sun_path) {
+        Ok(pinned) => connect_pinned_unix(notif.pid, sockfd, pinned),
+        Err(action) => action,
+    }
+}
+
+fn connect_pinned_unix(child_pid: u32, sockfd: i32, pinned: OwnedFd) -> NotifAction {
     let (sun, len) = match proc_self_fd_sockaddr(pinned.as_raw_fd()) {
         Some(s) => s,
         None => return NotifAction::Errno(libc::ENAMETOOLONG),

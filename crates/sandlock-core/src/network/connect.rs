@@ -12,12 +12,12 @@ use crate::seccomp::notif::NotifAction;
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr, set_port_in_sockaddr,
+    classify_dest_shape, parse_ip_from_sockaddr, parse_port_from_sockaddr, set_port_in_sockaddr,
     sockaddr_is_ipv6,
 };
 use super::query_socket_protocol;
-use super::unix::connect_named_unix_on_behalf;
-use super::verdict::{classify_destination, Destination};
+use super::unix::{connect_named_unix_on_behalf, connect_ungated_unix_on_behalf};
+use super::verdict::{classify_destination, DestShape, Destination};
 
 // ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
@@ -133,15 +133,30 @@ pub(super) async fn connect_on_behalf(
         // EACCES. The decision is made on `addr_bytes` (our immune copy) and we
         // never return Continue on the deny path, so it is TOCTOU-safe.
         // Abstract sockets (no path) are handled by the Landlock abstract scope.
-        match named_unix_socket_path(&addr_bytes) {
+        match classify_dest_shape(&addr_bytes) {
             // Resolve the symlink-followed target and connect on-behalf to
             // the pinned inode, so a symlink inside a granted dir cannot
             // redirect to an ungranted socket.
-            Some(path) if ctx.policy.supervises_unix_connect() => {
+            DestShape::UnixNamed(path) if ctx.policy.supervises_named_unix() => {
                 connect_named_unix_on_behalf(notif, ctx, sockfd, &path)
             }
-            // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
-            _ => NotifAction::Continue,
+            _ if !ctx.policy.has_net_destination_policy => NotifAction::Continue,
+            // From here a Continue is a way around the destination policy: the
+            // kernel looks the fd and the address up again, and a sibling
+            // thread can have put an IP socket and a forbidden IP there.
+            DestShape::UnixNamed(path) => connect_ungated_unix_on_behalf(notif, sockfd, &path),
+            DestShape::NotUnix => {
+                let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+                    Ok(fd) => fd,
+                    Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+                };
+                NotifAction::prepare(&addr_bytes.clone(), dup_fd.as_raw_fd(), move || {
+                    NotifAction::native(move || connect_dup(dup_fd.as_raw_fd(), &addr_bytes))
+                })
+            }
+            // Only the child's own connect is held to its Landlock abstract
+            // scope, so this one still continues and the race stays open.
+            DestShape::UnixNoPath => NotifAction::Continue,
         }
     }
 }
