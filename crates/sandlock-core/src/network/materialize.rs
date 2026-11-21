@@ -6,6 +6,7 @@
 // never re-read child memory.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 
 use crate::seccomp::notif::read_child_mem;
@@ -223,10 +224,8 @@ pub(crate) fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::Pat
         .position(|&b| b == 0)
         .unwrap_or(sun_path.len());
     let raw = &sun_path[..end];
-    if raw.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
+    // Bytes, not UTF-8: a name the gate cannot spell would slip past it.
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(raw)))
 }
 
 /// Classify a raw destination `sockaddr` into the [`DestShape`] the non-IP send
@@ -568,9 +567,9 @@ mod tests {
 
     #[test]
     fn dest_shape_pathless_unix_addresses_are_unix_no_path() {
-        // Abstract (leading NUL), unnamed (no path at all), and non-UTF-8
-        // sun_path all land in the arm that fails closed: there is nothing the
-        // supervisor can re-resolve in the child's root view.
+        // Abstract (leading NUL) and unnamed (no path at all) land in the arm
+        // that fails closed: there is nothing the supervisor can re-resolve in
+        // the child's root view.
         assert_eq!(
             classify_dest_shape(&unix_sockaddr_bytes(b"\0abstract-name")),
             DestShape::UnixNoPath
@@ -579,9 +578,12 @@ mod tests {
             classify_dest_shape(&unix_sockaddr_bytes(b"")),
             DestShape::UnixNoPath
         );
+        // A name that is not UTF-8 is still a name the gate must judge.
         assert_eq!(
             classify_dest_shape(&unix_sockaddr_bytes(b"/run/\xff\xfe\0")),
-            DestShape::UnixNoPath
+            DestShape::UnixNamed(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+                b"/run/\xff\xfe"
+            )))
         );
         // Too short to even carry a family: fail closed, do not guess.
         assert_eq!(classify_dest_shape(&[1]), DestShape::UnixNoPath);

@@ -6,6 +6,7 @@
 // and the syscall runs on-behalf against `/proc/self/fd/<pin>` so the
 // checked inode is the one acted on (TOCTOU- and symlink-safe).
 
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
@@ -25,12 +26,14 @@ use super::verdict::real_path_under_any;
 /// Pure: builds a string, touches nothing. Single source of truth for the
 /// resolution context, so a change to it is visible in one unit test rather
 /// than only in a live sandbox.
-fn child_lookup_path(child_pid: u32, sun_path: &std::path::Path) -> String {
-    if sun_path.is_absolute() {
-        format!("/proc/{}/root{}", child_pid, sun_path.display())
+fn child_lookup_path(child_pid: u32, sun_path: &std::path::Path) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(if sun_path.is_absolute() {
+        format!("/proc/{}/root", child_pid)
     } else {
-        format!("/proc/{}/cwd/{}", child_pid, sun_path.display())
-    }
+        format!("/proc/{}/cwd/", child_pid)
+    });
+    path.push(sun_path);
+    path
 }
 
 /// Pin the inode a named unix socket `sun_path` resolves to **in the child's
@@ -45,7 +48,8 @@ fn pin_child_unix_target(
     let proc_path = child_lookup_path(child_pid, sun_path);
     // `O_PATH` follows symlinks to the real socket inode and pins it without
     // performing any I/O on the socket.
-    let c_proc = std::ffi::CString::new(proc_path).map_err(|_| NotifAction::Errno(libc::EACCES))?;
+    let c_proc = std::ffi::CString::new(proc_path.into_vec())
+        .map_err(|_| NotifAction::Errno(libc::EACCES))?;
     let pinned_raw = unsafe { libc::open(c_proc.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if pinned_raw < 0 {
         // Target missing or unreachable: refuse without leaking the reason.
