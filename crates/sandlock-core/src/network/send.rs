@@ -123,7 +123,7 @@ pub(super) async fn sendto_on_behalf(
                 // out to a denied IP. Pin the fd and gate on its STABLE socket
                 // domain instead. NOTE: this fails closed for non-IP sends on
                 // non-unix sockets and for AF_UNIX destinations we cannot pin in
-                // the child's context (abstract / empty / non-UTF-8 `sun_path`)
+                // the child's context (abstract / empty `sun_path`)
                 // under a destination policy — see the PR description.
                 if !ctx.policy.has_net_destination_policy {
                     return NotifAction::Continue;
