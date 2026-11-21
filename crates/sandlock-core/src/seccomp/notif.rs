@@ -1407,19 +1407,14 @@ pub struct NotifPolicy {
 }
 
 impl NotifPolicy {
-    /// Whether a named unix `connect()` is decided by the supervisor. It then
-    /// connects on-behalf, so the peer's `SO_PEERCRED` names the supervisor.
-    /// Under chroot the kernel would resolve the address against the host's
-    /// root and the child's frozen cwd, so Landlock cannot take it over.
-    pub(crate) fn supervises_unix_connect(&self) -> bool {
-        self.has_unix_fs_gate && (!self.landlock_unix_gate || self.chroot_root.is_some())
-    }
-
-    /// Whether a named unix send is decided by the supervisor. A destination
-    /// policy keeps sends on-behalf even under Landlock: a `Continue` would let
-    /// a racing `dup2` move the send onto an IP socket.
-    pub(crate) fn supervises_unix_send(&self) -> bool {
-        self.supervises_unix_connect() || (self.has_unix_fs_gate && self.has_net_destination_policy)
+    /// Whether the supervisor acts on-behalf for a named unix connect or send:
+    /// wherever Landlock cannot gate it, or a `Continue` could be raced past a
+    /// destination policy. The peer's `SO_PEERCRED` then names the supervisor.
+    pub(crate) fn supervises_named_unix(&self) -> bool {
+        self.has_unix_fs_gate
+            && (!self.landlock_unix_gate
+                || self.chroot_root.is_some()
+                || self.has_net_destination_policy)
     }
 
     /// Whether an open may land on something the supervisor answers for
