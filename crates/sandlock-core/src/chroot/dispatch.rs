@@ -410,7 +410,8 @@ fn build_virtual_path(
         let base_virtual = if dirfd32 == libc::AT_FDCWD {
             virtual_cwd_of(notif, ctx)?
         } else {
-            let base_host = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)).ok()?;
+            let base_host =
+                std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd32)).ok()?;
             ctx.host_to_virtual(&base_host)?
         };
         let combined = base_virtual.join(path);
@@ -1146,6 +1147,8 @@ fn open_exec_by_path(
     rel_path: String,
     ctx: &ChrootCtx<'_>,
 ) -> Result<(RawFd, PathBuf), i32> {
+    // The kernel reads dirfd as an int; drop any junk in the upper 32 bits.
+    let dirfd = dirfd as i32 as i64;
     // Build the full virtual path from dirfd + relative path.
     let full_path = if Path::new(&rel_path).is_absolute() {
         rel_path
@@ -1358,6 +1361,7 @@ pub(crate) async fn handle_chroot_exec(
     } else {
         0
     };
+    let dirfd = dirfd as i32 as i64;
     // What the kernel's alloc_bprm() hands a script's interpreter as the script.
     let exec_name = if rel_path.starts_with('/') || dirfd == libc::AT_FDCWD as i64 {
         rel_path.clone()
