@@ -102,6 +102,17 @@ memory limits bound growth. Resource exhaustion and registry transaction errors
 fail sandbox creation; transaction waits are bounded to two seconds. SEM_UNDO
 releases both ownership and transaction locks after a process exits.
 
+With `kernel.shm_rmid_forced=1` the kernel destroys a shared-memory segment as
+soon as its last attachment drops, while semaphores persist. Each live claim
+therefore keeps the root directory and its own segment attached. A missing
+directory means no sandbox is registered, and it is created again. The
+directory's salt, which keys every segment, is also kept in a small semaphore
+set so a recreated directory finds the existing semaphore sets instead of
+orphaning them. A segment destroyed with its last claimant takes the index
+links in its records with it; a lookup that reaches one relinks every bucket
+from the records that survive, under the transaction lock. An interrupted
+relink is redone by the next transaction.
+
 The registry is accessible only to its owning UID. Processes with that same UID
 are trusted, as with the control socket. The child publishes its process-group
 identity in a dedicated semaphore before confinement; `GETPID` returns its
