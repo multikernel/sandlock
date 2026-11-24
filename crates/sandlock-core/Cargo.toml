@@ -37,7 +37,7 @@ http-body-util = { version = "0.1", optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"], optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
-ruzstd = { version = "0.9", optional = true }
+zrip = { version = "0.8.25", optional = true }
 base64 = { version = "0.22", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 bollard = { version = "0.21", optional = true }
@@ -46,7 +46,7 @@ futures-util = { version = "0.3", optional = true }
 [features]
 cow = ["dep:walkdir", "dep:pathdiff", "dep:ring"]
 profiles = ["dep:toml"]
-image = ["cow", "dep:uuid", "dep:tar", "dep:flate2", "dep:ruzstd", "dep:base64", "dep:bollard", "dep:futures-util"]
+image = ["cow", "dep:uuid", "dep:tar", "dep:flate2", "dep:zrip", "dep:base64", "dep:bollard", "dep:futures-util"]
 checkpoint = ["dep:bincode"]
 default = ["http", "checkpoint", "image", "profiles", "cow"]
 cli = ["dep:clap"]

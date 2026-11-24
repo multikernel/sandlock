@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -292,10 +292,12 @@ pub(super) fn unpack(
                 drain(dec.into_inner(), desc)?;
             }
             Compression::Zstd => {
-                let mut dec = ZstdReader::new(BufReader::new(raw));
+                // Every frame of the stream, skippable frames skipped (zstd:chunked layers
+                // are many frames plus skippable metadata).
+                let mut dec = zrip::FrameDecoder::new(BufReader::new(raw));
                 apply_layer(root, &mut dec)?;
                 drain(&mut dec, desc)?;
-                drain(dec.src, desc)?;
+                drain(dec.into_inner(), desc)?;
             }
         }
     }
@@ -422,63 +424,6 @@ impl<R: Read> Read for Verified<R> {
     }
 }
 
-/// zstd decoder spanning every frame of a stream, skipping skippable frames
-/// (zstd:chunked layers are many frames plus skippable metadata).
-struct ZstdReader<R> {
-    src: R,
-    frame: ruzstd::decoding::FrameDecoder,
-    in_frame: bool,
-}
-
-impl<R: BufRead> ZstdReader<R> {
-    fn new(src: R) -> Self {
-        ZstdReader {
-            src,
-            frame: ruzstd::decoding::FrameDecoder::new(),
-            in_frame: false,
-        }
-    }
-}
-
-impl<R: BufRead> Read for ZstdReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
-        use ruzstd::decoding::BlockDecodingStrategy;
-        let invalid =
-            |e: FrameDecoderError| io::Error::new(io::ErrorKind::InvalidData, format!("zstd: {e}"));
-        loop {
-            if self.in_frame {
-                if self.frame.can_collect() > 0 {
-                    return self.frame.read(buf);
-                }
-                if !self.frame.is_finished() {
-                    self.frame
-                        .decode_blocks(
-                            &mut self.src,
-                            BlockDecodingStrategy::UptoBytes(buf.len().max(1)),
-                        )
-                        .map_err(invalid)?;
-                    continue;
-                }
-                self.in_frame = false;
-            }
-            if self.src.fill_buf()?.is_empty() {
-                return Ok(0);
-            }
-            match self.frame.init(&mut self.src) {
-                Ok(()) => self.in_frame = true,
-                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
-                    length,
-                    ..
-                })) => {
-                    io::copy(&mut (&mut self.src).take(length as u64), &mut io::sink())?;
-                }
-                Err(e) => return Err(invalid(e)),
-            }
-        }
-    }
-}
-
 pub(super) fn parse_json<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
     what: &str,
@@ -589,10 +534,7 @@ pub(super) mod tests {
             out.extend_from_slice(&0x184D2A50u32.to_le_bytes());
             out.extend_from_slice(&4u32.to_le_bytes());
             out.extend_from_slice(b"meta");
-            out.extend(ruzstd::encoding::compress_to_vec(
-                *part,
-                ruzstd::encoding::CompressionLevel::Fastest,
-            ));
+            out.extend(zrip::compress(part, 1).unwrap());
         }
         out
     }
