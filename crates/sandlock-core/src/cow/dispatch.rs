@@ -140,7 +140,7 @@ fn resolve_at_path_with_virtual(
         return path.to_string();
     }
     // Relative to dirfd
-    if let Ok(base) = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)) {
+    if let Ok(base) = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd32)) {
         normalize_path(base.join(path))
             .to_string_lossy()
             .into_owned()

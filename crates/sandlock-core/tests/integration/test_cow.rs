@@ -2305,3 +2305,73 @@ async fn test_seccomp_cow_o_path_open_of_created_entries() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+/// A dirfd with junk in its upper 32 bits must resolve like the kernel does.
+///
+/// The kernel reads openat's dirfd as an `int`, so 0x1_0000_0000 | fd means
+/// fd. COW resolved it through `/proc/<pid>/fd/<untruncated>`, which does not
+/// exist, so it fell back to the bare relative path and the write went to the
+/// real directory, surviving an abort.
+#[tokio::test]
+async fn test_seccomp_cow_openat_dirfd_high_bits() {
+    let workdir = temp_dir("seccomp-dirfd-hi");
+    fs::create_dir_all(workdir.join("sub")).unwrap();
+    let out_file =
+        std::env::temp_dir().join(format!("sandlock-test-dirfd-hi-{}", std::process::id()));
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, os, platform\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.syscall.restype = ctypes.c_long\n",
+        "nr = 257 if platform.machine() == 'x86_64' else 56\n",
+        "dfd = os.open('{wd}/sub', os.O_RDONLY | os.O_DIRECTORY)\n",
+        "O_WRONLY = 1; O_CREAT = 64\n",
+        "res = []\n",
+        "for name, d in (('plain', dfd), ('hi', dfd | (1 << 32))):\n",
+        "    fd = libc.syscall(nr, ctypes.c_long(d), ('%s.txt' % name).encode(), O_WRONLY | O_CREAT, 0o644)\n",
+        "    res.append('%s=%s' % (name, 'ok' if fd >= 0 else 'errno%d' % ctypes.get_errno()))\n",
+        "open('{out}', 'w').write(' '.join(res))\n",
+    ), wd = workdir.display(), out = out_file.display());
+
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+    let content = fs::read_to_string(&out_file).unwrap_or_default();
+    // Both opens must succeed, or the checks below pass for a failed open.
+    assert_eq!(content, "plain=ok hi=ok");
+    assert!(
+        !workdir.join("sub/plain.txt").exists(),
+        "control: plain dirfd should be COWed"
+    );
+    assert!(
+        !workdir.join("sub/hi.txt").exists(),
+        "openat with high bits set in dirfd escaped COW and survived abort ({content})"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
