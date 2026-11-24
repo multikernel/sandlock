@@ -23,7 +23,12 @@ struct Record {
     next: u64,
 }
 
-struct Mapping(*mut Record);
+/// An attachment and the pid that made it. With kernel.shm_rmid_forced=1 a
+/// segment lives only while something is attached, so holding one pins it.
+struct Mapping(*mut Record, i32);
+
+// The address names a SysV attachment of the whole process, not of a thread.
+unsafe impl Send for Mapping {}
 
 impl Mapping {
     fn attach(id: i32, readonly: bool) -> io::Result<Self> {
@@ -50,7 +55,7 @@ impl Mapping {
             }
             return Err(error);
         }
-        Ok(Self(address.cast()))
+        Ok(Self(address.cast(), unsafe { libc::getpid() }))
     }
 
     fn read(&self, slot: usize) -> Record {
@@ -81,9 +86,19 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        unsafe {
-            libc::shmdt(self.0.cast());
+        // MADV_DONTFORK left a forked child without the attachment; the
+        // address may hold something else there.
+        if unsafe { libc::getpid() } == self.1 {
+            unsafe {
+                libc::shmdt(self.0.cast());
+            }
         }
+    }
+}
+
+impl std::fmt::Debug for Mapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mapping")
     }
 }
 
@@ -94,6 +109,9 @@ pub(crate) struct Claim {
     owner: i32,
     token: [u8; 16],
     pub entry: Entry,
+    /// The directory and this claim's segment, kept attached for as long as
+    /// the claim lives so kernel.shm_rmid_forced=1 cannot destroy them.
+    _pins: Vec<Mapping>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,17 +200,50 @@ fn values(id: i32, count: usize) -> io::Result<Vec<u16>> {
     Ok(values)
 }
 
+fn get_memory(key: libc::key_t, bytes: usize, create: bool) -> io::Result<i32> {
+    checked(unsafe { libc::shmget(key, bytes, 0o600 | if create { libc::IPC_CREAT } else { 0 }) })
+}
+
+#[cfg(test)]
 fn open_memory(key: libc::key_t, bytes: usize, create: bool) -> io::Result<i32> {
-    let id = checked(unsafe {
-        libc::shmget(key, bytes, 0o600 | if create { libc::IPC_CREAT } else { 0 })
-    })?;
+    let id = get_memory(key, bytes, create)?;
+    validate_memory(id, bytes)?;
+    Ok(id)
+}
+
+fn validate_memory(id: i32, bytes: usize) -> io::Result<()> {
     let mut stat: libc::shmid_ds = unsafe { std::mem::zeroed() };
     checked(unsafe { libc::shmctl(id, libc::IPC_STAT, &mut stat) })?;
     validate_permissions(&stat.shm_perm)?;
     if stat.shm_segsz != bytes {
         return Err(invalid());
     }
-    Ok(id)
+    Ok(())
+}
+
+/// Open and attach a segment, the attachment pinning it, then validate it.
+///
+/// The last attachment can drop between shmget and shmat without the lock,
+/// at a claimant's exit, and under kernel.shm_rmid_forced=1 that destroys
+/// the segment. Nothing was attached, so nothing was registered there: look
+/// it up again, which creates it afresh or finds it gone.
+fn attach_memory(key: libc::key_t, bytes: usize, create: bool) -> io::Result<(i32, Mapping)> {
+    let mut attempts = 0;
+    loop {
+        let id = get_memory(key, bytes, create)?;
+        match Mapping::attach_bytes(id, false, bytes) {
+            Ok(mapping) => {
+                validate_memory(id, bytes)?;
+                return Ok((id, mapping));
+            }
+            Err(e)
+                if attempts < 8 && matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EIDRM)) =>
+            {
+                attempts += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn initialize_signature(id: i32, count: usize) -> io::Result<()> {
@@ -215,6 +266,60 @@ fn initialize_signature(id: i32, count: usize) -> io::Result<()> {
     checked(unsafe { libc::semop(id, ops.as_mut_ptr(), ops.len()) })?;
     Ok(())
 }
+
+/// Semaphores holding the directory's salt, 15 bits each.
+///
+/// With kernel.shm_rmid_forced=1 the directory dies with its last attachment
+/// while the registry semaphore arrays, keyed from the salt, live on. A fresh
+/// salt would orphan every one of them, so the salt outlives the directory
+/// here. Semaphores of a 0600 array are unreadable to other users, so the
+/// salt stays as private as it is in the directory.
+const SALT_SEMAPHORES: usize = 9;
+
+/// XORed with the uid to key the root lock set and directory.
+const ROOT_KEY: u32 = 0x534c4305;
+
+/// XORed with the uid to key the salt set. Keys are per-uid, so uid `a`'s
+/// salt key equals uid `b`'s root key when `a ^ b == ROOT_KEY ^ SALT_KEY`.
+/// Bit 30 puts such a pair a billion uids apart; the other user's set would
+/// fail `semget` with EACCES and block every sandbox of whoever came second.
+const SALT_KEY: u32 = ROOT_KEY ^ (1 << 30);
+
+fn uid_key(constant: u32) -> libc::key_t {
+    (unsafe { libc::getuid() } ^ constant).max(1) as libc::key_t
+}
+
+fn salt_semaphores() -> io::Result<i32> {
+    open_semaphores(uid_key(SALT_KEY), SALT_SEMAPHORES, true)
+}
+
+fn stored_salt(id: i32) -> io::Result<u128> {
+    Ok(values(id, SALT_SEMAPHORES)?
+        .iter()
+        .rev()
+        .fold(0, |salt, &chunk| (salt << 15) | u128::from(chunk)))
+}
+
+fn store_salt(id: i32, salt: u128) -> io::Result<()> {
+    let mut chunks: Vec<u16> = (0..SALT_SEMAPHORES)
+        .map(|i| ((salt >> (15 * i)) & 0x7fff) as u16)
+        .collect();
+    checked(unsafe {
+        libc::semctl(
+            id,
+            0,
+            libc::SETALL,
+            SemArg {
+                array: chunks.as_mut_ptr(),
+            },
+        )
+    })
+    .map(|_| ())
+}
+
+/// Word 3 of a directory whose chains are being relinked. Left behind by an
+/// interrupted rebuild, it makes the next transaction rebuild again.
+const REBUILDING: u64 = u64::MAX;
 
 struct Directory(Mapping);
 impl Directory {
@@ -267,14 +372,63 @@ fn segment_key(salt: [u64; 2], segment: u64) -> libc::key_t {
     ((value ^ (value >> 31)) as u32).max(1) as libc::key_t
 }
 
-#[derive(Clone, Copy)]
 struct Catalog {
     lock: i32,
     metadata: i32,
+    /// Attached for the catalog's lifetime, which pins the directory.
+    directory: Directory,
 }
+
+/// A registry segment and an attachment that pins it.
+struct Segment {
+    registry: Registry,
+    memory: Mapping,
+}
+
+/// The segments a transaction has opened, kept attached until it ends: one
+/// whose last claimant exits mid-transaction must not vanish under it.
+struct Segments {
+    salt: [u64; 2],
+    lock: i32,
+    open: std::collections::HashMap<u64, Segment>,
+}
+
+impl Segments {
+    fn new(catalog: &Catalog) -> Self {
+        Self {
+            salt: catalog.directory.salt(),
+            lock: catalog.lock,
+            open: std::collections::HashMap::new(),
+        }
+    }
+
+    /// `None` when the segment does not exist and `create` is false.
+    fn get(&mut self, ordinal: u64, create: bool) -> io::Result<Option<&mut Segment>> {
+        if !self.open.contains_key(&ordinal) {
+            match Registry::open_segment(self.salt, ordinal, self.lock, create) {
+                Ok(segment) => {
+                    self.open.insert(ordinal, segment);
+                }
+                Err(e) if !create && e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(self.open.get_mut(&ordinal))
+    }
+}
+
+/// One record on a bucket chain.
+struct Node {
+    reference: u64,
+    registry: Registry,
+    slot: usize,
+    record: Record,
+    owner: u16,
+}
+
 impl Catalog {
     fn open(create: bool) -> io::Result<Option<Self>> {
-        let key = (unsafe { libc::getuid() } ^ 0x534c4305).max(1) as libc::key_t;
+        let key = uid_key(ROOT_KEY);
         let lock = match open_semaphores(key, HEADER, create) {
             Ok(id) => id,
             Err(e) if !create && e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
@@ -289,80 +443,186 @@ impl Catalog {
         if initialize && !create {
             return Ok(None);
         }
-        let metadata = open_memory(key, DIRECTORY_BYTES, create && initialize)?;
-        let catalog = Self { lock, metadata };
-        let directory = catalog.directory()?;
+        // Every live claim pins the directory, so with kernel.shm_rmid_forced=1
+        // a missing directory means nothing is registered: create it afresh.
+        let (metadata, directory) = match attach_memory(key, DIRECTORY_BYTES, create) {
+            Ok((id, mapping)) => (id, Directory(mapping)),
+            Err(e) if !create && e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let [low, high] = directory.salt();
+        let mut salt = u128::from(low) | u128::from(high) << 64;
+        if create {
+            let stash = salt_semaphores()?;
+            let stored = stored_salt(stash)?;
+            if salt == 0 {
+                salt = stored;
+                while salt == 0 {
+                    salt = rand::random();
+                }
+                directory.put(0, salt as u64);
+                directory.put(1, (salt >> 64) as u64);
+            }
+            if stored != salt {
+                store_salt(stash, salt)?;
+            }
+        } else if salt == 0 {
+            return Ok(None);
+        }
         if initialize {
-            let salt: u128 = rand::random();
-            directory.put(0, salt as u64);
-            directory.put(1, (salt >> 64) as u64);
             initialize_signature(lock, HEADER)?;
         }
-        directory.recover()?;
-        Ok(Some(catalog))
+        Ok(Some(Self {
+            lock,
+            metadata,
+            directory,
+        }))
     }
 
-    fn directory(self) -> io::Result<Directory> {
-        Ok(Directory(Mapping::attach_bytes(
-            self.metadata,
-            false,
-            DIRECTORY_BYTES,
-        )?))
+    fn transaction(&self) -> io::Result<Transaction> {
+        Registry(self.lock, -1, self.lock).lock()
     }
 
-    fn segment(self, directory: &Directory, ordinal: u64, create: bool) -> io::Result<Registry> {
-        Registry::open_segment(directory.salt(), ordinal, self.lock, create)
+    fn recover(&self, segments: &mut Segments) -> io::Result<()> {
+        if self.directory.word(3) == REBUILDING {
+            return self.rebuild(segments);
+        }
+        self.directory.recover()
     }
 
-    fn claim(self, name: &str) -> io::Result<Claim> {
+    /// Relink every surviving record into its bucket.
+    ///
+    /// A segment with no attachment left is destroyed under
+    /// kernel.shm_rmid_forced=1, taking the chain links stored in its records.
+    /// Live claims pin their own segment, so only released records are lost;
+    /// the chains through them are rebuilt from the records that remain.
+    fn rebuild(&self, segments: &mut Segments) -> io::Result<()> {
+        let directory = &self.directory;
+        let cursor = directory.word(2);
+        directory.put(3, REBUILDING);
+        for bucket in 0..BUCKETS {
+            directory.put(5 + bucket, 0);
+        }
+        let mut highest = 0;
+        for ordinal in 0..cursor.div_ceil(SLOTS as u64) {
+            let Some(segment) = segments.get(ordinal, false)? else {
+                continue;
+            };
+            for slot in 0..SLOTS {
+                let reference = ordinal * SLOTS as u64 + slot as u64 + 1;
+                if reference > cursor {
+                    break;
+                }
+                let mut record = segment.memory.read(slot);
+                if record.len == 0 || record.len as usize > NAME_BYTES {
+                    continue;
+                }
+                let bucket = hash_name(&record.name[..record.len as usize]) as usize % BUCKETS;
+                record.next = directory.word(5 + bucket);
+                segment.memory.write(slot, record);
+                directory.put(5 + bucket, reference);
+                highest = reference;
+            }
+        }
+        // References past the last surviving record are free to hand out again.
+        directory.put(2, highest);
+        directory.put(3, 0);
+        Ok(())
+    }
+
+    /// The records on `bucket`'s chain, rebuilding the chains first if one
+    /// of them runs through a segment that was destroyed.
+    fn chain(&self, segments: &mut Segments, bucket: usize) -> io::Result<Vec<Node>> {
+        if let Some(nodes) = self.try_chain(segments, bucket)? {
+            return Ok(nodes);
+        }
+        self.rebuild(segments)?;
+        self.try_chain(segments, bucket)?.ok_or_else(invalid)
+    }
+
+    /// `None` when a link leads into a lost segment: one that no longer
+    /// exists, or was recreated and holds no record where a link points.
+    fn try_chain(&self, segments: &mut Segments, bucket: usize) -> io::Result<Option<Vec<Node>>> {
+        let directory = &self.directory;
+        let mut nodes = Vec::new();
+        let mut reference = directory.word(5 + bucket);
+        while reference != 0 {
+            if reference > directory.word(2) || nodes.len() as u64 >= directory.word(2) {
+                return Err(invalid());
+            }
+            let slot = ((reference - 1) % SLOTS as u64) as usize;
+            let Some(segment) = segments.get((reference - 1) / SLOTS as u64, false)? else {
+                return Ok(None);
+            };
+            let record = segment.memory.read(slot);
+            if record.len == 0 {
+                return Ok(None);
+            }
+            let owner = checked(unsafe {
+                libc::semctl(segment.registry.0, (HEADER + slot) as i32, libc::GETVAL)
+            })? as u16;
+            nodes.push(Node {
+                reference,
+                registry: segment.registry,
+                slot,
+                record,
+                owner,
+            });
+            reference = record.next;
+        }
+        Ok(Some(nodes))
+    }
+
+    fn claim(&self, name: &str) -> io::Result<Claim> {
         if name.is_empty() || name.len() > NAME_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "control name must contain 1 to 64 bytes",
             ));
         }
-        let _lock = Registry(self.lock, -1, self.lock).lock()?;
-        let directory = self.directory()?;
-        directory.recover()?;
+        let _lock = self.transaction()?;
+        let mut segments = Segments::new(self);
+        self.recover(&mut segments)?;
+        let directory = &self.directory;
         let bucket = hash_name(name.as_bytes()) as usize % BUCKETS;
-        let mut reference = directory.word(5 + bucket);
         let mut available = None;
-        let mut traversed = 0;
-        while reference != 0 {
-            if reference > directory.word(2) || traversed >= directory.word(2) {
-                return Err(invalid());
-            }
-            traversed += 1;
-            let registry = self.segment(&directory, (reference - 1) / SLOTS as u64, false)?;
-            let slot = ((reference - 1) % SLOTS as u64) as usize;
-            let mapping = Mapping::attach(registry.1, true)?;
-            let record = mapping.read(slot);
-            let owner =
-                checked(unsafe { libc::semctl(registry.0, (HEADER + slot) as i32, libc::GETVAL) })?;
-            if owner == 0 {
-                available.get_or_insert(reference);
+        for node in self.chain(&mut segments, bucket)? {
+            if node.owner == 0 {
+                available.get_or_insert(node.reference);
             } else {
-                if owner != 1 || record.len == 0 || record.len as usize > NAME_BYTES {
+                if node.owner != 1 || node.record.len as usize > NAME_BYTES {
                     return Err(invalid());
                 }
-                if &record.name[..record.len as usize] == name.as_bytes() {
+                if &node.record.name[..node.record.len as usize] == name.as_bytes() {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
                         "sandbox name is already claimed",
                     ));
                 }
             }
-            reference = record.next;
         }
         let fresh = available.is_none();
         let reference = available.unwrap_or(directory.word(2).checked_add(1).ok_or_else(invalid)?);
-        let registry = self.segment(&directory, (reference - 1) / SLOTS as u64, fresh)?;
         let slot = ((reference - 1) % SLOTS as u64) as usize;
-        let mut mapping = Mapping::attach(registry.1, false)?;
+        let segment = segments
+            .get((reference - 1) / SLOTS as u64, fresh)?
+            .ok_or_else(invalid)?;
+        let registry = segment.registry;
+        if fresh
+            && checked(unsafe { libc::semctl(registry.0, (HEADER + slot) as i32, libc::GETVAL) })?
+                != 0
+        {
+            // A live owner on a slot the directory never handed out.
+            return Err(invalid());
+        }
+        let pins = vec![
+            Mapping::attach_bytes(self.metadata, true, DIRECTORY_BYTES)?,
+            Mapping::attach(registry.1, true)?,
+        ];
         let next = if fresh {
             directory.word(5 + bucket)
         } else {
-            mapping.read(slot).next
+            segment.memory.read(slot).next
         };
         if fresh {
             directory.put(4, bucket as u64);
@@ -376,7 +636,7 @@ impl Catalog {
             next,
         };
         record.name[..name.len()].copy_from_slice(name.as_bytes());
-        mapping.write(slot, record);
+        segment.memory.write(slot, record);
         checked(unsafe {
             libc::semctl(
                 registry.0,
@@ -403,61 +663,60 @@ impl Catalog {
                 supervisor: owner,
                 child: None,
             },
+            _pins: pins,
         })
     }
 
-    fn lookup(self, name: &str) -> io::Result<Option<Entry>> {
-        let _lock = Registry(self.lock, -1, self.lock).lock()?;
-        let directory = self.directory()?;
-        directory.recover()?;
+    fn lookup(&self, name: &str) -> io::Result<Option<Entry>> {
+        let _lock = self.transaction()?;
+        let mut segments = Segments::new(self);
+        self.recover(&mut segments)?;
         let bucket = hash_name(name.as_bytes()) as usize % BUCKETS;
-        let mut reference = directory.word(5 + bucket);
-        let mut traversed = 0;
-        while reference != 0 {
-            if reference > directory.word(2) || traversed >= directory.word(2) {
+        for node in self.chain(&mut segments, bucket)? {
+            if node.record.len as usize > NAME_BYTES {
                 return Err(invalid());
             }
-            traversed += 1;
-            let registry = self.segment(&directory, (reference - 1) / SLOTS as u64, false)?;
-            let slot = ((reference - 1) % SLOTS as u64) as usize;
-            let record = Mapping::attach(registry.1, true)?.read(slot);
-            if record.len as usize > NAME_BYTES {
-                return Err(invalid());
-            }
-            if &record.name[..record.len as usize] == name.as_bytes() {
-                let owner = checked(unsafe {
-                    libc::semctl(registry.0, (HEADER + slot) as i32, libc::GETVAL)
-                })? as u16;
+            if &node.record.name[..node.record.len as usize] == name.as_bytes() {
                 let child = checked(unsafe {
-                    libc::semctl(registry.0, (HEADER + SLOTS + slot) as i32, libc::GETVAL)
+                    libc::semctl(
+                        node.registry.0,
+                        (HEADER + SLOTS + node.slot) as i32,
+                        libc::GETVAL,
+                    )
                 })? as u16;
-                if let Some(entry) = registry.entry(slot, record, owner, child)? {
+                if let Some(entry) =
+                    node.registry
+                        .entry(node.slot, node.record, node.owner, child)?
+                {
                     return Ok(Some(entry));
                 }
             }
-            reference = record.next;
         }
         Ok(None)
     }
 
-    fn list(self) -> io::Result<Vec<Entry>> {
-        let _lock = Registry(self.lock, -1, self.lock).lock()?;
-        let directory = self.directory()?;
-        directory.recover()?;
+    fn list(&self) -> io::Result<Vec<Entry>> {
+        let _lock = self.transaction()?;
+        let mut segments = Segments::new(self);
+        self.recover(&mut segments)?;
         let mut entries = Vec::new();
-        for ordinal in 0..directory.word(2).div_ceil(SLOTS as u64) {
-            let registry = self.segment(&directory, ordinal, false)?;
-            entries.extend(registry.entries(&registry.values()?)?);
+        for ordinal in 0..self.directory.word(2).div_ceil(SLOTS as u64) {
+            // A destroyed segment held no live claim.
+            let Some(segment) = segments.get(ordinal, false)? else {
+                continue;
+            };
+            let owners = segment.registry.values()?;
+            entries.extend(segment.registry.entries_in(&segment.memory, &owners)?);
         }
         Ok(entries)
     }
 }
 
 impl Registry {
-    fn open_segment(salt: [u64; 2], segment: u64, lock: i32, create: bool) -> io::Result<Self> {
+    fn open_segment(salt: [u64; 2], segment: u64, lock: i32, create: bool) -> io::Result<Segment> {
         let key = segment_key(salt, segment);
-        let metadata = open_memory(key, METADATA_BYTES, create)?;
-        let header = Directory(Mapping::attach(metadata, false)?);
+        let (metadata, header) = attach_memory(key, METADATA_BYTES, create)?;
+        let header = Directory(header);
         let expected = [salt[0], salt[1], segment, 0x534c_434f_0000_0005];
         if header.word(3) == 0 && create {
             for (i, &value) in expected.iter().enumerate() {
@@ -473,7 +732,10 @@ impl Registry {
         }
         let sem = open_semaphores(key, SEMAPHORES, create)?;
         initialize_signature(sem, SEMAPHORES)?;
-        Ok(Self(sem, metadata, lock))
+        Ok(Segment {
+            registry: Self(sem, metadata, lock),
+            memory: header.0,
+        })
     }
 
     fn values(self) -> io::Result<Vec<u16>> {
@@ -570,8 +832,12 @@ impl Registry {
         }))
     }
 
+    #[cfg(test)]
     fn entries(self, owners: &[u16]) -> io::Result<Vec<Entry>> {
-        let metadata = Mapping::attach(self.1, true)?;
+        self.entries_in(&Mapping::attach(self.1, true)?, owners)
+    }
+
+    fn entries_in(self, metadata: &Mapping, owners: &[u16]) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
         for slot in 0..SLOTS {
             if owners[HEADER + slot] == 0 {
@@ -601,6 +867,7 @@ impl Registry {
         let _lock = self.lock()?;
         let owners = self.values()?;
         let mut metadata = Mapping::attach(self.1, false)?;
+        let pins = vec![Mapping::attach(self.1, true)?];
         let mut available = None;
         for slot in 0..SLOTS {
             if owners[HEADER + slot] == 0 {
@@ -653,6 +920,7 @@ impl Registry {
             owner,
             token,
             entry,
+            _pins: pins,
         })
     }
 }
@@ -756,7 +1024,8 @@ mod tests {
     use std::io::{BufRead, Write};
     use std::process::{Child, Command, Stdio};
 
-    struct TestRegistry(Registry);
+    /// The attachment keeps the segment alive under kernel.shm_rmid_forced=1.
+    struct TestRegistry(Registry, #[allow(dead_code)] Mapping);
 
     impl TestRegistry {
         fn new() -> Self {
@@ -764,7 +1033,10 @@ mod tests {
                 .unwrap();
             let metadata =
                 checked(unsafe { libc::shmget(libc::IPC_PRIVATE, METADATA_BYTES, 0o600) }).unwrap();
-            Self(Registry(id, metadata, id))
+            Self(
+                Registry(id, metadata, id),
+                Mapping::attach(metadata, true).unwrap(),
+            )
         }
     }
 
@@ -777,23 +1049,34 @@ mod tests {
         }
     }
 
+    impl Catalog {
+        fn attached(lock: i32, metadata: i32) -> Self {
+            Self {
+                lock,
+                metadata,
+                directory: Directory(
+                    Mapping::attach_bytes(metadata, false, DIRECTORY_BYTES).unwrap(),
+                ),
+            }
+        }
+    }
+
     struct TestCatalog(Catalog);
     impl TestCatalog {
         fn new() -> Self {
             let lock = open_semaphores(libc::IPC_PRIVATE, HEADER, true).unwrap();
             let metadata = open_memory(libc::IPC_PRIVATE, DIRECTORY_BYTES, true).unwrap();
-            let catalog = Catalog { lock, metadata };
-            let directory = catalog.directory().unwrap();
+            let catalog = Catalog::attached(lock, metadata);
             let salt: u128 = rand::random();
-            directory.put(0, salt as u64);
-            directory.put(1, (salt >> 64) as u64);
+            catalog.directory.put(0, salt as u64);
+            catalog.directory.put(1, (salt >> 64) as u64);
             initialize_signature(lock, HEADER).unwrap();
             Self(catalog)
         }
     }
     impl Drop for TestCatalog {
         fn drop(&mut self) {
-            let directory = self.0.directory().unwrap();
+            let directory = &self.0.directory;
             for ordinal in 0..=directory.word(2).max(directory.word(3)) / SLOTS as u64 {
                 let key = segment_key(directory.salt(), ordinal);
                 unsafe {
@@ -815,6 +1098,12 @@ mod tests {
     }
 
     #[test]
+    fn per_uid_keys_collide_only_for_uids_far_apart() {
+        // uid a's salt key is uid b's root key exactly when a ^ b is this.
+        assert!(ROOT_KEY ^ SALT_KEY >= 1 << 30);
+    }
+
+    #[test]
     fn catalog_grows_past_31000_and_reuses_indexed_reservations() {
         let catalog = TestCatalog::new();
         let mut claims = Vec::new();
@@ -830,11 +1119,11 @@ mod tests {
             catalog.0.claim("dense-39999").unwrap_err().kind(),
             io::ErrorKind::AddrInUse
         );
-        let allocated = catalog.0.directory().unwrap().word(2);
+        let allocated = catalog.0.directory.word(2);
         let old = claims.pop().unwrap().entry.token.clone();
         let replacement = catalog.0.claim("dense-39999").unwrap();
         assert_ne!(replacement.entry.token, old);
-        assert_eq!(catalog.0.directory().unwrap().word(2), allocated);
+        assert_eq!(catalog.0.directory.word(2), allocated);
     }
 
     #[test]
@@ -875,7 +1164,7 @@ mod tests {
             assert!(catalog.0.list().unwrap().is_empty());
             let _claim = catalog.0.claim("interrupted").unwrap();
             assert!(catalog.0.lookup("interrupted").unwrap().is_some());
-            assert_eq!(catalog.0.directory().unwrap().word(2), 1);
+            assert_eq!(catalog.0.directory.word(2), 1);
         }
     }
 
@@ -896,6 +1185,65 @@ mod tests {
         );
         header.put(0, salt);
         assert!(catalog.0.lookup("owner").unwrap().is_some());
+    }
+
+    /// kernel.shm_rmid_forced=1 destroys a segment once its last claimant
+    /// is gone, taking the chain links in its records with it. A live claim
+    /// reachable only through them must still be found, or its name could be
+    /// claimed twice.
+    #[test]
+    fn chains_through_a_lost_segment_are_rebuilt() {
+        for mode in ["destroyed", "recreated", "interrupted"] {
+            let catalog = TestCatalog::new();
+            let first = "first";
+            let bucket = hash_name(first.as_bytes()) as usize % BUCKETS;
+            let second = (0..)
+                .map(|i| format!("collision-{i}"))
+                .find(|name| hash_name(name.as_bytes()) as usize % BUCKETS == bucket)
+                .unwrap();
+            let _first = catalog.0.claim(first).unwrap();
+            // Pretend segment 0 is spent so `second` opens segment 1, ahead
+            // of `first` on the shared chain.
+            catalog.0.directory.put(2, SLOTS as u64);
+            drop(catalog.0.claim(&second).unwrap());
+            assert_eq!(catalog.0.directory.word(5 + bucket), SLOTS as u64 + 1);
+            let key = segment_key(catalog.0.directory.salt(), 1);
+            let _recreated = match mode {
+                "interrupted" => {
+                    catalog.0.directory.put(3, REBUILDING);
+                    catalog.0.directory.put(5 + bucket, 0);
+                    None
+                }
+                _ => {
+                    unsafe {
+                        let memory = libc::shmget(key, 0, 0o600);
+                        libc::shmctl(memory, libc::IPC_RMID, std::ptr::null_mut());
+                    }
+                    (mode == "recreated").then(|| {
+                        Registry::open_segment(catalog.0.directory.salt(), 1, catalog.0.lock, true)
+                            .unwrap()
+                    })
+                }
+            };
+            assert_eq!(
+                catalog.0.claim(first).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse,
+                "{mode}"
+            );
+            assert!(catalog.0.lookup(first).unwrap().is_some(), "{mode}");
+            assert_eq!(catalog.0.directory.word(3), 0, "{mode}");
+            if mode != "interrupted" {
+                assert_eq!(catalog.0.directory.word(2), 1, "{mode}");
+            }
+            let _again = catalog.0.claim(&second).unwrap();
+            assert_eq!(catalog.0.list().unwrap().len(), 2, "{mode}");
+            unsafe {
+                let sem = libc::semget(key, 0, 0o600);
+                libc::semctl(sem, 0, libc::IPC_RMID);
+                let memory = libc::shmget(key, 0, 0o600);
+                libc::shmctl(memory, libc::IPC_RMID, std::ptr::null_mut());
+            }
+        }
     }
 
     struct Helper(Child, Option<i32>);
@@ -953,13 +1301,11 @@ mod tests {
         let registry = Registry(ids[0], ids[1], ids[2]);
         let mode = std::env::var("SANDLOCK_TEST_SEM_MODE").unwrap();
         if mode.starts_with("index-") {
-            let catalog = Catalog {
-                lock: registry.0,
-                metadata: registry.1,
-            };
+            let catalog = Catalog::attached(registry.0, registry.1);
             let _lock = registry.lock().unwrap();
-            let directory = catalog.directory().unwrap();
-            let segment = catalog.segment(&directory, 0, true).unwrap();
+            let directory = &catalog.directory;
+            let mut segments = Segments::new(&catalog);
+            let segment = segments.get(0, true).unwrap().unwrap();
             let bucket = hash_name(b"interrupted") as usize % BUCKETS;
             directory.put(4, bucket as u64);
             directory.put(3, 1);
@@ -970,7 +1316,7 @@ mod tests {
                 next: 0,
             };
             record.name[..11].copy_from_slice(b"interrupted");
-            Mapping::attach(segment.1, false).unwrap().write(0, record);
+            segment.memory.write(0, record);
             if mode != "index-before-head" {
                 directory.put(5 + bucket, 1);
             }
