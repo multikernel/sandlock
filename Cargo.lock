@@ -2476,9 +2476,9 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zrip"
-version = "0.8.25"
+version = "0.8.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad872a715cf5f5cb507dd31e98b27d668bf134148ad289cedeb0ffb63210a40d"
+checksum = "fc4817f8fb23f571614c4b74c711edd092d3bdf595da0d3804d0ae52eeedb444"
 dependencies = [
  "zrip-core",
  "zrip-decode",
@@ -2503,9 +2503,9 @@ dependencies = [
 
 [[package]]
 name = "zrip-encode"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "087d47dbc4a7c2a6bd758cb48ab3e401a7be4cfdb92776ea1deb3c3918b434a7"
+checksum = "1fa7e8c9045bb66f4ae6bfbde0a343c58118f3a285096a6b6cf4297e61ef12e0"
 dependencies = [
  "fearless_simd",
  "zrip-core",
