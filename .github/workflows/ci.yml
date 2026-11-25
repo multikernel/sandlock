@@ -78,12 +78,12 @@ jobs:
           if [ "$FEATURE" != minimal ]; then args+=(--features "$FEATURE"); fi
           cargo tree --workspace "${args[@]}" -e normal --prefix none > /tmp/dependencies.txt
           case "$FEATURE" in
-            minimal) forbidden='bincode|toml|tar|flate2|ruzstd|base64|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
-            http) forbidden='bincode|toml|tar|flate2|ruzstd|walkdir|pathdiff|bollard' ;;
-            checkpoint) forbidden='toml|tar|flate2|ruzstd|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
+            minimal) forbidden='bincode|toml|tar|flate2|zrip|base64|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
+            http) forbidden='bincode|toml|tar|flate2|zrip|walkdir|pathdiff|bollard' ;;
+            checkpoint) forbidden='toml|tar|flate2|zrip|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
             image) forbidden='bincode|toml|rcgen' ;;
-            profiles) forbidden='bincode|tar|flate2|ruzstd|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
-            cow) forbidden='bincode|toml|tar|flate2|ruzstd|hyper|rustls|rcgen|bollard' ;;
+            profiles) forbidden='bincode|tar|flate2|zrip|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
+            cow) forbidden='bincode|toml|tar|flate2|zrip|hyper|rustls|rcgen|bollard' ;;
           esac
           if grep -E "^($forbidden) " /tmp/dependencies.txt; then exit 1; fi
       - name: Test selected features
