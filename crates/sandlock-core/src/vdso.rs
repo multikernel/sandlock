@@ -94,18 +94,24 @@ fn arm64_b_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
     Ok(0x14000000u32 | ((offset as u32) & 0x03FF_FFFF))
 }
 
-/// Compute the offset within the vDSO mapping where the trampoline area starts —
-/// just past the last symbol, rounded up to a 16-byte boundary.
+/// Offset within the vDSO mapping where the trampoline area starts, rounded up
+/// to a 16-byte boundary.
+///
+/// It must clear the whole ELF image, not just the exported symbols: the vDSO
+/// keeps unexported code after them (riscv64 `__vdso_getrandom` calls a local
+/// ChaCha routine placed past its own end).
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn vdso_tramp_start(vdso_bytes: &[u8]) -> Option<u64> {
     let elf = goblin::elf::Elf::parse(vdso_bytes).ok()?;
-    let highest_end = elf
-        .dynsyms
+    let load_end = elf
+        .program_headers
         .iter()
-        .filter(|s| s.st_value != 0)
-        .map(|s| s.st_value + s.st_size)
+        .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
+        .map(|ph| ph.p_vaddr + ph.p_memsz.max(ph.p_filesz))
         .max()?;
-    Some((highest_end + 15) & !15)
+    let header = &elf.header;
+    let section_table_end = header.e_shoff + header.e_shnum as u64 * header.e_shentsize as u64;
+    Some((load_end.max(section_table_end) + 15) & !15)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -521,7 +527,9 @@ pub(crate) fn patch(
     // mapping and patch each function entry with a single 4-byte jump to its stub.
     // x86_64: stubs are short and inter-symbol gaps are wide; patch inline.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    let mut tramp_offset = vdso_tramp_start(&vdso_bytes).unwrap_or(0);
+    let mut tramp_offset = vdso_tramp_start(&vdso_bytes).ok_or_else(|| {
+        SandlockError::MemoryProtect("failed to locate free space in the vDSO".into())
+    })?;
 
     for (name, alt_name, syscall_nr) in vdso_targets() {
         if let Some(&offset) = symbols.get(name).or_else(|| symbols.get(alt_name)) {
