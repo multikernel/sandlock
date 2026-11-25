@@ -1143,17 +1143,15 @@ fn memfd_with_patched_interp(
 
 fn open_exec_by_path(
     notif: &SeccompNotif,
-    dirfd: i64,
+    dirfd: i32,
     rel_path: String,
     ctx: &ChrootCtx<'_>,
 ) -> Result<(RawFd, PathBuf), i32> {
-    // The kernel reads dirfd as an int; drop any junk in the upper 32 bits.
-    let dirfd = dirfd as i32 as i64;
     // Build the full virtual path from dirfd + relative path.
     let full_path = if Path::new(&rel_path).is_absolute() {
         rel_path
     } else {
-        let base = match dirfd as i32 {
+        let base = match dirfd {
             libc::AT_FDCWD => virtual_cwd_of(notif, ctx),
             _ => std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd))
                 .ok()
@@ -1272,7 +1270,7 @@ const MAX_SCRIPT_DEPTH: usize = 5;
 fn check_interp_chain(notif: &SeccompNotif, ctx: &ChrootCtx<'_>, interp: &str) -> Result<(), i32> {
     let mut interp = interp.to_string();
     for _ in 0..MAX_SCRIPT_DEPTH {
-        let (fd, _) = open_exec_by_path(notif, libc::AT_FDCWD as i64, interp, ctx)?;
+        let (fd, _) = open_exec_by_path(notif, libc::AT_FDCWD, interp, ctx)?;
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         match read_shebang(fd.as_raw_fd()) {
             Some(next) => interp = next.interp,
@@ -1337,14 +1335,15 @@ pub(crate) async fn handle_chroot_exec(
     let nr = notif.data.nr as i64;
     let (dirfd, path_ptr, argv_ptr, envp_ptr) = if nr == libc::SYS_execveat {
         (
-            notif.data.args[0] as i64,
+            // The kernel reads dirfd as an int; junk in the upper 32 bits is ignored.
+            notif.data.args[0] as i32,
             notif.data.args[1],
             notif.data.args[2],
             notif.data.args[3],
         )
     } else {
         (
-            libc::AT_FDCWD as i64,
+            libc::AT_FDCWD,
             notif.data.args[0],
             notif.data.args[1],
             notif.data.args[2],
@@ -1361,9 +1360,8 @@ pub(crate) async fn handle_chroot_exec(
     } else {
         0
     };
-    let dirfd = dirfd as i32 as i64;
     // What the kernel's alloc_bprm() hands a script's interpreter as the script.
-    let exec_name = if rel_path.starts_with('/') || dirfd == libc::AT_FDCWD as i64 {
+    let exec_name = if rel_path.starts_with('/') || dirfd == libc::AT_FDCWD {
         rel_path.clone()
     } else if rel_path.is_empty() {
         format!("/dev/fd/{dirfd}")
@@ -1371,7 +1369,7 @@ pub(crate) async fn handle_chroot_exec(
         format!("/dev/fd/{dirfd}/{rel_path}")
     };
     let opened = if rel_path.is_empty() && flags & libc::AT_EMPTY_PATH != 0 {
-        open_exec_by_fd(notif, dirfd as i32, ctx)
+        open_exec_by_fd(notif, dirfd, ctx)
     } else {
         open_exec_by_path(notif, dirfd, rel_path, ctx)
     };
