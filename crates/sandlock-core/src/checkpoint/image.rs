@@ -391,16 +391,8 @@ mod tests {
     }
 
     fn round_trip_policy(policy: Sandbox) -> Sandbox {
-        let dir = std::env::temp_dir().join(format!(
-            "sandlock-mode-{}-{}",
-            std::process::id(),
-            // Use nanos to avoid collisions when tests run in parallel.
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("image");
         let checkpoint = Checkpoint {
             name: "mode-test".into(),
             policy,
@@ -411,9 +403,7 @@ mod tests {
         };
 
         checkpoint.save(&dir).unwrap();
-        let loaded = Checkpoint::load(&dir).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        loaded.policy
+        Checkpoint::load(&dir).unwrap().policy
     }
 
     #[test]
