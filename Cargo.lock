@@ -442,12 +442,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
 
 [[package]]
-name = "fearless_simd"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "629c9d6b6f30b5604089e0980f4d924a013aacb1654a6cdf5d3d852224f68651"
-
-[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2497,7 +2491,6 @@ version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01c0749875821430cad5671129c1c6414966ef30380144a82bb21771c4687e0a"
 dependencies = [
- "fearless_simd",
  "zrip-core",
 ]
 
@@ -2507,6 +2500,5 @@ version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa7e8c9045bb66f4ae6bfbde0a343c58118f3a285096a6b6cf4297e61ef12e0"
 dependencies = [
- "fearless_simd",
  "zrip-core",
 ]
