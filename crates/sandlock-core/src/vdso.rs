@@ -49,8 +49,9 @@ fn read_proc_mem(pid: i32, addr: u64, len: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Parse vDSO ELF bytes and return a map of symbol name -> offset from ELF base.
-fn parse_vdso_symbols(vdso_bytes: &[u8]) -> HashMap<String, u64> {
+/// Parse vDSO ELF bytes and return a map of symbol name -> (offset from ELF
+/// base, size in bytes).
+fn parse_vdso_symbols(vdso_bytes: &[u8]) -> HashMap<String, (u64, u64)> {
     let mut symbols = HashMap::new();
 
     if let Ok(elf) = goblin::elf::Elf::parse(vdso_bytes) {
@@ -58,7 +59,7 @@ fn parse_vdso_symbols(vdso_bytes: &[u8]) -> HashMap<String, u64> {
             if sym.st_value != 0 {
                 if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
                     if !name.is_empty() {
-                        symbols.insert(name.to_string(), sym.st_value);
+                        symbols.insert(name.to_string(), (sym.st_value, sym.st_size));
                     }
                 }
             }
@@ -94,13 +95,26 @@ fn arm64_b_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
     Ok(0x14000000u32 | ((offset as u32) & 0x03FF_FFFF))
 }
 
+/// Encode an x86-64 `jmp rel32` located at `from`, reaching ±2 GiB.
+#[cfg(target_arch = "x86_64")]
+fn x86_jmp_insn(from: u64, to: u64) -> Result<[u8; 5], SandlockError> {
+    let rel = i32::try_from(to as i64 - (from as i64 + 5)).map_err(|_| {
+        SandlockError::MemoryProtect(format!(
+            "x86_64 jmp {:#x}->{:#x} out of ±2 GiB range",
+            from, to
+        ))
+    })?;
+    let mut insn = [0xE9, 0, 0, 0, 0];
+    insn[1..].copy_from_slice(&rel.to_le_bytes());
+    Ok(insn)
+}
+
 /// Offset within the vDSO mapping where the trampoline area starts, rounded up
 /// to a 16-byte boundary.
 ///
 /// It must clear the whole ELF image, not just the exported symbols: the vDSO
 /// keeps unexported code after them (riscv64 `__vdso_getrandom` calls a local
 /// ChaCha routine placed past its own end).
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn vdso_tramp_start(vdso_bytes: &[u8]) -> Option<u64> {
     let elf = goblin::elf::Elf::parse(vdso_bytes).ok()?;
     let load_end = elf
@@ -525,14 +539,19 @@ pub(crate) fn patch(
 
     // arm64/riscv64: place full stubs in slack space at the tail of the vDSO
     // mapping and patch each function entry with a single 4-byte jump to its stub.
-    // x86_64: stubs are short and inter-symbol gaps are wide; patch inline.
+    // x86_64: patch inline when the stub fits inside the function. Some kernels
+    // export entries that are only a 5-byte jmp to shared code, and a longer
+    // stub there would run into the next function, so it goes to the tail
+    // behind a 5-byte jmp instead.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let mut tramp_offset = vdso_tramp_start(&vdso_bytes).ok_or_else(|| {
         SandlockError::MemoryProtect("failed to locate free space in the vDSO".into())
     })?;
+    #[cfg(target_arch = "x86_64")]
+    let mut tramp_offset = vdso_tramp_start(&vdso_bytes);
 
     for (name, alt_name, syscall_nr) in vdso_targets() {
-        if let Some(&offset) = symbols.get(name).or_else(|| symbols.get(alt_name)) {
+        if let Some(&(offset, _size)) = symbols.get(name).or_else(|| symbols.get(alt_name)) {
             let entry_addr = base + offset;
             let stub = match (time_offset_secs, name) {
                 (Some(off), "clock_gettime") => offset_stub_clock_gettime(off),
@@ -542,18 +561,41 @@ pub(crate) fn patch(
 
             #[cfg(target_arch = "x86_64")]
             {
-                mem.seek(SeekFrom::Start(entry_addr)).map_err(|e| {
-                    SandlockError::MemoryProtect(format!(
-                        "failed to seek to {} at {:#x}: {}",
-                        name, entry_addr, e
-                    ))
-                })?;
-                mem.write_all(&stub).map_err(|e| {
-                    SandlockError::MemoryProtect(format!(
-                        "failed to write {} stub at {:#x}: {}",
-                        name, entry_addr, e
-                    ))
-                })?;
+                // A size of 0 means the kernel did not record one: patch
+                // inline as before rather than give up on the symbol.
+                let writes = if _size == 0 || stub.len() as u64 <= _size {
+                    vec![(entry_addr, stub)]
+                } else {
+                    let start = tramp_offset.ok_or_else(|| {
+                        SandlockError::MemoryProtect(
+                            "failed to locate free space in the vDSO".into(),
+                        )
+                    })?;
+                    if _size < 5 || start + stub.len() as u64 > mapping_size {
+                        return Err(SandlockError::MemoryProtect(format!(
+                            "no room for the {} stub: entry is {} bytes, trampoline needs {} bytes at offset {:#x}, mapping ends at {:#x}",
+                            name, _size, stub.len(), start, mapping_size
+                        )));
+                    }
+                    let tramp_addr = base + start;
+                    tramp_offset = Some((start + stub.len() as u64 + 15) & !15);
+                    let jmp = x86_jmp_insn(entry_addr, tramp_addr)?;
+                    vec![(tramp_addr, stub), (entry_addr, jmp.to_vec())]
+                };
+                for (addr, bytes) in writes {
+                    mem.seek(SeekFrom::Start(addr)).map_err(|e| {
+                        SandlockError::MemoryProtect(format!(
+                            "failed to seek to {} at {:#x}: {}",
+                            name, addr, e
+                        ))
+                    })?;
+                    mem.write_all(&bytes).map_err(|e| {
+                        SandlockError::MemoryProtect(format!(
+                            "failed to write {} stub at {:#x}: {}",
+                            name, addr, e
+                        ))
+                    })?;
+                }
             }
 
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -628,6 +670,21 @@ mod tests {
             "Expected clock_gettime in vDSO symbols, found: {:?}",
             symbols.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_x86_jmp_insn() {
+        // rel32 counts from the end of the 5-byte instruction.
+        assert_eq!(
+            x86_jmp_insn(0x1230, 0x1f20).unwrap(),
+            [0xE9, 0xEB, 0x0C, 0x00, 0x00]
+        );
+        assert_eq!(
+            x86_jmp_insn(0x1f20, 0x1230).unwrap(),
+            [0xE9, 0x0B, 0xF3, 0xFF, 0xFF]
+        );
+        assert!(x86_jmp_insn(0, 1 << 32).is_err());
     }
 
     #[test]

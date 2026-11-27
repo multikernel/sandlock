@@ -131,6 +131,56 @@ async fn test_time_start_basic_commands_work() {
     assert!(result.success());
 }
 
+/// The time_start stubs are longer than some vDSO entry points: on recent
+/// kernels __vdso_gettimeofday and __vdso_clock_gettime are a bare 5-byte jmp
+/// with __vdso_time and __vdso_clock_getres right behind them. Patching the
+/// stubs in place ran them into those neighbours, so gettimeofday returned
+/// the time(2) result and clock_getres returned garbage without filling in
+/// the resolution.
+#[tokio::test]
+async fn test_time_start_leaves_neighbouring_vdso_calls_working() {
+    let y2k = SystemTime::UNIX_EPOCH + Duration::from_secs(961027200);
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .time_start(y2k)
+        .build()
+        .unwrap();
+    let script = r#"
+import ctypes, time
+libc = ctypes.CDLL(None)
+class Pair(ctypes.Structure):
+    _fields_ = [('sec', ctypes.c_long), ('frac', ctypes.c_long)]
+tv = Pair()
+ret = libc.gettimeofday(ctypes.byref(tv), None)
+print('gettimeofday', ret, time.gmtime(tv.sec).tm_year)
+res = Pair(-1, -1)
+ret = libc.clock_getres(time.CLOCK_MONOTONIC, ctypes.byref(res))
+print('clock_getres', ret, res.sec == 0 and res.frac > 0)
+print('clock_gettime', time.gmtime(time.time()).tm_year)
+"#;
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+    let stdout = result.stdout_str().unwrap_or("");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "gettimeofday 0 2000",
+            "clock_getres 0 True",
+            "clock_gettime 2000"
+        ]
+    );
+}
+
 /// Test combining random_seed and time_start.
 #[tokio::test]
 async fn test_combined_determinism() {
