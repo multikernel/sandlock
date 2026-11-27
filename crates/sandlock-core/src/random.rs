@@ -90,7 +90,7 @@ pub(crate) fn handle_random_open(
     // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
     Some(NotifAction::InjectFdSend {
         srcfd: memfd,
-        newfd_flags: libc::O_CLOEXEC as u32,
+        newfd_flags: crate::seccomp::notif::open_newfd_flags(open.args.flags),
     })
 }
 

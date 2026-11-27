@@ -57,7 +57,10 @@ pub(crate) fn handle_ca_inject_open(
     let child_view = format!("/proc/{}/root{}", notif.pid, resolved.to_str()?);
     let original = std::fs::read(&child_view).ok()?;
     let combined = combine_bundle(&original, ca_pem);
-    Some(NotifAction::inject_bytes(&combined))
+    Some(NotifAction::inject_bytes_for_open(
+        &combined,
+        open.args.flags,
+    ))
 }
 
 #[cfg(test)]

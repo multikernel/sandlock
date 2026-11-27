@@ -294,6 +294,28 @@ impl NotifAction {
             Err(_) => NotifAction::Errno(libc::EIO),
         }
     }
+
+    /// [`inject_bytes`](Self::inject_bytes) as the answer to an open: the fd
+    /// is close-on-exec only when the child's open `flags` asked for it.
+    pub(crate) fn inject_bytes_for_open(content: &[u8], flags: u64) -> NotifAction {
+        match Self::inject_bytes(content) {
+            NotifAction::InjectFdSend { srcfd, .. } => NotifAction::InjectFdSend {
+                srcfd,
+                newfd_flags: open_newfd_flags(flags),
+            },
+            other => other,
+        }
+    }
+}
+
+/// The `newfd_flags` for an fd injected as an open's result: `O_CLOEXEC`
+/// when the child's open flags carry it, nothing otherwise.
+pub(crate) fn open_newfd_flags(flags: u64) -> u32 {
+    if flags & libc::O_CLOEXEC as u64 != 0 {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    }
 }
 
 /// Create an anonymous in-memory file ("memfd") populated with `content` and
@@ -915,14 +937,9 @@ pub(crate) fn inject_open_result(raw_fd: i32, flags: u64) -> NotifAction {
         return NotifAction::Errno(last_errno(libc::EACCES));
     }
     let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
-        libc::O_CLOEXEC as u32
-    } else {
-        0
-    };
     NotifAction::InjectFdSend {
         srcfd: owned,
-        newfd_flags,
+        newfd_flags: open_newfd_flags(flags),
     }
 }
 
@@ -967,7 +984,7 @@ async fn reopen_existing_on_behalf(
     if let Some(file) = crate::procfs::virtual_file(&realpath.to_string_lossy(), policy) {
         let content =
             crate::procfs::render_virtual_file(file, processes, &ctx.resource, policy).await;
-        return NotifAction::inject_bytes(&content);
+        return NotifAction::inject_bytes_for_open(&content, flags);
     }
     // Resolution-only flags are stripped from the reopen.
     let reopen_flags =

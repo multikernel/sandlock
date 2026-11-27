@@ -39,8 +39,8 @@ use tokio::sync::Mutex;
 use crate::sandbox::Uname;
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{
-    content_memfd, dup_fd_from_pid, inject_open_result, openat2_at, write_child_mem, NotifAction,
-    NotifPolicy, OpenArgs, OpenRequest,
+    content_memfd, dup_fd_from_pid, inject_open_result, open_newfd_flags, openat2_at,
+    write_child_mem, NotifAction, NotifPolicy, OpenArgs, OpenRequest,
 };
 use crate::seccomp::state::ProcessIndex;
 use crate::sys::structs::{SeccompNotif, EACCES};
@@ -651,11 +651,11 @@ pub(crate) fn generate_proc_mountstats(
     buf.into_bytes()
 }
 
-fn inject_memfd(content: &[u8]) -> NotifAction {
+fn inject_memfd(content: &[u8], flags: u64) -> NotifAction {
     match content_memfd(content, true) {
         Ok(fd) => NotifAction::InjectFdSend {
             srcfd: fd,
-            newfd_flags: libc::O_CLOEXEC as u32,
+            newfd_flags: open_newfd_flags(flags),
         },
         Err(_) => NotifAction::Continue, // fallback: let real open proceed
     }
@@ -691,7 +691,7 @@ pub(crate) async fn handle_proc_open(
     if path.starts_with("/proc/") || path.starts_with("/sys/") {
         if let Some(file) = virtual_file(path, policy) {
             let content = render_virtual_file(file, processes, resource, policy).await;
-            return inject_memfd(&content);
+            return inject_memfd(&content, open.args.flags);
         }
     }
 
@@ -1179,7 +1179,10 @@ pub(crate) fn handle_hostname_open(open: &OpenRequest, hostname: &str) -> Option
     if open.target.as_deref() != Some(std::path::Path::new("/etc/hostname")) {
         return None;
     }
-    Some(inject_memfd(format!("{}\n", hostname).as_bytes()))
+    Some(inject_memfd(
+        format!("{}\n", hostname).as_bytes(),
+        open.args.flags,
+    ))
 }
 
 /// Answer an open of /etc/hosts with the virtual file: a fixed loopback view
@@ -1192,7 +1195,7 @@ pub(crate) fn handle_etc_hosts_open(
     if open.target.as_deref() != Some(std::path::Path::new("/etc/hosts")) {
         return None;
     }
-    Some(inject_memfd(etc_hosts_content.as_bytes()))
+    Some(inject_memfd(etc_hosts_content.as_bytes(), open.args.flags))
 }
 
 /// Lexical normalization of `(pid, dirfd, path)`:
