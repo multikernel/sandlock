@@ -730,3 +730,43 @@ s = original
     )
     .await;
 }
+
+/// socket(2) applies SOCK_NONBLOCK and SOCK_CLOEXEC to the descriptor it
+/// returns, and the virtual NETLINK_ROUTE socket has to honor them too. It
+/// came back blocking and close-on-exec whatever the caller asked for, so a
+/// non-blocking reader such as Python with SOCK_NONBLOCK, which trusts the
+/// flag and never calls fcntl, hung in recv once the replies ran out.
+#[tokio::test]
+async fn netlink_socket_honors_creation_flags() {
+    let script = r#"
+import ctypes, fcntl, os, socket
+libc = ctypes.CDLL(None, use_errno=True)
+out = []
+for extra in (0, socket.SOCK_NONBLOCK, socket.SOCK_CLOEXEC):
+    fd = libc.socket(socket.AF_NETLINK, socket.SOCK_RAW | extra, socket.NETLINK_ROUTE)
+    assert fd >= 0, ctypes.get_errno()
+    nonblock = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK != 0
+    cloexec = fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC != 0
+    out.append('%d%d' % (nonblock, cloexec))
+    os.close(fd)
+s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK, socket.NETLINK_ROUTE)
+try:
+    s.recv(4096)
+    out.append('data')
+except BlockingIOError:
+    out.append('EAGAIN')
+print(' '.join(out))
+"#;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        base_policy()
+            .build()
+            .unwrap()
+            .run(&["python3", "-c", script]),
+    )
+    .await
+    .expect("recv on a SOCK_NONBLOCK netlink socket blocked")
+    .unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+    assert_eq!(result.stdout_str().unwrap_or("").trim(), "00 10 01 EAGAIN");
+}

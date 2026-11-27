@@ -101,6 +101,7 @@ fn bind_kernel_like_address(fd: RawFd) -> std::io::Result<()> {
 /// else (and non-NETLINK_ROUTE netlink protocols) returns EAFNOSUPPORT.
 pub async fn handle_socket(notif: &SeccompNotif, state: &Arc<NetlinkState>) -> NotifAction {
     let domain = notif.data.args[0];
+    let sock_type = notif.data.args[1] as i32;
     let protocol = notif.data.args[2];
 
     if !family_allowed(domain) {
@@ -129,12 +130,15 @@ pub async fn handle_socket(notif: &SeccompNotif, state: &Arc<NetlinkState>) -> N
     // fds[1] → child side (injected)
     //
     // The supervisor end is driven by a tokio task via AsyncFd, so it
-    // must be non-blocking. The child end stays blocking (glibc's
-    // netlink code expects blocking semantics).
+    // must be non-blocking. The child end takes the SOCK_NONBLOCK the
+    // child passed to socket(2); glibc's netlink code passes none and
+    // expects blocking semantics.
     let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
     if flags < 0
         || unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
         || bind_kernel_like_address(fds[0]).is_err()
+        || (sock_type & libc::SOCK_NONBLOCK != 0
+            && unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) } < 0)
     {
         unsafe {
             libc::close(fds[0]);
@@ -155,7 +159,11 @@ pub async fn handle_socket(notif: &SeccompNotif, state: &Arc<NetlinkState>) -> N
     proxy::spawn_responder(responder_fd, port_id, registration);
     NotifAction::InjectFdSend {
         srcfd: child_fd,
-        newfd_flags: libc::O_CLOEXEC as u32,
+        newfd_flags: if sock_type & libc::SOCK_CLOEXEC != 0 {
+            libc::O_CLOEXEC as u32
+        } else {
+            0
+        },
     }
 }
 
