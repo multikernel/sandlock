@@ -113,6 +113,39 @@ async fn test_time_start_frozen() {
     );
 }
 
+/// time(2) is a vDSO call on x86_64, and libc's time(), Python's argument-less
+/// time.gmtime() and many C programs read the clock through it. It has to
+/// report the shifted wall clock like clock_gettime and gettimeofday do.
+#[tokio::test]
+async fn test_time_start_shifts_time_call() {
+    let y2k = SystemTime::UNIX_EPOCH + Duration::from_secs(961027200);
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .time_start(y2k)
+        .build()
+        .unwrap();
+    let script = r#"
+import ctypes, time
+libc = ctypes.CDLL(None)
+libc.time.restype = ctypes.c_long
+stored = ctypes.c_long()
+returned = libc.time(ctypes.byref(stored))
+print(time.gmtime(returned).tm_year, time.gmtime(stored.value).tm_year, time.gmtime().tm_year)
+"#;
+    let result = policy
+        .clone()
+        .run(&["python3", "-c", script])
+        .await
+        .unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+    assert_eq!(result.stdout_str().unwrap_or("").trim(), "2000 2000 2000");
+}
+
 /// Test that time_start doesn't break basic command execution.
 #[tokio::test]
 async fn test_time_start_basic_commands_work() {
