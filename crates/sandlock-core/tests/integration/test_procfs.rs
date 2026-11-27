@@ -1867,3 +1867,33 @@ print('OK')
         .unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
 }
+
+/// A virtual file comes back from a memfd the supervisor injects, and that
+/// fd has to carry the child's own O_CLOEXEC choice. Forcing it on closed
+/// the descriptor across exec, so a program that opened /etc/hosts,
+/// /proc/cpuinfo or a seeded /dev/urandom for a child it was about to exec
+/// handed over nothing.
+#[tokio::test]
+async fn test_virtual_files_keep_the_callers_cloexec_choice() {
+    let script = r#"
+import ctypes, fcntl, os
+libc = ctypes.CDLL(None, use_errno=True)
+out = []
+for path in (b'/proc/cpuinfo', b'/etc/hosts', b'/dev/urandom'):
+    for flags in (os.O_RDONLY, os.O_RDONLY | os.O_CLOEXEC):
+        fd = libc.open(path, flags)
+        assert fd >= 0, (path, ctypes.get_errno())
+        out.append(str(fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC))
+        os.close(fd)
+print(' '.join(out))
+"#;
+    let mut policy = proc_grant()
+        .fs_read("/dev")
+        .num_cpus(1)
+        .random_seed(1)
+        .build()
+        .unwrap();
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+    assert_eq!(result.stdout_str().unwrap_or("").trim(), "0 1 0 1 0 1");
+}
