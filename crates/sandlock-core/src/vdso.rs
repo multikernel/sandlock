@@ -232,6 +232,33 @@ fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     stub
 }
 
+/// Generate an offset stub for time(tloc) that forces a real syscall, then adds
+/// the time offset to the returned seconds and, when `tloc` is non-NULL, stores
+/// them over the unshifted value the kernel wrote there. The syscall preserves
+/// rdi, so `tloc` is still in place afterwards.
+///
+/// Layout (x86-64), 29 bytes:
+///   mov eax, 201 / syscall          ; real time(tloc)
+///   movabs rcx, offset_secs
+///   add  rax, rcx                   ; shifted seconds
+///   test rdi, rdi / je +3           ; tloc == NULL -> ret
+///   mov  [rdi], rax
+///   ret
+#[cfg(target_arch = "x86_64")]
+fn offset_stub_time(offset_secs: i64) -> Vec<u8> {
+    let mut stub = Vec::new();
+    stub.extend_from_slice(&[0xB8, 0xC9, 0x00, 0x00, 0x00]); // mov eax, 201
+    stub.extend_from_slice(&[0x0F, 0x05]); // syscall
+    stub.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, imm64
+    stub.extend_from_slice(&offset_secs.to_le_bytes());
+    stub.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
+    stub.extend_from_slice(&[0x48, 0x85, 0xFF]); // test rdi, rdi (tloc == NULL?)
+    stub.extend_from_slice(&[0x74, 0x03]); // je +3 -> ret (skip the store)
+    stub.extend_from_slice(&[0x48, 0x89, 0x07]); // mov [rdi], rax
+    stub.push(0xC3); // ret
+    stub
+}
+
 #[cfg(target_arch = "aarch64")]
 fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
     let mut stub = Vec::new();
@@ -500,8 +527,8 @@ fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
 }
 
 /// Patch the vDSO of a target process to force real syscalls (interceptable by seccomp).
-/// If `time_offset_secs` is provided, clock_gettime and gettimeofday stubs will add
-/// the offset to the returned time.
+/// If `time_offset_secs` is provided, the clock_gettime, gettimeofday and (on
+/// x86_64) time stubs will add the offset to the returned time.
 pub(crate) fn patch(
     pid: i32,
     time_offset_secs: Option<i64>,
@@ -537,6 +564,8 @@ pub(crate) fn patch(
             let stub = match (time_offset_secs, name) {
                 (Some(off), "clock_gettime") => offset_stub_clock_gettime(off),
                 (Some(off), "gettimeofday") => offset_stub_gettimeofday(off),
+                #[cfg(target_arch = "x86_64")]
+                (Some(off), "time") => offset_stub_time(off),
                 _ => simple_stub(syscall_nr),
             };
 
@@ -821,6 +850,38 @@ mod tests {
             stub_fn(std::ptr::null_mut(), std::ptr::null_mut()),
             0,
             "NULL timeval handled without fault"
+        );
+
+        unsafe {
+            libc::munmap(page, EXEC_PAGE);
+        }
+    }
+
+    /// Execute the generated `time` offset stub: the seconds it returns and the
+    /// seconds it stores through `tloc` are both shifted by the embedded offset,
+    /// and a NULL `tloc` takes the stub's NULL branch without a store.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn offset_stub_time_executes_and_shifts_seconds() {
+        const OFFSET: i64 = -86_400; // one day back
+        let page = map_executable(&offset_stub_time(OFFSET));
+        let stub_fn: extern "C" fn(*mut libc::time_t) -> libc::time_t =
+            unsafe { std::mem::transmute(page) };
+
+        let real = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut stored: libc::time_t = 0;
+        let returned = stub_fn(&mut stored);
+        assert!(
+            (real - returned - (-OFFSET)).abs() <= 2,
+            "time() should be shifted by {OFFSET}s, real={real} stub={returned}"
+        );
+        assert_eq!(stored, returned, "tloc receives the shifted seconds");
+        assert_eq!(offset_stub_time(OFFSET).len(), 29);
+
+        let returned = stub_fn(std::ptr::null_mut());
+        assert!(
+            (real - returned - (-OFFSET)).abs() <= 2,
+            "NULL tloc handled without fault, real={real} stub={returned}"
         );
 
         unsafe {
