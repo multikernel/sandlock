@@ -9,11 +9,11 @@ use std::os::unix::io::RawFd;
 
 const TIMER_ABSTIME: u64 = 1;
 
-// Monotonic clocks whose absolute deadlines need un-shifting
-const CLOCK_MONOTONIC: u32 = 1;
-const CLOCK_MONOTONIC_RAW: u32 = 4;
-const CLOCK_MONOTONIC_COARSE: u32 = 6;
-const CLOCK_BOOTTIME: u32 = 7;
+/// The clocks the vDSO stubs shift. An absolute deadline the child computed
+/// from one of them carries the offset; every other clock reads real time.
+fn is_shifted_clock(clockid: i64) -> bool {
+    clockid == libc::CLOCK_REALTIME as i64 || clockid == libc::CLOCK_REALTIME_COARSE as i64
+}
 
 /// Calculate the time offset in seconds.
 /// offset = desired_start_time - current_real_time
@@ -36,9 +36,10 @@ fn epoch_secs(t: SystemTime) -> i64 {
 
 /// Handle clock_nanosleep/timerfd_settime/timer_settime with TIMER_ABSTIME.
 ///
-/// For absolute monotonic timers, the child computed the deadline using a
-/// vDSO-shifted clock (offset was added). We subtract the offset here so the
-/// kernel receives the correct real deadline.
+/// An absolute deadline on CLOCK_REALTIME was computed from the vDSO-shifted
+/// wall clock (offset added), so the offset is subtracted here and the kernel
+/// receives the real deadline. The monotonic and CPU-time clocks are never
+/// shifted, so their deadlines pass through untouched.
 ///
 /// Continue safety (issue #27): every `Continue` in this function is safe.
 /// This handler does virtual-time correctness, not access control — it never
@@ -60,13 +61,7 @@ pub(crate) fn handle_timer(notif: &SeccompNotif, time_offset: i64, notif_fd: Raw
     }
 
     if nr == libc::SYS_clock_nanosleep as i64 {
-        let clockid = (notif.data.args[0] & 0xFFFFFFFF) as u32;
-        // Only un-shift monotonic clocks (realtime is handled differently)
-        if clockid != CLOCK_MONOTONIC
-            && clockid != CLOCK_MONOTONIC_RAW
-            && clockid != CLOCK_MONOTONIC_COARSE
-            && clockid != CLOCK_BOOTTIME
-        {
+        if !is_shifted_clock(notif.data.args[0] as i32 as i64) {
             return NotifAction::Continue;
         }
         // timespec is directly at args[2]
@@ -76,7 +71,16 @@ pub(crate) fn handle_timer(notif: &SeccompNotif, time_offset: i64, notif_fd: Raw
         }
         adjust_tv_sec(notif_fd, notif.id, notif.pid, ts_addr, time_offset);
     } else {
-        // timerfd_settime or timer_settime: it_value at offset 16 in itimerspec
+        // timerfd_settime or timer_settime: the clock was fixed when the timer
+        // was created, so look it up; it_value is at offset 16 in itimerspec.
+        let clockid = if nr == libc::SYS_timerfd_settime {
+            timerfd_clock(notif.pid, notif.data.args[0] as i32)
+        } else {
+            posix_timer_clock(notif.pid, notif.data.args[0] as i32)
+        };
+        if !clockid.is_some_and(is_shifted_clock) {
+            return NotifAction::Continue;
+        }
         let itimerspec_addr = notif.data.args[2];
         if itimerspec_addr == 0 {
             return NotifAction::Continue;
@@ -91,6 +95,30 @@ pub(crate) fn handle_timer(notif: &SeccompNotif, time_offset: i64, notif_fd: Raw
     }
 
     NotifAction::Continue
+}
+
+/// The clock of timerfd `fd`, from the `clockid:` line of its fdinfo.
+fn timerfd_clock(pid: u32, fd: i32) -> Option<i64> {
+    let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("clockid:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// The clock of POSIX timer `id`, from the `ClockID:` line that follows its
+/// `ID:` line in /proc/<pid>/timers.
+fn posix_timer_clock(pid: u32, id: i32) -> Option<i64> {
+    let timers = std::fs::read_to_string(format!("/proc/{pid}/timers")).ok()?;
+    parse_timer_clock(&timers, id)
+}
+
+fn parse_timer_clock(timers: &str, id: i32) -> Option<i64> {
+    let mut lines = timers.lines();
+    lines.find(|line| line.strip_prefix("ID:").map(str::trim) == Some(&id.to_string()))?;
+    lines
+        .take_while(|line| !line.starts_with("ID:"))
+        .find_map(|line| line.strip_prefix("ClockID:"))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// Read tv_sec from child memory at `addr`, subtract `offset`, write back.
@@ -159,8 +187,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_timer_clock() {
+        let timers = "ID: 0\nsignal: 14/0000000000000000\nnotify: signal/pid.7\nClockID: 1\n\
+                      ID: 1\nsignal: 14/0000000000000000\nnotify: signal/pid.7\nClockID: -6\n\
+                      ID: 10\nsignal: 14/0000000000000000\nnotify: signal/pid.7\nClockID: 0\n";
+        assert_eq!(parse_timer_clock(timers, 0), Some(1));
+        assert_eq!(parse_timer_clock(timers, 1), Some(-6));
+        assert_eq!(parse_timer_clock(timers, 10), Some(0));
+        assert_eq!(parse_timer_clock(timers, 2), None);
+    }
+
+    #[test]
+    fn test_only_wall_clocks_are_shifted() {
+        assert!(is_shifted_clock(libc::CLOCK_REALTIME as i64));
+        assert!(is_shifted_clock(libc::CLOCK_REALTIME_COARSE as i64));
+        for clock in [
+            libc::CLOCK_MONOTONIC,
+            libc::CLOCK_MONOTONIC_RAW,
+            libc::CLOCK_BOOTTIME,
+            libc::CLOCK_PROCESS_CPUTIME_ID,
+            libc::CLOCK_TAI,
+        ] {
+            assert!(!is_shifted_clock(clock as i64), "clock {clock}");
+        }
+    }
+
+    #[test]
     fn test_adjust_arithmetic() {
-        // Monotonic clock: vDSO adds offset, so absolute deadline is shifted.
+        // Realtime clock: vDSO adds offset, so absolute deadline is shifted.
         // Un-shifting: adjusted = original - offset
         let offset: i64 = -3600; // 1 hour in past
         let shifted_deadline: i64 = 1700000000;

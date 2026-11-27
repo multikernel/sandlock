@@ -342,3 +342,75 @@ async fn test_hostname_virtualization_resists_path_bypasses() {
         );
     }
 }
+
+/// Only the wall clock is shifted under time_start: the vDSO adds the offset
+/// to CLOCK_REALTIME and leaves the monotonic clocks alone. An absolute
+/// deadline therefore needs the offset taken back out only when it was
+/// computed from CLOCK_REALTIME. Python's time.sleep() sleeps to an absolute
+/// CLOCK_MONOTONIC deadline, so shifting that one hung it for decades.
+#[tokio::test]
+async fn test_time_start_absolute_deadlines() {
+    let past = SystemTime::UNIX_EPOCH + Duration::from_secs(961027200);
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .time_start(past)
+        .build()
+        .unwrap();
+    let script = r#"
+import ctypes, os, signal, time
+libc = ctypes.CDLL(None, use_errno=True)
+CLOCK_REALTIME, CLOCK_MONOTONIC, TIMER_ABSTIME = 0, 1, 1
+class Timespec(ctypes.Structure):
+    _fields_ = [('sec', ctypes.c_long), ('nsec', ctypes.c_long)]
+def deadline(clock, delay):
+    t = time.clock_gettime_ns(clock) + int(delay * 1e9)
+    return Timespec(t // 10**9, t % 10**9)
+def elapsed(f):
+    start = time.monotonic()
+    f()
+    return time.monotonic() - start
+def nanosleep(clock):
+    ts = deadline(clock, 0.2)
+    assert libc.clock_nanosleep(clock, TIMER_ABSTIME, ctypes.byref(ts), None) == 0
+def timerfd(clock):
+    fd = libc.timerfd_create(clock, 0)
+    assert fd >= 0, ctypes.get_errno()
+    ts = (Timespec * 2)(Timespec(0, 0), deadline(clock, 0.2))
+    assert libc.timerfd_settime(fd, TIMER_ABSTIME, ts, None) == 0, ctypes.get_errno()
+    os.read(fd, 8)
+    os.close(fd)
+def posix_timer(clock):
+    timer = ctypes.c_void_p()
+    assert libc.timer_create(clock, None, ctypes.byref(timer)) == 0, ctypes.get_errno()
+    ts = (Timespec * 2)(Timespec(0, 0), deadline(clock, 0.2))
+    assert libc.timer_settime(timer, TIMER_ABSTIME, ts, None) == 0, ctypes.get_errno()
+    signal.sigwait({signal.SIGALRM})
+    libc.timer_delete(timer)
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+assert time.gmtime(time.time()).tm_year == 2000
+for name, f in [('sleep', lambda: time.sleep(0.2)),
+                ('nanosleep realtime', lambda: nanosleep(CLOCK_REALTIME)),
+                ('nanosleep monotonic', lambda: nanosleep(CLOCK_MONOTONIC)),
+                ('timerfd realtime', lambda: timerfd(CLOCK_REALTIME)),
+                ('timerfd monotonic', lambda: timerfd(CLOCK_MONOTONIC)),
+                ('timer realtime', lambda: posix_timer(CLOCK_REALTIME)),
+                ('timer monotonic', lambda: posix_timer(CLOCK_MONOTONIC))]:
+    took = elapsed(f)
+    assert 0.15 < took < 5, (name, took)
+print('OK')
+"#;
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        policy.clone().run(&["python3", "-c", script]),
+    )
+    .await
+    .expect("an absolute deadline was shifted and the sleep never ended")
+    .unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
+    assert_eq!(result.stdout_str().unwrap_or("").trim(), "OK");
+}
