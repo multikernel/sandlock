@@ -13,6 +13,7 @@ pub use crate::grant::Grant;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
 pub use crate::network::{IpCidr, NetAllow, NetDeny, NetRule, NetTarget, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
+use crate::seccomp::filter::FilterSpec;
 
 mod builder;
 pub use builder::SandboxBuilder;
@@ -2083,7 +2084,7 @@ impl Sandbox {
             let _ = crate::landlock_policy::confine(&sandbox_cfg);
 
             let features = crate::features::SandboxFeatures::from_sandbox(&sandbox_cfg, None, &[]);
-            let spec = crate::seccomp::filter::FilterSpec::deny_only(&sandbox_cfg, &features);
+            let spec = FilterSpec::deny_only(&sandbox_cfg, &features);
             let filter = match spec.assemble() {
                 Ok(f) => f,
                 Err(_) => unsafe { libc::_exit(1) },
@@ -2555,6 +2556,12 @@ impl Sandbox {
             Some(resolved_sandbox_name.as_str()),
             &handler_syscalls,
         );
+        let filter = if no_supervisor {
+            FilterSpec::no_supervisor(self, &features)
+        } else {
+            let handler_nrs: Vec<u32> = handler_syscalls.iter().map(|&nr| nr as u32).collect();
+            FilterSpec::supervised(self, &features, &handler_nrs)
+        };
 
         // Per-stream stdio wiring. Each Piped stream gets a CLOEXEC pipe whose
         // parent-side end we keep: the caller writes the child's stdin and reads
@@ -2699,8 +2706,6 @@ impl Sandbox {
             let gather_keep_fds: Vec<i32> =
                 extra_fds_copy.iter().map(|&(target, _)| target).collect();
 
-            let extra_syscalls: Vec<u32> = self.rt().handlers.iter().map(|h| h.0 as u32).collect();
-
             // In-process entrypoint (OCI PID-1) names the process from cmd[0];
             // otherwise execve the command.
             let entry = match (self.in_child_main, self.rt().exec_fd) {
@@ -2717,9 +2722,8 @@ impl Sandbox {
                 env: &child_env,
                 pipes: &pipes,
                 no_supervisor,
-                features,
+                filter: &filter,
                 keep_fds: &gather_keep_fds,
-                extra_syscalls: &extra_syscalls,
                 foreground,
             });
         }
@@ -3000,7 +3004,7 @@ impl Sandbox {
             let control_ctx = Arc::clone(&ctx);
 
             self.rt_mut().notif_handle = Some(tokio::spawn(notif::supervisor(
-                notif_fd, ctx, handlers, startup_tx,
+                notif_fd, ctx, handlers, filter, startup_tx,
             )));
             // Wait for the supervisor to register the notif fd with the IO
             // driver before we release the child to execve. Otherwise an

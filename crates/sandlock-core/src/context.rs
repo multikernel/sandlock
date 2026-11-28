@@ -6,7 +6,6 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::child_env::ChildEnv;
-use crate::features::SandboxFeatures;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf;
 use crate::seccomp::filter::FilterSpec;
@@ -214,13 +213,10 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// deny filter, parent reads `notif_fd_num = 0` and never starts a
     /// supervisor. Mirrors `Sandbox::no_supervisor`.
     pub no_supervisor: bool,
-    /// Derived before fork so the filter and the supervisor share one view.
-    pub features: SandboxFeatures,
+    /// Built before fork: the supervisor checks its handlers against the
+    /// same spec the child installs.
+    pub filter: &'a FilterSpec,
     pub keep_fds: &'a [RawFd],
-    /// Syscall numbers for which the parent registered user `Handler`s.
-    /// Merged into the child's BPF notif list so the kernel actually
-    /// raises USER_NOTIF for them.
-    pub extra_syscalls: &'a [u32],
     /// Make the child the terminal's foreground process group before exec.
     /// Only interactive (fully inherited) stdio wants this; a captured or
     /// piped run taking the foreground demotes the embedding process to a
@@ -271,9 +267,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         env,
         pipes,
         no_supervisor,
-        features,
+        filter,
         keep_fds,
-        extra_syscalls,
         foreground,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
@@ -430,15 +425,15 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
     let mut keep_fd: i32 = -1;
+    let filter = match filter.assemble() {
+        Ok(f) => f,
+        Err(e) => fail!(format!("seccomp assemble: {}", e)),
+    };
 
     if no_supervisor {
         // No-supervisor mode: deny-only kernel filter, no NEW_LISTENER.
         // BPF filters are ANDed by the kernel, so an outer filter (from a
         // wrapping sandbox) keeps tightening this layer too.
-        let filter = match FilterSpec::no_supervisor(sandbox, &features).assemble() {
-            Ok(f) => f,
-            Err(e) => fail!(format!("seccomp assemble: {}", e)),
-        };
         if let Err(e) = bpf::install_deny_filter(&filter) {
             fail!(format!("seccomp deny filter: {}", e));
         }
@@ -451,11 +446,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
     } else {
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
-        let spec = FilterSpec::supervised(sandbox, &features, extra_syscalls);
-        let filter = match spec.assemble() {
-            Ok(f) => f,
-            Err(e) => fail!(format!("seccomp assemble: {}", e)),
-        };
         let listener = match bpf::install_filter(&filter) {
             Ok(listener) => listener,
             Err(e) => {

@@ -21,6 +21,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use super::ctx::SupervisorCtx;
+use super::filter::{self, open_family_syscalls, FilterSpec};
 use super::notif::{NotifAction, NotifPolicy, OpenRequest};
 use super::state::ResourceState;
 use super::syscall::SyscallError;
@@ -167,21 +168,6 @@ pub enum HandlerError {
 ///
 /// The blocklist is whatever [`super::filter::blocklist`]
 /// resolves from Sandlock's default syscall blocklist plus policy extras.
-///
-/// Every open-family syscall a path-keyed handler must intercept to be
-/// leak-proof: `open` (legacy), `openat`, and `openat2`. A handler that
-/// only registers `openat` is bypassed by any libc that picks one of
-/// the others. The corresponding BPF notif list (in `seccomp::filter`)
-/// must register the same set so the kernel actually produces a
-/// notification — otherwise `RET_ALLOW` makes the handler unreachable.
-fn open_family_syscalls() -> Vec<i64> {
-    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2];
-    if let Some(legacy_open) = arch::sys_open() {
-        v.push(legacy_open);
-    }
-    v
-}
-
 /// Takes only the syscall numbers because that's all it needs to check.
 /// Called from the `run_with_handlers` entry points before any
 /// handler is registered against the dispatch table.
@@ -242,6 +228,12 @@ impl DispatchTable {
             })
             .handlers
             .push(handler);
+    }
+
+    /// A syscall with a handler the kernel never notifies: the filter allows
+    /// it, so the handler would silently never run.
+    pub(crate) fn unreachable_under(&self, filter: &FilterSpec) -> Option<i64> {
+        self.chains.keys().copied().find(|&nr| !filter.notifies(nr))
     }
 
     /// The handler chain for a notification, not yet started.
@@ -314,6 +306,7 @@ pub(crate) fn build_dispatch_table(
     policy: &Arc<NotifPolicy>,
     resource: &Arc<Mutex<ResourceState>>,
     ctx: &Arc<SupervisorCtx>,
+    spec: &FilterSpec,
     pending_handlers: Vec<(i64, std::sync::Arc<dyn Handler>)>,
 ) -> DispatchTable {
     let mut table = DispatchTable::new();
@@ -338,14 +331,7 @@ pub(crate) fn build_dispatch_table(
     // Memory management (conditional on memory_limit)
     // ------------------------------------------------------------------
     if policy.features.memory_limit {
-        for &nr in &[
-            libc::SYS_mmap,
-            libc::SYS_munmap,
-            libc::SYS_brk,
-            libc::SYS_mremap,
-            libc::SYS_mprotect,
-            libc::SYS_shmget,
-        ] {
+        for nr in filter::memory_accounting_syscalls(&policy.features) {
             let policy_for_mem = Arc::clone(policy);
             let __sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
@@ -360,7 +346,7 @@ pub(crate) fn build_dispatch_table(
         // its brk base; see handle_exec_memory_reset. Registered first for
         // these nrs (always Continue), so later chroot/COW exec handlers
         // still run.
-        for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
+        for &nr in filter::EXEC_SYSCALLS {
             let __sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
@@ -376,12 +362,7 @@ pub(crate) fn build_dispatch_table(
     // network_destination_policy, so it isn't listed.
     // ------------------------------------------------------------------
     if policy.features.network_destination_policy || policy.supervises_named_unix() {
-        for &nr in &[
-            libc::SYS_connect,
-            libc::SYS_sendto,
-            libc::SYS_sendmsg,
-            libc::SYS_sendmmsg,
-        ] {
+        for &nr in filter::DESTINATION_SYSCALLS {
             let __sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
@@ -444,11 +425,7 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     if policy.features.time_start {
         let time_offset = policy.time_offset;
-        for &nr in &[
-            libc::SYS_clock_nanosleep as i64,
-            libc::SYS_timerfd_settime as i64,
-            libc::SYS_timer_settime as i64,
-        ] {
+        for &nr in filter::TIMER_SYSCALLS {
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
@@ -625,9 +602,9 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // sysinfo virtualization (always on, like /proc/loadavg)
+    // sysinfo virtualization (on unless the policy denies sysinfo)
     // ------------------------------------------------------------------
-    {
+    if spec.notifies(libc::SYS_sysinfo) {
         let policy = Arc::clone(policy);
         let resource = Arc::clone(resource);
         let sup = Arc::clone(ctx);
@@ -1578,6 +1555,22 @@ mod handler_tests {
     }
 
     // ---- Handler trait tests --------------------------------------
+
+    #[test]
+    fn a_handler_on_an_unnotified_syscall_is_unreachable() {
+        let policy = crate::sandbox::Sandbox::builder().build().unwrap();
+        let features = crate::features::SandboxFeatures::from_sandbox(&policy, None, &[]);
+        let mut table = DispatchTable::new();
+        table.register(libc::SYS_getpid, |_cx: &HandlerCtx| async {
+            NotifAction::Continue
+        });
+
+        let unaware = FilterSpec::supervised(&policy, &features, &[]);
+        assert_eq!(table.unreachable_under(&unaware), Some(libc::SYS_getpid));
+
+        let aware = FilterSpec::supervised(&policy, &features, &[libc::SYS_getpid as u32]);
+        assert_eq!(table.unreachable_under(&aware), None);
+    }
 
     #[tokio::test]
     async fn handler_via_blanket_impl_dispatches_closures() {

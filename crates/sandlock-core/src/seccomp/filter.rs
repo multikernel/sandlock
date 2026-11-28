@@ -67,6 +67,11 @@ impl FilterSpec {
         }
     }
 
+    /// Whether the kernel raises a notification for `nr` at all.
+    pub(crate) fn notifies(&self, nr: i64) -> bool {
+        self.notify.binary_search(&(nr as u32)).is_ok()
+    }
+
     pub(crate) fn assemble(&self) -> std::io::Result<Vec<SockFilter>> {
         bpf::assemble_filter(&self.notify, &self.deny, &self.arg_block)
     }
@@ -121,40 +126,52 @@ const BASE_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_setpgid,
 ];
 
-const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
-    libc::SYS_mmap,
-    libc::SYS_munmap,
-    libc::SYS_brk,
-    libc::SYS_mremap,
-    // Only calls granting PROT_WRITE reach the supervisor; see arg_block.
-    libc::SYS_mprotect,
-    // exec destroys the address space and the kernel picks a fresh
-    // randomized brk base, so brk accounting must observe it to drop the
-    // old image's base; otherwise the new image's first brk is charged the
-    // ASLR distance between the two heaps.
-    libc::SYS_execve,
-    libc::SYS_execveat,
-];
+// The lists below are iterated by `build_dispatch_table` as well, so a
+// handler is registered for exactly the syscalls the filter notifies.
 
-const NETWORK_POLICY_SYSCALLS: &[i64] = &[
+pub(crate) fn memory_accounting_syscalls(features: &SandboxFeatures) -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        // Only calls granting PROT_WRITE reach the supervisor; see arg_block.
+        libc::SYS_mprotect,
+    ];
+    // Without "sysv_ipc" in extra_allow_syscalls shmget is on the
+    // blocklist, and notifying it would bypass that deny.
+    if features.sysv_ipc_allowed {
+        v.push(libc::SYS_shmget);
+    }
+    v
+}
+
+pub(crate) const EXEC_SYSCALLS: &[i64] = &[libc::SYS_execve, libc::SYS_execveat];
+
+/// Syscalls that name a peer: `connect` for streams, the sends for datagrams.
+pub(crate) const DESTINATION_SYSCALLS: &[i64] = &[
     libc::SYS_connect,
     libc::SYS_sendto,
     libc::SYS_sendmsg,
     libc::SYS_sendmmsg,
-    libc::SYS_bind,
 ];
 
-// Also intercept openat so the supervisor can re-patch vDSO after exec.
-const RANDOM_NOTIF_SYSCALLS: &[i64] = &[libc::SYS_getrandom, libc::SYS_openat];
-
-// Also intercept openat so the supervisor gets a notification after exec
-// and can re-patch the vDSO (exec replaces vDSO with a fresh copy).
-const TIME_NOTIF_SYSCALLS: &[i64] = &[
+pub(crate) const TIMER_SYSCALLS: &[i64] = &[
     libc::SYS_clock_nanosleep,
     libc::SYS_timerfd_settime,
     libc::SYS_timer_settime,
-    libc::SYS_openat,
 ];
+
+/// Every spelling of open a path-keyed handler must see: a libc that picks
+/// one the handler does not cover reads the real file.
+pub(crate) fn open_family_syscalls() -> Vec<i64> {
+    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2];
+    v.extend(arch::sys_open());
+    v
+}
+
+// Also intercept openat so the supervisor can re-patch vDSO after exec.
+const RANDOM_NOTIF_SYSCALLS: &[i64] = &[libc::SYS_getrandom, libc::SYS_openat];
 
 // /proc virtualization + /etc/hosts virtualization (always on).
 //
@@ -166,12 +183,9 @@ const TIME_NOTIF_SYSCALLS: &[i64] = &[
 // a caller that picks `open` or `openat2` slips past virtualization
 // and reads the real on-disk file.
 fn procfs_hosts_notif_syscalls() -> Vec<i64> {
-    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_getdents64];
-    v.extend(
-        [arch::sys_open(), arch::sys_getdents()]
-            .into_iter()
-            .flatten(),
-    );
+    let mut v = open_family_syscalls();
+    v.push(libc::SYS_getdents64);
+    v.extend(arch::sys_getdents());
     v.push(libc::SYS_lseek);
     v.extend(crate::procfs::net_dispatch::metadata_syscalls());
     v
@@ -409,8 +423,6 @@ const POLICY_NETWORK_EVENT_SYSCALLS: &[i64] = &[
     libc::SYS_bind,
 ];
 
-const POLICY_EXEC_EVENT_SYSCALLS: &[i64] = &[libc::SYS_execve, libc::SYS_execveat];
-
 const PORT_REMAP_SYSCALLS: &[i64] = &[libc::SYS_bind, libc::SYS_getsockname];
 
 /// Syscalls that need `SECCOMP_RET_USER_NOTIF`.
@@ -423,30 +435,24 @@ fn notify_syscalls(features: &SandboxFeatures, deny: &[u32]) -> Vec<u32> {
     nrs.push_optional(arch::sys_fork());
 
     if features.memory_limit {
-        nrs.extend(MEMORY_NOTIF_SYSCALLS);
-        // shmget is in notif only when SysV IPC is allowed. The BPF
-        // layout puts notif JEQs before deny JEQs, so a syscall on
-        // both lists would notify (RET_USER_NOTIF) and silently
-        // bypass the kernel-level deny. When extra_allow_syscalls does not contain "sysv_ipc",
-        // shmget belongs only on the blocklist.
-        if features.sysv_ipc_allowed {
-            nrs.push(libc::SYS_shmget);
-        }
+        nrs.extend(&memory_accounting_syscalls(features));
+        // exec destroys the address space and the kernel picks a fresh
+        // randomized brk base, so brk accounting must observe it to drop the
+        // old image's base; otherwise the new image's first brk is charged the
+        // ASLR distance between the two heaps.
+        nrs.extend(EXEC_SYSCALLS);
     }
 
     if features.network_supervision {
-        nrs.extend(NETWORK_POLICY_SYSCALLS);
+        nrs.extend(DESTINATION_SYSCALLS);
+        nrs.push(libc::SYS_bind);
     } else if features.unix_fs_gate && (!features.landlock_unix_gate || features.chroot) {
-        // Named-unix gate: trap connect() (stream) and sendto()/sendmsg()/
-        // sendmmsg() (datagram) so reaching a unix socket outside the fs-write
-        // grants is denied, even when no IP network rules are present. Landlock
+        // Named-unix gate: reaching a unix socket outside the fs-write
+        // grants is denied even when no IP network rules are present. Landlock
         // before ABI v9 cannot gate this, and under chroot no Landlock can,
-        // since the kernel would resolve the address on the host. Handlers bail cheaply on addr-less
-        // (connected) sends.
-        nrs.push(libc::SYS_connect);
-        nrs.push(libc::SYS_sendto);
-        nrs.push(libc::SYS_sendmsg);
-        nrs.push(libc::SYS_sendmmsg);
+        // since the kernel would resolve the address on the host. Handlers
+        // bail cheaply on addr-less (connected) sends.
+        nrs.extend(DESTINATION_SYSCALLS);
     }
 
     if features.random_seed {
@@ -454,7 +460,10 @@ fn notify_syscalls(features: &SandboxFeatures, deny: &[u32]) -> Vec<u32> {
     }
 
     if features.time_start {
-        nrs.extend(TIME_NOTIF_SYSCALLS);
+        nrs.extend(TIMER_SYSCALLS);
+        // exec replaces the vDSO with a fresh copy; the open that follows
+        // is where the supervisor patches it again.
+        nrs.push(libc::SYS_openat);
     }
 
     nrs.extend(&procfs_hosts_notif_syscalls());
@@ -498,7 +507,7 @@ fn notify_syscalls(features: &SandboxFeatures, deny: &[u32]) -> Vec<u32> {
         nrs.extend(POLICY_NETWORK_EVENT_SYSCALLS);
     }
     if features.policy_events.contains(SyscallCategory::Exec) {
-        nrs.extend(POLICY_EXEC_EVENT_SYSCALLS);
+        nrs.extend(EXEC_SYSCALLS);
     }
 
     // Port remapping

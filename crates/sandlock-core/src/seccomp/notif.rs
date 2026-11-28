@@ -3339,10 +3339,11 @@ async fn settle_parked(
 /// `pending_handlers` are user-supplied syscall handlers registered after all
 /// builtin handlers.  For the default behaviour without any custom handlers
 /// pass an empty `Vec`.
-pub async fn supervisor(
+pub(crate) async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
     pending_handlers: Vec<(i64, std::sync::Arc<dyn super::dispatch::Handler>)>,
+    filter: super::filter::FilterSpec,
     startup: tokio::sync::oneshot::Sender<io::Result<()>>,
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
@@ -3367,8 +3368,16 @@ pub async fn supervisor(
         &ctx.policy,
         &ctx.resource,
         &ctx,
+        &filter,
         pending_handlers,
     ));
+    if let Some(nr) = dispatch_table.unreachable_under(&filter) {
+        let _ = startup.send(Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("syscall {nr} has a handler but the seccomp filter does not notify it"),
+        )));
+        return;
+    }
 
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
