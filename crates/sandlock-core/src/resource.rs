@@ -239,7 +239,7 @@ pub(crate) fn requires_process_creation_tracking(
     notif: &SeccompNotif,
     policy: &NotifPolicy,
 ) -> bool {
-    policy.argv_safety_required && fork_counted_on_continue(notif)
+    policy.features.argv_safety_required && fork_counted_on_continue(notif)
 }
 
 /// Arm ptrace fork-event tracking on the syscall's calling task.
@@ -956,6 +956,7 @@ mod memory_range_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::SandboxFeatures;
     use crate::netlink::NetlinkState;
     use crate::seccomp::state::{
         ChrootState, CowState, NetworkState, PolicyFnState, ProcessIndex, ProcfsState,
@@ -990,19 +991,13 @@ mod tests {
         NotifPolicy {
             max_memory_bytes: 0,
             max_processes: 0,
-            has_memory_limit: false,
-            has_net_destination_policy: false,
-            has_bind_denylist: false,
-            has_unix_fs_gate: false,
-            landlock_unix_gate: false,
-            has_random_seed: false,
-            has_time_start: false,
-            argv_safety_required,
+            features: SandboxFeatures {
+                argv_safety_required,
+                ..Default::default()
+            },
             notif_wait_killable: true,
             time_offset: 0,
             num_cpus: None,
-            port_remap: false,
-            cow_enabled: false,
             chroot_root: None,
             chroot_readable: Vec::new(),
             chroot_writable: Vec::new(),
@@ -1012,7 +1007,6 @@ mod tests {
             deterministic_dirs: false,
             virtual_hostname: None,
             uname: Default::default(),
-            has_http_acl: false,
             virtual_etc_hosts: String::new(),
             ca_inject_paths: Vec::new(),
             ca_inject_pem: None,
@@ -1058,7 +1052,7 @@ mod tests {
         let ctx = fake_supervisor_ctx(false);
         let mut policy = fake_policy(false);
         policy.max_memory_bytes = 1 << 20;
-        policy.has_memory_limit = true;
+        policy.features.memory_limit = true;
         let rw = (libc::PROT_READ | libc::PROT_WRITE) as u64;
 
         let shared = file_mmap_notif(1 << 30, rw, libc::MAP_SHARED as u64);
@@ -1095,7 +1089,7 @@ mod tests {
         let ctx = fake_supervisor_ctx(false);
         let mut policy = fake_policy(false);
         policy.max_memory_bytes = 1 << 20;
-        policy.has_memory_limit = true;
+        policy.features.memory_limit = true;
 
         let reserve = mmap_notif(1 << 30, libc::PROT_NONE as u64);
         let action = handle_memory(&reserve, &ctx, &policy).await;
@@ -1150,7 +1144,7 @@ mod tests {
         let ctx = fake_supervisor_ctx(false);
         let mut policy = fake_policy(false);
         policy.max_memory_bytes = 1 << 20;
-        policy.has_memory_limit = true;
+        policy.features.memory_limit = true;
         let reserved = map_anon(1 << 30, libc::PROT_NONE);
 
         let over = handle_memory(&mprotect_notif(reserved, 1 << 30), &ctx, &policy).await;
@@ -1180,7 +1174,7 @@ mod tests {
         let ctx = fake_supervisor_ctx(false);
         let mut policy = fake_policy(false);
         policy.max_memory_bytes = 64 << 20;
-        policy.has_memory_limit = true;
+        policy.features.memory_limit = true;
         ctx.resource.lock().await.mem_used = 60 << 20;
         let writable = map_anon(16 << 20, libc::PROT_READ | libc::PROT_WRITE);
 

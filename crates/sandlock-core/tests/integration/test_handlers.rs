@@ -412,8 +412,8 @@ async fn handler_on_default_blocklist_syscall_is_rejected() {
 /// rejection at user-space discretion.
 ///
 /// Counterpart to `handler_on_default_blocklist_syscall_is_rejected`,
-/// driving the user-list branch of `blocklist_syscall_numbers` (see
-/// `crates/sandlock-core/src/context.rs`).  Uses `SYS_mremap` because it is
+/// driving the user-list branch of `blocklist` (see
+/// `crates/sandlock-core/src/seccomp/filter.rs`).  Uses `SYS_mremap` because it is
 /// in `syscall_name_to_nr` but **not** in DEFAULT_BLOCKLIST — putting it into
 /// `extra_deny_syscalls` is the only way it lands on the blocklist, isolating the
 /// user-supplied branch under test from the default-blocklist branch.

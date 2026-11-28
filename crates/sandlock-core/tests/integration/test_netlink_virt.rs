@@ -657,15 +657,6 @@ async fn dup2_over_the_cookie_fd_ends_the_netlink_fixups() {
     );
 }
 
-/// The netlink cookie is recognised by identity, so close() need not be
-/// trapped for it; close is one of the hottest syscalls a program makes.
-#[tokio::test]
-async fn close_is_not_a_notified_syscall() {
-    let policy = base_policy().build().unwrap();
-    let notified = sandlock_core::context::notif_syscalls(&policy, None);
-    assert!(!notified.contains(&(libc::SYS_close as u32)));
-}
-
 async fn check_socket_alias(setup: &str) {
     let script = format!(
         r#"

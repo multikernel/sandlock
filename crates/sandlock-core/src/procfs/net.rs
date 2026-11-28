@@ -346,13 +346,13 @@ pub(crate) fn render(
                 libc::IPPROTO_UDP
             };
             let records = sock_diag::dump(family, protocol, &cookies)?;
-            render_inet(&records, port_map, policy.port_remap, protocol)
+            render_inet(&records, port_map, policy.features.port_remap, protocol)
         }
         NetFile::Unix => {
             let records = sock_diag::dump(libc::AF_UNIX, 0, &cookies)?;
             render_unix(&records, |path| {
                 if path.starts_with('@') { return Some(path.into()); }
-                if policy.cow_enabled || !path.starts_with('/') { return None; }
+                if policy.features.cow || !path.starts_with('/') { return None; }
                 visible_unix_path(path, policy.chroot_root.as_deref(), &policy.chroot_mounts)
             })
         }

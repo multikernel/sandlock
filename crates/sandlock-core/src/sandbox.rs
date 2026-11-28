@@ -2082,9 +2082,9 @@ impl Sandbox {
 
             let _ = crate::landlock_policy::confine(&sandbox_cfg);
 
-            let deny = crate::context::blocklist_syscall_numbers(&sandbox_cfg);
-            let args = crate::context::arg_filters(&sandbox_cfg);
-            let filter = match crate::seccomp::bpf::assemble_filter(&[], &deny, &args) {
+            let features = crate::features::SandboxFeatures::from_sandbox(&sandbox_cfg, None, &[]);
+            let spec = crate::seccomp::filter::FilterSpec::deny_only(&sandbox_cfg, &features);
+            let filter = match spec.assemble() {
                 Ok(f) => f,
                 Err(_) => unsafe { libc::_exit(1) },
             };
@@ -2244,7 +2244,7 @@ impl Sandbox {
     /// Whether named (pathname) `AF_UNIX` connects should be gated by the
     /// fs-write grants (`has_unix_fs_gate`). Active whenever the sandbox
     /// confines the filesystem. Single source of truth for both the
-    /// `NotifPolicy` flag and the `notif_syscalls` BPF set.
+    /// `SandboxFeatures` flag and the BPF notif set.
     pub(crate) fn has_unix_fs_gate(&self) -> bool {
         !self.fs_readable.is_empty() || !self.fs_writable.is_empty()
     }
@@ -2550,7 +2550,7 @@ impl Sandbox {
 
         let handler_syscalls: Vec<i64> = self.rt().handlers.iter().map(|(nr, _)| *nr).collect();
         let resolved_sandbox_name = self.rt().name.clone();
-        let resolved = crate::resolved::ResolvedSandbox::from_sandbox(
+        let features = crate::features::SandboxFeatures::from_sandbox(
             self,
             Some(resolved_sandbox_name.as_str()),
             &handler_syscalls,
@@ -2717,8 +2717,8 @@ impl Sandbox {
                 env: &child_env,
                 pipes: &pipes,
                 no_supervisor,
+                features,
                 keep_fds: &gather_keep_fds,
-                sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
                 foreground,
             });
@@ -2799,19 +2799,10 @@ impl Sandbox {
             let notif_policy = NotifPolicy {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.max_processes.unwrap_or(u32::MAX),
-                has_memory_limit: resolved.features.memory_limit,
-                has_net_destination_policy: resolved.features.network_destination_policy,
-                has_bind_denylist: resolved.features.bind_denylist,
-                has_unix_fs_gate: resolved.features.unix_fs_gate,
-                landlock_unix_gate: resolved.features.landlock_unix_gate,
-                has_random_seed: resolved.features.random_seed,
-                has_time_start: resolved.features.time_start,
-                argv_safety_required: resolved.features.argv_safety_required,
+                features,
                 notif_wait_killable,
                 time_offset: time_offset.unwrap_or(0),
                 num_cpus: self.num_cpus,
-                port_remap: resolved.features.port_remap,
-                cow_enabled: resolved.features.cow,
                 chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
@@ -2821,7 +2812,6 @@ impl Sandbox {
                 deterministic_dirs: self.deterministic_dirs,
                 virtual_hostname: Some(rt_name),
                 uname: self.uname.clone(),
-                has_http_acl: resolved.features.http_acl,
                 virtual_etc_hosts,
                 ca_inject_paths: self.http_inject_ca.clone(),
                 ca_inject_pem: ca_inject_pem.clone(),

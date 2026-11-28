@@ -17,6 +17,7 @@ pub(crate) mod credential;
 pub(crate) mod credential;
 pub mod error;
 pub mod expand;
+pub(crate) mod features;
 pub mod fork;
 pub(crate) mod freeze;
 pub mod grant;
@@ -38,12 +39,10 @@ pub(crate) mod random;
 pub(crate) mod reaper;
 #[cfg(feature = "cow")]
 pub mod recovery;
-pub(crate) mod resolved;
 pub(crate) mod resource;
 pub mod result;
 pub mod sandbox; // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod seccomp;
-pub(crate) mod seccomp_plan;
 pub(crate) mod sys;
 pub(crate) mod time;
 #[cfg(feature = "cow")]

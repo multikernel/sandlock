@@ -55,7 +55,7 @@ pub enum SyscallCategory {
 }
 
 /// The event categories a policy callback subscribes to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CategorySet(u8);
 
 impl CategorySet {

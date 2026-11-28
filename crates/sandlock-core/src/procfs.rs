@@ -162,7 +162,9 @@ pub(crate) fn virtual_file(path: &str, policy: &NotifPolicy) -> Option<VirtualFi
     let uname = &policy.uname;
     Some(match canon_proc_namespace(path).as_ref() {
         "/proc/cpuinfo" if policy.num_cpus.is_some() => VirtualFile::CpuInfo,
-        "/proc/stat" if policy.num_cpus.is_some() || policy.has_time_start => VirtualFile::Stat,
+        "/proc/stat" if policy.num_cpus.is_some() || policy.features.time_start => {
+            VirtualFile::Stat
+        }
         // glibc's sysconf(_SC_NPROCESSORS_ONLN/CONF) counts these, not the
         // affinity mask, so `make -j$(getconf _NPROCESSORS_ONLN)` sees them.
         "/sys/devices/system/cpu/online"

@@ -47,7 +47,7 @@ pub(crate) fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 ///
 /// * `notif_syscalls`  — syscalls that generate SECCOMP_RET_USER_NOTIF
 /// * `block_syscalls`   — syscalls that return ERRNO(EPERM)
-/// * `arg_block`       — pre-built arg filter instructions (from `context::arg_filters`)
+/// * `arg_block`       — pre-built arg filter instructions (from `filter::FilterSpec`)
 ///
 /// Returns an error if a syscall appears in both notification and deny lists,
 /// or if the resulting program would exceed the kernel's `BPF_MAXINSNS`

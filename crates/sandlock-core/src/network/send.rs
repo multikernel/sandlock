@@ -125,7 +125,7 @@ pub(super) async fn sendto_on_behalf(
                 // non-unix sockets and for AF_UNIX destinations we cannot pin in
                 // the child's context (abstract / empty `sun_path`)
                 // under a destination policy — see the PR description.
-                if !ctx.policy.has_net_destination_policy {
+                if !ctx.policy.features.network_destination_policy {
                     return NotifAction::Continue;
                 }
                 let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
@@ -233,7 +233,7 @@ pub(super) async fn sendmsg_on_behalf(
     // connected (NULL) name for a denied address. Send on-behalf (including
     // connected sends) so the verdict is made on the immune copy. Without a
     // policy there is nothing to bypass, so the Continue fast path below stands.
-    let dest_policy = ctx.policy.has_net_destination_policy;
+    let dest_policy = ctx.policy.features.network_destination_policy;
     if !dest_policy {
         // Pre-scan for Continue cases (connected socket / non-IP family).
         // EFAULT on unreadable msghdr (vs. Continue, which would let the kernel
@@ -468,7 +468,7 @@ pub(super) async fn sendmmsg_on_behalf(
     // entry for a denied address after our prescan, bypassing the allowlist on
     // an unconnected datagram socket. On-behalf sends use the immune copy and
     // validate every IP destination, so the verdict is TOCTOU-free.
-    if ctx.policy.has_net_destination_policy {
+    if ctx.policy.features.network_destination_policy {
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
             Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),

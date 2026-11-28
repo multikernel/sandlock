@@ -165,13 +165,13 @@ pub enum HandlerError {
 /// `NotifAction::Continue` becomes `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and
 /// the kernel actually runs the syscall — silently bypassing deny.
 ///
-/// The blocklist is whatever [`crate::context::blocklist_syscall_numbers`]
+/// The blocklist is whatever [`super::filter::blocklist`]
 /// resolves from Sandlock's default syscall blocklist plus policy extras.
 ///
 /// Every open-family syscall a path-keyed handler must intercept to be
 /// leak-proof: `open` (legacy), `openat`, and `openat2`. A handler that
 /// only registers `openat` is bypassed by any libc that picks one of
-/// the others. The corresponding BPF notif list (in `context::notif_syscalls`)
+/// the others. The corresponding BPF notif list (in `seccomp::filter`)
 /// must register the same set so the kernel actually produces a
 /// notification — otherwise `RET_ALLOW` makes the handler unreachable.
 fn open_family_syscalls() -> Vec<i64> {
@@ -193,9 +193,7 @@ pub(crate) fn validate_handler_syscalls_against_policy(
     policy: &crate::sandbox::Sandbox,
 ) -> Result<(), i64> {
     let blocklist: std::collections::HashSet<u32> =
-        crate::context::blocklist_syscall_numbers(policy)
-            .into_iter()
-            .collect();
+        super::filter::blocklist(policy).into_iter().collect();
     for &nr in syscall_nrs {
         if blocklist.contains(&(nr as u32)) {
             return Err(nr);
@@ -337,9 +335,9 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Memory management (conditional on has_memory_limit)
+    // Memory management (conditional on memory_limit)
     // ------------------------------------------------------------------
-    if policy.has_memory_limit {
+    if policy.features.memory_limit {
         for &nr in &[
             libc::SYS_mmap,
             libc::SYS_munmap,
@@ -373,11 +371,11 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Network (conditional on has_net_destination_policy or the supervisor
-    // gating named unix sockets). has_http_acl is already subsumed by
-    // has_net_destination_policy, so it isn't listed.
+    // Network (conditional on network_destination_policy or the supervisor
+    // gating named unix sockets). http_acl is already subsumed by
+    // network_destination_policy, so it isn't listed.
     // ------------------------------------------------------------------
-    if policy.has_net_destination_policy || policy.supervises_named_unix() {
+    if policy.features.network_destination_policy || policy.supervises_named_unix() {
         for &nr in &[
             libc::SYS_connect,
             libc::SYS_sendto,
@@ -397,7 +395,7 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Deterministic random — getrandom()
     // ------------------------------------------------------------------
-    if policy.has_random_seed {
+    if policy.features.random_seed {
         let __sup = Arc::clone(ctx);
         table.register(libc::SYS_getrandom, move |cx: &HandlerCtx| {
             let notif = cx.notif;
@@ -420,7 +418,7 @@ pub(crate) fn build_dispatch_table(
     // legacy `open` spellings can't slip past the seed and read the
     // kernel's real entropy.
     // ------------------------------------------------------------------
-    if policy.has_random_seed {
+    if policy.features.random_seed {
         for nr in open_family_syscalls() {
             let __sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
@@ -442,9 +440,9 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Timer adjustment (conditional on has_time_start)
+    // Timer adjustment (conditional on time_start)
     // ------------------------------------------------------------------
-    if policy.has_time_start {
+    if policy.features.time_start {
         let time_offset = policy.time_offset;
         for &nr in &[
             libc::SYS_clock_nanosleep as i64,
@@ -591,7 +589,7 @@ pub(crate) fn build_dispatch_table(
     // COW filesystem interception
     // ------------------------------------------------------------------
     #[cfg(feature = "cow")]
-    if policy.cow_enabled {
+    if policy.features.cow {
         register_cow_handlers(&mut table, ctx);
     }
 
@@ -760,7 +758,10 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     // Bind — on-behalf
     // ------------------------------------------------------------------
-    if policy.port_remap || policy.has_net_destination_policy || policy.has_bind_denylist {
+    if policy.features.port_remap
+        || policy.features.network_destination_policy
+        || policy.features.bind_denylist
+    {
         let __sup = Arc::clone(ctx);
         table.register(libc::SYS_bind, move |cx: &HandlerCtx| {
             let notif = cx.notif;
@@ -773,7 +774,7 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     // getsockname — port remap
     // ------------------------------------------------------------------
-    if policy.port_remap {
+    if policy.features.port_remap {
         let __sup = Arc::clone(ctx);
         table.register(libc::SYS_getsockname, move |cx: &HandlerCtx| {
             let notif = cx.notif;
@@ -1301,19 +1302,10 @@ mod handler_tests {
             policy: Arc::new(NotifPolicy {
                 max_memory_bytes: 0,
                 max_processes: 0,
-                has_memory_limit: false,
-                has_net_destination_policy: false,
-                has_bind_denylist: false,
-                has_unix_fs_gate: false,
-                landlock_unix_gate: false,
-                has_random_seed: false,
-                has_time_start: false,
+                features: Default::default(),
                 time_offset: 0,
                 num_cpus: None,
-                argv_safety_required: false,
                 notif_wait_killable: true,
-                port_remap: false,
-                cow_enabled: false,
                 chroot_root: None,
                 chroot_readable: Vec::new(),
                 chroot_writable: Vec::new(),
@@ -1323,7 +1315,6 @@ mod handler_tests {
                 deterministic_dirs: false,
                 virtual_hostname: None,
                 uname: Default::default(),
-                has_http_acl: false,
                 virtual_etc_hosts: String::new(),
                 ca_inject_paths: Vec::new(),
                 ca_inject_pem: None,
@@ -1565,7 +1556,7 @@ mod handler_tests {
     /// Uses `mremap` because it is in `syscall_name_to_nr` but not in
     /// `DEFAULT_BLOCKLIST_SYSCALLS` — putting it into `extra_deny_syscalls` is the only
     /// way it ends up on the extra blocklist, so the test isolates the user-supplied
-    /// path of `blocklist_syscall_numbers` from the default branch covered by
+    /// path of `blocklist` from the default branch covered by
     /// `handler_on_default_blocklist_syscall_is_rejected`.
     ///
     /// Pure-logic counterpart to the integration test of the same name —

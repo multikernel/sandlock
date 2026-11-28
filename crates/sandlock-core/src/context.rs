@@ -6,17 +6,10 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::child_env::ChildEnv;
-use crate::resolved::ResolvedSandbox;
+use crate::features::SandboxFeatures;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf;
-
-#[cfg(test)]
-use crate::arch;
-#[cfg(test)]
-use crate::sys::structs::{
-    AF_INET, AF_INET6, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, PR_SET_DUMPABLE, SIOCETHTOOL,
-    SIOCGIFCONF, SOCK_RAW, SOCK_TYPE_MASK, TIOCLINUX, TIOCSTI,
-};
+use crate::seccomp::filter::FilterSpec;
 
 // ============================================================
 // Pipe pair for parent-child synchronization
@@ -125,31 +118,6 @@ pub(crate) fn read_u32_fd(fd: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-#[cfg(test)]
-use crate::seccomp::syscall::syscall_name_to_nr;
-
-// ============================================================
-// Sandbox -> seccomp plan
-// ============================================================
-
-pub(crate) use crate::seccomp_plan::{arg_filters_resolved, notif_syscalls_resolved};
-
-pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
-    crate::seccomp_plan::notif_syscalls(policy, sandbox_name)
-}
-
-pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
-    crate::seccomp_plan::no_supervisor_blocklist_syscall_numbers(policy)
-}
-
-pub fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
-    crate::seccomp_plan::blocklist_syscall_numbers(policy)
-}
-
-pub fn arg_filters(policy: &Sandbox) -> Vec<crate::sys::structs::SockFilter> {
-    crate::seccomp_plan::arg_filters(policy)
-}
-
 // ============================================================
 // Close fds above threshold
 // ============================================================
@@ -246,10 +214,9 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// deny filter, parent reads `notif_fd_num = 0` and never starts a
     /// supervisor. Mirrors `Sandbox::no_supervisor`.
     pub no_supervisor: bool,
+    /// Derived before fork so the filter and the supervisor share one view.
+    pub features: SandboxFeatures,
     pub keep_fds: &'a [RawFd],
-    /// Sandbox instance name. When set, it is also exposed as the
-    /// sandbox's virtual hostname.
-    pub sandbox_name: Option<&'a str>,
     /// Syscall numbers for which the parent registered user `Handler`s.
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
@@ -304,8 +271,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         env,
         pipes,
         no_supervisor,
+        features,
         keep_fds,
-        sandbox_name,
         extra_syscalls,
         foreground,
     } = args;
@@ -462,22 +429,13 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     }
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
-    let handler_syscalls: Vec<i64> = extra_syscalls.iter().map(|&nr| nr as i64).collect();
-    let resolved = ResolvedSandbox::from_sandbox(sandbox, sandbox_name, &handler_syscalls);
-    let args = arg_filters_resolved(&resolved);
     let mut keep_fd: i32 = -1;
 
     if no_supervisor {
         // No-supervisor mode: deny-only kernel filter, no NEW_LISTENER.
         // BPF filters are ANDed by the kernel, so an outer filter (from a
         // wrapping sandbox) keeps tightening this layer too.
-        //
-        // Uses the relaxed `no_supervisor_blocklist_syscall_numbers` deny
-        // list (which leaves `ptrace`, `process_vm_*`, etc. alone) so an
-        // inner full-supervisor sandlock nested under this one still has
-        // the syscalls its supervisor needs.
-        let deny = no_supervisor_blocklist_syscall_numbers(sandbox);
-        let filter = match bpf::assemble_filter(&[], &deny, &args) {
+        let filter = match FilterSpec::no_supervisor(sandbox, &features).assemble() {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
         };
@@ -492,21 +450,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             fail!(format!("write notif wait: {}", e));
         }
     } else {
-        let deny = blocklist_syscall_numbers(sandbox);
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
-        //
-        // Caller-supplied handlers must have their syscalls registered in
-        // the BPF filter, otherwise the kernel never raises a notification for
-        // them and the handler silently never fires.  We merge `extra_syscalls`
-        // into the notif list and dedup so each syscall produces exactly one
-        // JEQ in the assembled program.
-        let mut notif = notif_syscalls_resolved(&resolved);
-        if !extra_syscalls.is_empty() {
-            notif.extend_from_slice(extra_syscalls);
-        }
-        notif.sort_unstable();
-        notif.dedup();
-        let filter = match bpf::assemble_filter(&notif, &deny, &args) {
+        let spec = FilterSpec::supervised(sandbox, &features, extra_syscalls);
+        let filter = match spec.assemble() {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
         };
