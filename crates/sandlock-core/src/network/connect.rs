@@ -87,7 +87,7 @@ pub(super) async fn connect_on_behalf(
         let proxy = ns
             .http_acl_addr
             .filter(|_| dest_port.map_or(false, |p| ns.http_acl_ports.contains(&p)));
-        let remap_port = if ctx.policy.port_remap && ip.is_loopback() {
+        let remap_port = if ctx.policy.features.port_remap && ip.is_loopback() {
             dest_port.and_then(|p| ns.port_map.get_real(p))
         } else {
             None
@@ -140,7 +140,7 @@ pub(super) async fn connect_on_behalf(
             DestShape::UnixNamed(path) if ctx.policy.supervises_named_unix() => {
                 connect_named_unix_on_behalf(notif, ctx, sockfd, &path)
             }
-            _ if !ctx.policy.has_net_destination_policy => NotifAction::Continue,
+            _ if !ctx.policy.features.network_destination_policy => NotifAction::Continue,
             // From here a Continue is a way around the destination policy: the
             // kernel looks the fd and the address up again, and a sibling
             // thread can have put an IP socket and a forbidden IP there.

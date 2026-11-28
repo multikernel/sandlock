@@ -7,8 +7,8 @@
 use syscalls::{Sysno, SysnoSet};
 
 use crate::arch;
+use crate::features::SandboxFeatures;
 use crate::policy_fn::SyscallCategory;
-use crate::resolved::ResolvedSandbox;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{jump, stmt};
 use crate::sys::structs::{
@@ -364,14 +364,12 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[libc::SYS_bind, libc::SYS_getsockname];
 
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
-    let resolved = ResolvedSandbox::from_sandbox(policy, sandbox_name, &[]);
-    notif_syscalls_resolved(&resolved)
+    notif_syscalls_resolved(&SandboxFeatures::from_sandbox(policy, sandbox_name, &[]))
 }
 
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF` from the resolved
 /// internal feature view.
-pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
-    let features = &resolved.features;
+pub(crate) fn notif_syscalls_resolved(features: &SandboxFeatures) -> Vec<u32> {
     let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
     nrs.push_optional(arch::sys_vfork());
 
@@ -523,12 +521,10 @@ pub(crate) fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
 pub(crate) fn arg_filters(policy: &Sandbox) -> Vec<SockFilter> {
-    let resolved = ResolvedSandbox::from_sandbox(policy, None, &[]);
-    arg_filters_resolved(&resolved)
+    arg_filters_resolved(&SandboxFeatures::from_sandbox(policy, None, &[]))
 }
 
-pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter> {
-    let features = &resolved.features;
+pub(crate) fn arg_filters_resolved(features: &SandboxFeatures) -> Vec<SockFilter> {
     let ret_errno = SECCOMP_RET_ERRNO | EPERM as u32;
     let nr_clone = libc::SYS_clone as u32;
     let nr_ioctl = libc::SYS_ioctl as u32;

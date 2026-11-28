@@ -1354,45 +1354,12 @@ pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> io::Result<OwnedFd> {
 pub struct NotifPolicy {
     pub max_memory_bytes: u64,
     pub max_processes: u32,
-    pub has_memory_limit: bool,
-    /// A **network destination policy** is active: a `net_allow` allowlist, a
-    /// `net_deny` denylist, an HTTP ACL, or a live `policy_fn` (i.e.
-    /// `network_destination_policy`). Despite the historical singular framing
-    /// this is *not* only an allowlist. When set, the on-behalf path is the
-    /// IP-level enforcer for connect/sendto/sendmsg and those handlers must
-    /// never `Continue`; when clear, the syscalls are trapped only to gate
-    /// named `AF_UNIX` sockets and IP destinations are returned to the kernel
-    /// so Landlock/BPF govern them.
-    pub has_net_destination_policy: bool,
-    /// `--net-deny-bind` is active: trap `bind()` and register the on-behalf
-    /// handler so denied TCP ports can be refused (independent of the
-    /// connect-side `has_net_destination_policy`).
-    pub has_bind_denylist: bool,
-    /// Named (pathname) `AF_UNIX` connect gate. When true, `connect()` to a
-    /// named unix socket whose path is not covered by an fs-write grant is
-    /// denied with EACCES. Abstract sockets are handled by
-    /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` instead.
-    pub has_unix_fs_gate: bool,
-    /// The host's Landlock enforces [`Self::has_unix_fs_gate`] itself
-    /// (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), so the caller can connect in its
-    /// own name.
-    pub landlock_unix_gate: bool,
-    pub has_random_seed: bool,
-    pub has_time_start: bool,
-    /// Argv-safety gate: the supervisor must freeze every task that
-    /// could mutate argv before any consumer reads it. True when
-    /// `policy_fn` is active or when a handler is bound to
-    /// execve/execveat (such handlers can call `read_child_mem`).
-    /// Also gates ptrace fork-event tracking so `ProcessIndex` is
-    /// complete when the freeze enumerates it.
-    pub argv_safety_required: bool,
+    pub(crate) features: crate::features::SandboxFeatures,
     /// The child's listener holds a received notification's caller until it
     /// is answered (`WAIT_KILLABLE_RECV`); the exec freeze relies on that.
     pub notif_wait_killable: bool,
     pub time_offset: i64,
     pub num_cpus: Option<u32>,
-    pub port_remap: bool,
-    pub cow_enabled: bool,
     pub chroot_root: Option<std::path::PathBuf>,
     /// Virtual paths allowed for reading under chroot (original user-specified paths).
     pub chroot_readable: Vec<crate::grant::Grant>,
@@ -1410,7 +1377,6 @@ pub struct NotifPolicy {
     pub deterministic_dirs: bool,
     pub virtual_hostname: Option<String>,
     pub uname: crate::sandbox::Uname,
-    pub has_http_acl: bool,
     /// Synthetic `/etc/hosts` served to the sandbox. Always populated:
     /// `openat("/etc/hosts")` returns a memfd with this content so the
     /// host's on-disk `/etc/hosts` never leaks in. The content is the
@@ -1428,10 +1394,11 @@ impl NotifPolicy {
     /// wherever Landlock cannot gate it, or a `Continue` could be raced past a
     /// destination policy. The peer's `SO_PEERCRED` then names the supervisor.
     pub(crate) fn supervises_named_unix(&self) -> bool {
-        self.has_unix_fs_gate
-            && (!self.landlock_unix_gate
+        let features = &self.features;
+        features.unix_fs_gate
+            && (!features.landlock_unix_gate
                 || self.chroot_root.is_some()
-                || self.has_net_destination_policy)
+                || features.network_destination_policy)
     }
 
     /// Whether an open may land on something the supervisor answers for
@@ -1459,7 +1426,7 @@ impl NotifPolicy {
     /// supervisor, given the destination's loopback-ness.
     ///
     /// This is the connect-side form of the invariant the `sendto`/`sendmsg`
-    /// handlers already follow: with [`Self::has_net_destination_policy`] the
+    /// handlers already follow: with a destination policy the
     /// on-behalf path is the IP-level enforcer and must never `Continue`;
     /// without it there is nothing to enforce and the syscall is returned to
     /// the kernel. `connect()` adds one wrinkle over datagram sends —
@@ -1471,7 +1438,7 @@ impl NotifPolicy {
     /// empty `net_allow`); handling it on-behalf would run it in the
     /// unconfined supervisor and bypass that decision.
     pub(crate) fn ip_connect_supervised(&self, dest_is_loopback: bool) -> bool {
-        self.has_net_destination_policy || (self.port_remap && dest_is_loopback)
+        self.features.network_destination_policy || (self.features.port_remap && dest_is_loopback)
     }
 }
 
@@ -2204,12 +2171,12 @@ fn maybe_patch_vdso(pid: i32, procfs: &mut super::state::ProcfsState, policy: &N
     if base == procfs.vdso_patched_addr {
         return; // already patched this vDSO
     }
-    let time_offset = if policy.has_time_start {
+    let time_offset = if policy.features.time_start {
         Some(policy.time_offset)
     } else {
         None
     };
-    if crate::vdso::patch(pid, time_offset, policy.has_random_seed).is_ok() {
+    if crate::vdso::patch(pid, time_offset, policy.features.random_seed).is_ok() {
         procfs.vdso_patched_addr = base;
     }
 }
@@ -3022,7 +2989,7 @@ async fn handle_notification(
     crate::resource::register_child_if_new(ctx, notif.pid as i32).await;
 
     // Re-patch vDSO if needed (exec replaces it with a fresh copy).
-    if policy.has_time_start || policy.has_random_seed {
+    if policy.features.time_start || policy.features.random_seed {
         let mut pfs = ctx.procfs.lock().await;
         maybe_patch_vdso(notif.pid as i32, &mut pfs, policy);
     }
@@ -3129,7 +3096,7 @@ async fn decide(
     // Read without freezing so the sandbox keeps running while policy_fn
     // decides; `freeze_exec` re-reads it under the freeze before Continue.
     let exec_image = (matches!(action, NotifAction::Continue)
-        && policy.argv_safety_required
+        && policy.features.argv_safety_required
         && crate::freeze::requires_freeze_on_continue(nr))
     .then(|| read_exec_image(&notif, fd));
 

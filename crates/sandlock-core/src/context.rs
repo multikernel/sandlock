@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::child_env::ChildEnv;
-use crate::resolved::ResolvedSandbox;
+use crate::features::SandboxFeatures;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf;
 
@@ -246,10 +246,9 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// deny filter, parent reads `notif_fd_num = 0` and never starts a
     /// supervisor. Mirrors `Sandbox::no_supervisor`.
     pub no_supervisor: bool,
+    /// Derived before fork so the filter and the supervisor share one view.
+    pub features: SandboxFeatures,
     pub keep_fds: &'a [RawFd],
-    /// Sandbox instance name. When set, it is also exposed as the
-    /// sandbox's virtual hostname.
-    pub sandbox_name: Option<&'a str>,
     /// Syscall numbers for which the parent registered user `Handler`s.
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
@@ -304,8 +303,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         env,
         pipes,
         no_supervisor,
+        features,
         keep_fds,
-        sandbox_name,
         extra_syscalls,
         foreground,
     } = args;
@@ -462,9 +461,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     }
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
-    let handler_syscalls: Vec<i64> = extra_syscalls.iter().map(|&nr| nr as i64).collect();
-    let resolved = ResolvedSandbox::from_sandbox(sandbox, sandbox_name, &handler_syscalls);
-    let args = arg_filters_resolved(&resolved);
+    let args = arg_filters_resolved(&features);
     let mut keep_fd: i32 = -1;
 
     if no_supervisor {
@@ -500,7 +497,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // them and the handler silently never fires.  We merge `extra_syscalls`
         // into the notif list and dedup so each syscall produces exactly one
         // JEQ in the assembled program.
-        let mut notif = notif_syscalls_resolved(&resolved);
+        let mut notif = notif_syscalls_resolved(&features);
         if !extra_syscalls.is_empty() {
             notif.extend_from_slice(extra_syscalls);
         }

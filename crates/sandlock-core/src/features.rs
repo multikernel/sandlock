@@ -1,40 +1,26 @@
 use crate::policy_fn::{CategorySet, SyscallCategory};
 use crate::sandbox::Sandbox;
 
-/// Internal normalized view of a sandbox configuration.
-///
-/// `Sandbox` is the public configuration surface. `ResolvedSandbox` is the
-/// private shape used by runtime setup after defaults and feature activation
-/// have been reduced to named facts.
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedSandbox {
-    pub(crate) features: SandboxFeatures,
-}
-
-impl ResolvedSandbox {
-    pub(crate) fn from_sandbox(
-        sandbox: &Sandbox,
-        sandbox_name: Option<&str>,
-        handler_syscalls: &[i64],
-    ) -> Self {
-        Self {
-            features: SandboxFeatures::from_sandbox(sandbox, sandbox_name, handler_syscalls),
-        }
-    }
-}
-
-/// Boolean feature gates derived from a sandbox configuration.
-///
-/// These are deliberately named around runtime behavior instead of raw option
-/// names. That keeps syscall planning and supervisor setup from re-encoding
-/// the same `Option`/empty-list checks in several places.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Feature gates derived once from a sandbox configuration and shared by the
+/// seccomp filter and the supervisor, so the two cannot disagree on what is
+/// active.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SandboxFeatures {
     pub(crate) memory_limit: bool,
     pub(crate) network_supervision: bool,
+    /// A destination policy is active: a `net_allow` allowlist, a `net_deny`
+    /// denylist, an HTTP ACL, or a live `policy_fn`. The on-behalf path is
+    /// then the IP-level enforcer for connect/sendto/sendmsg and must never
+    /// `Continue`; otherwise those syscalls are trapped only to gate named
+    /// `AF_UNIX` sockets and IP destinations go back to the kernel.
     pub(crate) network_destination_policy: bool,
+    /// `--net-deny-bind` is active, independent of the connect side.
     pub(crate) bind_denylist: bool,
+    /// `connect()` to a named unix socket outside the fs-write grants is
+    /// denied. Abstract sockets are scoped by Landlock instead.
     pub(crate) unix_fs_gate: bool,
+    /// The host's Landlock enforces [`Self::unix_fs_gate`] itself, so the
+    /// caller can connect in its own name.
     pub(crate) landlock_unix_gate: bool,
     pub(crate) random_seed: bool,
     pub(crate) time_start: bool,
@@ -48,6 +34,8 @@ pub(crate) struct SandboxFeatures {
     pub(crate) policy_events: CategorySet,
     pub(crate) port_remap: bool,
     pub(crate) http_acl: bool,
+    /// Every task that could mutate argv must be frozen before a consumer
+    /// reads it, and fork events are traced so the freeze sees every task.
     pub(crate) argv_safety_required: bool,
     pub(crate) sysv_ipc_allowed: bool,
     /// Whether an outbound allow layer is active. Derived from the separated
@@ -58,7 +46,7 @@ pub(crate) struct SandboxFeatures {
 }
 
 impl SandboxFeatures {
-    fn from_sandbox(
+    pub(crate) fn from_sandbox(
         sandbox: &Sandbox,
         sandbox_name: Option<&str>,
         handler_syscalls: &[i64],
