@@ -165,13 +165,13 @@ pub enum HandlerError {
 /// `NotifAction::Continue` becomes `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and
 /// the kernel actually runs the syscall — silently bypassing deny.
 ///
-/// The blocklist is whatever [`crate::context::blocklist_syscall_numbers`]
+/// The blocklist is whatever [`super::filter::blocklist`]
 /// resolves from Sandlock's default syscall blocklist plus policy extras.
 ///
 /// Every open-family syscall a path-keyed handler must intercept to be
 /// leak-proof: `open` (legacy), `openat`, and `openat2`. A handler that
 /// only registers `openat` is bypassed by any libc that picks one of
-/// the others. The corresponding BPF notif list (in `context::notif_syscalls`)
+/// the others. The corresponding BPF notif list (in `seccomp::filter`)
 /// must register the same set so the kernel actually produces a
 /// notification — otherwise `RET_ALLOW` makes the handler unreachable.
 fn open_family_syscalls() -> Vec<i64> {
@@ -193,9 +193,7 @@ pub(crate) fn validate_handler_syscalls_against_policy(
     policy: &crate::sandbox::Sandbox,
 ) -> Result<(), i64> {
     let blocklist: std::collections::HashSet<u32> =
-        crate::context::blocklist_syscall_numbers(policy)
-            .into_iter()
-            .collect();
+        super::filter::blocklist(policy).into_iter().collect();
     for &nr in syscall_nrs {
         if blocklist.contains(&(nr as u32)) {
             return Err(nr);
@@ -1558,7 +1556,7 @@ mod handler_tests {
     /// Uses `mremap` because it is in `syscall_name_to_nr` but not in
     /// `DEFAULT_BLOCKLIST_SYSCALLS` — putting it into `extra_deny_syscalls` is the only
     /// way it ends up on the extra blocklist, so the test isolates the user-supplied
-    /// path of `blocklist_syscall_numbers` from the default branch covered by
+    /// path of `blocklist` from the default branch covered by
     /// `handler_on_default_blocklist_syscall_is_rejected`.
     ///
     /// Pure-logic counterpart to the integration test of the same name —

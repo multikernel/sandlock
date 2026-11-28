@@ -2082,9 +2082,9 @@ impl Sandbox {
 
             let _ = crate::landlock_policy::confine(&sandbox_cfg);
 
-            let deny = crate::context::blocklist_syscall_numbers(&sandbox_cfg);
-            let args = crate::context::arg_filters(&sandbox_cfg);
-            let filter = match crate::seccomp::bpf::assemble_filter(&[], &deny, &args) {
+            let features = crate::features::SandboxFeatures::from_sandbox(&sandbox_cfg, None, &[]);
+            let spec = crate::seccomp::filter::FilterSpec::deny_only(&sandbox_cfg, &features);
+            let filter = match spec.assemble() {
                 Ok(f) => f,
                 Err(_) => unsafe { libc::_exit(1) },
             };

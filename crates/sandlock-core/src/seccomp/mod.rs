@@ -1,6 +1,7 @@
 pub mod bpf;
 pub(crate) mod ctx;
 pub mod dispatch;
+pub(crate) mod filter;
 pub(crate) mod gate;
 pub(crate) mod native;
 pub mod notif;

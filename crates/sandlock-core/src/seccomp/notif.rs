@@ -3007,7 +3007,7 @@ async fn handle_notification(
         .flatten()
         .map(Arc::new);
     let denied = has_denied
-        && crate::seccomp_plan::fs_denied_path_syscalls().contains(&nr)
+        && super::filter::fs_denied_path_syscalls().contains(&nr)
         && is_path_denied_for_notif(&*ctx.policy_fn.lock().await, &notif, fd);
     // Dispatch runs first so /proc virtualization and the other handlers
     // still win for their paths.

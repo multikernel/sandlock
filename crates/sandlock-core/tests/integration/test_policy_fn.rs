@@ -556,20 +556,6 @@ async fn test_policy_fn_network_events_only() {
     );
 }
 
-#[test]
-fn test_policy_fn_network_events_skip_file_and_exec_traps() {
-    let policy = base_policy()
-        .policy_fn(PolicyFn::new(|_event, _ctx| Verdict::Allow).events(&[SyscallCategory::Network]))
-        .build()
-        .unwrap();
-    let notified = sandlock_core::context::notif_syscalls(&policy, None);
-    assert!(notified.contains(&(libc::SYS_connect as u32)));
-    assert!(notified.contains(&(libc::SYS_sendmmsg as u32)));
-    assert!(!notified.contains(&(libc::SYS_mkdirat as u32)));
-    assert!(!notified.contains(&(libc::SYS_unlinkat as u32)));
-    assert!(!notified.contains(&(libc::SYS_execve as u32)));
-}
-
 // ============================================================
 // Parent PID tests
 // ============================================================

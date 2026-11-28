@@ -43,7 +43,6 @@ pub(crate) mod resource;
 pub mod result;
 pub mod sandbox; // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod seccomp;
-pub(crate) mod seccomp_plan;
 pub(crate) mod sys;
 pub(crate) mod time;
 #[cfg(feature = "cow")]

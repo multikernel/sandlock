@@ -1,8 +1,6 @@
-//! Seccomp syscall and argument-filter planning.
-//!
-//! This module turns the normalized sandbox feature view into the concrete
-//! syscall notification lists, blocklists, and BPF argument filters installed
-//! by the child-side confinement path.
+//! What the kernel filter does for one sandbox: which syscalls reach the
+//! supervisor, which are refused outright, and which are decided on their
+//! arguments.
 
 use syscalls::{Sysno, SysnoSet};
 
@@ -10,7 +8,7 @@ use crate::arch;
 use crate::features::SandboxFeatures;
 use crate::policy_fn::SyscallCategory;
 use crate::sandbox::Sandbox;
-use crate::seccomp::bpf::{jump, stmt};
+use crate::seccomp::bpf::{self, jump, stmt};
 use crate::sys::structs::{
     SockFilter, AF_INET, AF_INET6, BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K,
     BPF_LD, BPF_RET, BPF_W, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, EPERM, OFFSET_ARGS0_LO,
@@ -20,6 +18,59 @@ use crate::sys::structs::{
     SIOCGIFNAME, SIOCGIFNETMASK, SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, SYSV_IPC_BLOCKLIST_SYSCALLS,
     TIOCLINUX, TIOCSTI,
 };
+
+/// The seccomp filter of one sandbox, before it is encoded as cBPF.
+pub(crate) struct FilterSpec {
+    notify: Vec<u32>,
+    deny: Vec<u32>,
+    arg_block: Vec<SockFilter>,
+}
+
+impl FilterSpec {
+    /// `handler_syscalls` are notified as well: the kernel raises nothing
+    /// for a syscall the filter allows, so its handler would never fire.
+    pub(crate) fn supervised(
+        sandbox: &Sandbox,
+        features: &SandboxFeatures,
+        handler_syscalls: &[u32],
+    ) -> Self {
+        let deny = blocklist(sandbox);
+        let mut notify = notify_syscalls(features, &deny);
+        notify.extend_from_slice(handler_syscalls);
+        notify.sort_unstable();
+        notify.dedup();
+        Self {
+            notify,
+            deny,
+            arg_block: arg_block(features),
+        }
+    }
+
+    /// Nothing is notified: for a process that has no supervisor of its own.
+    pub(crate) fn deny_only(sandbox: &Sandbox, features: &SandboxFeatures) -> Self {
+        Self {
+            notify: Vec::new(),
+            deny: blocklist(sandbox),
+            arg_block: arg_block(features),
+        }
+    }
+
+    /// Like [`Self::deny_only`], but leaves `ptrace`, `process_vm_*` and the
+    /// like alone so a supervised sandbox nested inside still has the
+    /// syscalls its supervisor needs.
+    pub(crate) fn no_supervisor(sandbox: &Sandbox, features: &SandboxFeatures) -> Self {
+        use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
+        Self {
+            notify: Vec::new(),
+            deny: resolve_blocklist(NO_SUPERVISOR_BLOCKLIST_SYSCALLS, sandbox),
+            arg_block: arg_block(features),
+        }
+    }
+
+    pub(crate) fn assemble(&self) -> std::io::Result<Vec<SockFilter>> {
+        bpf::assemble_filter(&self.notify, &self.deny, &self.arg_block)
+    }
+}
 
 // ============================================================
 // Sandbox -> syscall lists
@@ -75,7 +126,7 @@ const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_munmap,
     libc::SYS_brk,
     libc::SYS_mremap,
-    // Only calls granting PROT_WRITE reach the supervisor; see arg_filters.
+    // Only calls granting PROT_WRITE reach the supervisor; see arg_block.
     libc::SYS_mprotect,
     // exec destroys the address space and the kernel picks a fresh
     // randomized brk base, so brk accounting must observe it to drop the
@@ -362,14 +413,8 @@ const POLICY_EXEC_EVENT_SYSCALLS: &[i64] = &[libc::SYS_execve, libc::SYS_execvea
 
 const PORT_REMAP_SYSCALLS: &[i64] = &[libc::SYS_bind, libc::SYS_getsockname];
 
-/// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
-pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
-    notif_syscalls_resolved(&SandboxFeatures::from_sandbox(policy, sandbox_name, &[]))
-}
-
-/// Determine which syscalls need `SECCOMP_RET_USER_NOTIF` from the resolved
-/// internal feature view.
-pub(crate) fn notif_syscalls_resolved(features: &SandboxFeatures) -> Vec<u32> {
+/// Syscalls that need `SECCOMP_RET_USER_NOTIF`.
+fn notify_syscalls(features: &SandboxFeatures, deny: &[u32]) -> Vec<u32> {
     let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
     nrs.push_optional(arch::sys_vfork());
 
@@ -414,7 +459,8 @@ pub(crate) fn notif_syscalls_resolved(features: &SandboxFeatures) -> Vec<u32> {
 
     nrs.extend(&procfs_hosts_notif_syscalls());
     nrs.extend(NETLINK_NOTIF_SYSCALLS);
-    if features.virtual_sysinfo {
+    // A notified syscall would bypass the deny.
+    if !deny.contains(&(libc::SYS_sysinfo as u32)) {
         nrs.push(libc::SYS_sysinfo);
     }
 
@@ -496,35 +542,22 @@ fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
     set.iter().map(|s| s.id() as u32).collect()
 }
 
-/// Resolve `NO_SUPERVISOR_BLOCKLIST_SYSCALLS` names to numbers, plus
-/// SysV IPC syscalls when `policy.allows_sysv_ipc()` is false.
-pub(crate) fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
-    use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
-    resolve_blocklist(NO_SUPERVISOR_BLOCKLIST_SYSCALLS, policy)
-}
-
 /// Resolve the default syscall blocklist plus policy extras to numbers.
 ///
 /// SysV IPC syscalls are appended to the resolved blocklist when
 /// `policy.allows_sysv_ipc()` is false.
-pub(crate) fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
+pub(crate) fn blocklist(policy: &Sandbox) -> Vec<u32> {
     resolve_blocklist(DEFAULT_BLOCKLIST_SYSCALLS, policy)
 }
 
-/// Build argument-level seccomp filter instructions matching the Python
-/// `_build_arg_filters()` exactly.
-///
-/// Returns a `Vec<SockFilter>` containing self-contained BPF blocks for:
+/// Self-contained BPF blocks that decide a syscall on its arguments:
 ///   - clone: block namespace creation flags
 ///   - clone3: refuse with ENOSYS so callers fall back to clone
 ///   - ioctl: block TIOCSTI, TIOCLINUX, SIOCGIF*, SIOCETHTOOL
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
-pub(crate) fn arg_filters(policy: &Sandbox) -> Vec<SockFilter> {
-    arg_filters_resolved(&SandboxFeatures::from_sandbox(policy, None, &[]))
-}
-
-pub(crate) fn arg_filters_resolved(features: &SandboxFeatures) -> Vec<SockFilter> {
+///   - mprotect: allow without notifying unless PROT_WRITE is granted
+fn arg_block(features: &SandboxFeatures) -> Vec<SockFilter> {
     let ret_errno = SECCOMP_RET_ERRNO | EPERM as u32;
     let nr_clone = libc::SYS_clone as u32;
     let nr_ioctl = libc::SYS_ioctl as u32;
@@ -704,3 +737,6 @@ pub(crate) fn arg_filters_resolved(features: &SandboxFeatures) -> Vec<SockFilter
 
     insns
 }
+
+#[cfg(test)]
+mod tests;
