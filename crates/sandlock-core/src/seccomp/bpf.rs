@@ -4,11 +4,12 @@
 //   [ABI check block]           3 instructions, plus 3 on x86_64 to reject x32
 //   [arg filter block]          variable length (pre-built SockFilter instructions)
 //   [LD syscall nr]             1 instruction
-//   [notif JEQ instructions]    1 per notif syscall
-//   [deny JEQ instructions]     1 per blocklisted syscall
-//   [RET ALLOW]                 index = ret_allow_idx   (default fall-through)
-//   [RET USER_NOTIF]            index = ret_notif_idx
-//   [RET ERRNO(EPERM)]          index = ret_errno_idx
+//   [JEQ, RET USER_NOTIF]       1 pair per notif syscall
+//   [JEQ, RET ERRNO(EPERM)]     1 pair per blocklisted syscall
+//   [RET ALLOW]                 default fall-through
+//
+// Each match returns from the instruction right after it: cBPF jump offsets
+// are u8, so a shared return past a long list would be out of reach.
 
 use std::os::unix::io::{FromRawFd, OwnedFd};
 
@@ -52,10 +53,7 @@ pub(crate) fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 /// Returns an error if a syscall appears in both notification and deny lists,
 /// or if the resulting program would exceed the kernel's `BPF_MAXINSNS`
 /// (4096) instruction limit. Catching the size limit here gives a clearer
-/// error than the kernel's `EINVAL` from `seccomp(2)`, and also guards the
-/// `(idx - n) as u8` jump-offset arithmetic below — cBPF jump offsets are u8,
-/// so a program over 256 instructions plus careless changes could silently
-/// truncate offsets.
+/// error than the kernel's `EINVAL` from `seccomp(2)`.
 pub fn assemble_filter(
     notif_syscalls: &[u32],
     block_syscalls: &[u32],
@@ -92,14 +90,17 @@ pub fn assemble_filter(
             stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         ]);
     }
-    let abi_block_len = prog.len();
-    let arg_block_len = arg_block.len();
+    let rules = [
+        (notif_syscalls, SECCOMP_RET_USER_NOTIF),
+        (block_syscalls, SECCOMP_RET_ERRNO | EPERM as u32),
+    ];
     let load_nr = 1usize;
-    let notif_jmps = notif_syscalls.len();
-    let deny_jmps = block_syscalls.len();
-    let ret_section = 3usize; // ALLOW, USER_NOTIF, ERRNO
-
-    let total = abi_block_len + arg_block_len + load_nr + notif_jmps + deny_jmps + ret_section;
+    let ret_allow = 1usize;
+    let total = prog.len()
+        + arg_block.len()
+        + load_nr
+        + 2 * (notif_syscalls.len() + block_syscalls.len())
+        + ret_allow;
 
     // Linux kernel cBPF program length limit (BPF_MAXINSNS).
     const MAX_BPF_INSNS: usize = 4096;
@@ -114,35 +115,15 @@ pub fn assemble_filter(
     }
 
     prog.reserve(total - prog.len());
-
-    // ---- 2. Pre-built arg filter block ----
     prog.extend_from_slice(arg_block);
-
-    // ---- 3. Load syscall number ----
     prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
-
-    // ---- 4. Notif syscall JEQ instructions ----
-    let ret_notif_idx = total - 2;
-    let notif_base = abi_block_len + arg_block_len + load_nr;
-    for (i, &nr) in notif_syscalls.iter().enumerate() {
-        let pos = notif_base + i;
-        let jt = (ret_notif_idx - (pos + 1)) as u8;
-        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, jt, 0));
+    for (syscalls, action) in rules {
+        for &nr in syscalls {
+            prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
+            prog.push(stmt(BPF_RET | BPF_K, action));
+        }
     }
-
-    // ---- 5. Deny syscall JEQ instructions ----
-    let ret_errno_idx = total - 1;
-    let deny_base = notif_base + notif_jmps;
-    for (i, &nr) in block_syscalls.iter().enumerate() {
-        let pos = deny_base + i;
-        let jt = (ret_errno_idx - (pos + 1)) as u8;
-        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, jt, 0));
-    }
-
-    // ---- 6. Return instructions ----
-    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)); // ret_allow_idx
-    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF)); // ret_notif_idx
-    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM as u32)); // ret_errno_idx
+    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
     debug_assert_eq!(prog.len(), total, "BPF program length mismatch");
     Ok(prog)
@@ -407,13 +388,31 @@ mod tests {
     }
 
     #[test]
-    fn test_default_allow_is_before_returns() {
+    fn test_default_allow_is_the_fall_through() {
         let prog =
             assemble_filter(&[libc::SYS_openat as u32], &[libc::SYS_mount as u32], &[]).unwrap();
-        // RET section is last 3 instructions; first of them is ALLOW.
-        let allow_instr = &prog[prog.len() - 3];
+        let allow_instr = prog.last().unwrap();
         assert_eq!(allow_instr.code, BPF_RET | BPF_K);
         assert_eq!(allow_instr.k, SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn actions_hold_past_the_u8_jump_range() {
+        let notif: Vec<u32> = (1000..1200).collect();
+        let deny: Vec<u32> = (2000..2200).collect();
+        let prog = assemble_filter(&notif, &deny, &[]).unwrap();
+        let arch = crate::arch::AUDIT_ARCH;
+        for &nr in &notif {
+            assert_eq!(evaluate(&prog, arch, nr), SECCOMP_RET_USER_NOTIF, "{nr}");
+        }
+        for &nr in &deny {
+            assert_eq!(
+                evaluate(&prog, arch, nr),
+                SECCOMP_RET_ERRNO | EPERM as u32,
+                "{nr}"
+            );
+        }
+        assert_eq!(evaluate(&prog, arch, 999), SECCOMP_RET_ALLOW);
     }
 
     #[test]
@@ -457,7 +456,7 @@ mod tests {
     #[test]
     fn test_oversized_filter_is_rejected() {
         // The deny entries alone exceed the instruction limit.
-        let deny: Vec<u32> = (0..4097u32).collect();
+        let deny: Vec<u32> = (0..2048u32).collect();
         let res = assemble_filter(&[], &deny, &[]);
         let err = match res {
             Ok(_) => panic!("expected oversize error"),
