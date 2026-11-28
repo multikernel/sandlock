@@ -119,7 +119,7 @@ async fn test_time_start_frozen() {
 #[tokio::test]
 async fn test_time_start_shifts_time_call() {
     let y2k = SystemTime::UNIX_EPOCH + Duration::from_secs(961027200);
-    let policy = Sandbox::builder()
+    let mut policy = Sandbox::builder()
         .fs_read("/usr")
         .fs_read("/lib")
         .fs_read_if_exists("/lib64")
@@ -137,11 +137,7 @@ stored = ctypes.c_long()
 returned = libc.time(ctypes.byref(stored))
 print(time.gmtime(returned).tm_year, time.gmtime(stored.value).tm_year, time.gmtime().tm_year)
 "#;
-    let result = policy
-        .clone()
-        .run(&["python3", "-c", script])
-        .await
-        .unwrap();
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
     assert!(result.success(), "{}", result.stderr_str().unwrap_or(""));
     assert_eq!(result.stdout_str().unwrap_or("").trim(), "2000 2000 2000");
 }

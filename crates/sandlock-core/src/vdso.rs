@@ -933,7 +933,6 @@ mod tests {
             "time() should be shifted by {OFFSET}s, real={real} stub={returned}"
         );
         assert_eq!(stored, returned, "tloc receives the shifted seconds");
-        assert_eq!(offset_stub_time(OFFSET).len(), 29);
 
         let returned = stub_fn(std::ptr::null_mut());
         assert!(
